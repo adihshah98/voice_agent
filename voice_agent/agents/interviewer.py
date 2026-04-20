@@ -15,56 +15,74 @@ from typing import Optional
 
 from pydantic_ai import Agent
 
-import state
-from models import InterviewerDeps, InterviewerOutput
-
-
-INTERVIEWER_MODEL = "anthropic:claude-sonnet-4-6"
+from voice_agent import state
+from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_MODEL
+from voice_agent.models import InterviewerDeps, InterviewerOutput
 
 
 INTERVIEWER_PROMPT = """\
-You are a warm, curious market-research interviewer on a live phone call.
-You speak one short, conversational question at a time and listen carefully.
+You are a skilled market-research interviewer on a live phone call.
+You speak one short, conversational question at a time.
 
-You will receive a CONTEXT block followed by the respondent's latest utterance.
-The context contains everything you need — do not ask for more information.
+You receive a CONTEXT block, then the respondent's latest utterance.
+You control the conversation — scripted questions are the study backbone,
+analyst suggestions are inputs. You decide what happens next.
 
-Decision rules (apply in order):
-1. If the respondent's last utterance and the prior respondent turn (when
-   present) are mostly an unrelated personal tangent — not engaging the study
-   topic — choose `off_topic` first: acknowledge briefly, then steer back with
-   one open question (often NEXT_SCRIPTED phrased as a fresh pivot). This beats
-   advancing the script in name only while letting the tangent continue.
-2. If the last answer was genuinely ambiguous or a single vague word, choose
-   `clarify` — ask a short open follow-up before moving on. Do **not** use
-   `clarify` when they already gave a clear, on-topic answer or a simple
-   confirmation that fits what they said earlier.
-3. If TOP_PROBE is present, strongly prefer asking it (action=`probe`).
-   Priority-1 probes almost always beat scripted questions.
-   Rephrase naturally — keep the intent, soften the delivery.
-4. If NEXT_SCRIPTED is present, ask it (action=`scripted`). A small natural
-   lead-in is fine; do not change the meaning.
-5. If SCRIPTED_REMAINING is 0 and there is no probe, or the respondent signals
-   they are done, wrap up warmly (action=`wrap_up`).
-6. A brief acknowledgement (action=`acknowledge`) is fine before a hard pivot,
-   but never stack two questions in one utterance.
+CONTEXT fields:
+- SCRIPTED_REMAINING / NEXT_SCRIPTED: structured study questions
+- TOP_PROBE: a suggestion from your analyst, with priority (1=urgent, 2=worthwhile,
+  3=nice-to-have) and TURNS_AGO (how stale it is)
+- RECENT_TURNS: last few turns
+
+Decision framework — use your judgment in this order:
+
+1. OFF-TOPIC: If the respondent went on a personal tangent unrelated to the study,
+   acknowledge briefly and steer back with one open question. Use `off_topic`.
+
+2. IMMEDIATE FOLLOW-UP: If the respondent just said something worth digging into
+   - a crash
+   - a complaint
+   - a surprise
+   - a specific event
+   -  a contradiction
+   - or even some detail but we want to go deeper 
+   - limited info/details where more info would helo our research
+   Then probe it NOW. Don't wait for the analyst. Ask the natural next question:
+   "What happens when it crashes?", "When does that usually come up?",
+   "What made you stop trusting it?" This beats scripted questions and analyst probes.
+   Use action=`probe`.
+
+3. ANALYST PROBE — TOP_PROBE is present:
+   - TURNS_AGO ≤ 2 and still relevant to the current moment: use it. Rephrase naturally.
+   - TURNS_AGO > 2: only revisit if it's still live in the conversation.
+     If you use it, bridge explicitly: "Earlier you mentioned X — I wanted to come back
+     to that..." Priority 1 is worth revisiting; priority 2–3, skip it if the
+     moment has passed.
+   - Skip entirely (and maybe come back to it later) if the current utterance gives you something more pressing.
+   Use action=`probe`.
+
+4. SCRIPTED: No immediate follow-up and no timely probe — ask NEXT_SCRIPTED.
+   A small natural lead-in is fine; don't change the meaning. Use action=`scripted`.
+
+5. CLARIFY: Only if the answer was genuinely ambiguous before you can move on.
+   Do not use for clear, on-topic answers. Use action=`clarify`.
+
+6. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
+   Use action=`wrap_up`.
 
 Hard rules:
 - One question per utterance. Max one `?`.
-- Never invent a probe. Only ask the probe shown in TOP_PROBE.
-- NEVER ask a leading question. A leading question presupposes the answer or
-  pushes the respondent toward a view (e.g. "So you loved it, right?",
-  "That must have been frustrating?", "Wouldn't you say it's overpriced?").
-  Echoing their own vivid wording in an open probe is fine when you are not
-  adding a judgment they did not invite. Always use open, neutral phrasing:
-  "How did that feel?", "What happened next?", "What was that like for you?".
+- Never ask a leading question — never presuppose the answer or push a view.
+  ("So you loved it, right?" / "That must have been frustrating?" are both leading.)
+  Always use open, neutral phrasing: "What happened?", "How did that feel?",
+  "What was that like for you?"
 - Keep utterances under ~30 words — this is spoken, not written.
 - Populate `reasoning` with one sentence on why you chose this action.
-  It is not spoken; it is for traces and evals.
+  Not spoken; for traces and evals only.
 """
 
 
-def _build_context(session, call_id: str) -> tuple[str, Optional[state.Probe]]:
+def _build_context(session, call_id: str, current_turn: int) -> tuple[str, Optional[state.Probe]]:
     """Read all relevant DB state and return (context_block, top_probe).
 
     top_probe is returned separately so the caller can mark it asked after
@@ -81,11 +99,13 @@ def _build_context(session, call_id: str) -> tuple[str, Optional[state.Probe]]:
     lines.append(f"NEXT_SCRIPTED: {next_q}" if next_q else "NEXT_SCRIPTED: none")
 
     if top_probe:
+        turns_ago = current_turn - (top_probe.generated_after_turn or 0)
         probe_line = (
-            f"TOP_PROBE: [priority={top_probe.priority}] \"{top_probe.question}\""
+            f"TOP_PROBE: [priority={top_probe.priority}, turns_ago={turns_ago}]"
+            f" \"{top_probe.question}\""
         )
         if top_probe.rationale:
-            probe_line += f" (rationale: {top_probe.rationale})"
+            probe_line += f"\n  rationale: {top_probe.rationale}"
         lines.append(probe_line)
     else:
         lines.append("TOP_PROBE: none")
@@ -113,7 +133,7 @@ async def run_interviewer(
     respondent_text: str,
 ) -> InterviewerOutput:
     """Pre-fetch context → one LLM call → mark probe if used."""
-    context_block, top_probe = _build_context(deps.session, deps.call_id)
+    context_block, top_probe = _build_context(deps.session, deps.call_id, deps.turn_number)
     prompt = f"{context_block}\n\nRespondent: {respondent_text}"
 
     result = await interviewer.run(prompt, deps=deps)
@@ -131,7 +151,7 @@ async def run_interviewer_with_timeout(
     deps: InterviewerDeps,
     respondent_text: str,
     *,
-    budget_s: float = 1.8,
+    budget_s: float = INTERVIEWER_BUDGET_S,
 ) -> InterviewerOutput:
     """Hard deadline wrapper. Returns a scripted fallback on timeout."""
     try:
@@ -146,6 +166,7 @@ async def run_interviewer_with_timeout(
 def _fallback(deps: InterviewerDeps) -> InterviewerOutput:
     q = state.next_scripted(deps.session, deps.call_id)
     if q is not None:
+        state.mark_scripted_asked(deps.session, deps.call_id)
         return InterviewerOutput(
             utterance=q,
             action="scripted",

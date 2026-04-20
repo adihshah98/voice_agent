@@ -12,8 +12,8 @@ from dataclasses import dataclass
 
 from pydantic_evals.evaluators import Evaluator, EvaluatorContext, LLMJudge
 
-from evals.cases import InterviewerCaseInputs
-from models import InterviewerOutput
+from evals.cases import AnalystCaseInputs, InterviewerCaseInputs
+from voice_agent.models import AnalysisUpdate, InterviewerOutput
 
 
 JUDGE_MODEL = "anthropic:claude-opus-4-6"
@@ -73,6 +73,132 @@ def utterance_warmth_judge() -> LLMJudge:
         include_input=False,
         score={"evaluation_name": "utterance_warmth"},
         assertion=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — Analyst probe quality evaluators
+# ---------------------------------------------------------------------------
+
+
+def _jaccard(a: str, b: str) -> float:
+    wa = set(a.lower().split())
+    wb = set(b.lower().split())
+    if not wa and not wb:
+        return 1.0
+    return len(wa & wb) / len(wa | wb)
+
+
+@dataclass
+class HasProbes(Evaluator[AnalystCaseInputs, AnalysisUpdate, None]):
+    """At least one probe was generated — necessary for other scorers to mean anything."""
+
+    def evaluate(
+        self, ctx: EvaluatorContext[AnalystCaseInputs, AnalysisUpdate, None]
+    ) -> bool:
+        return len(ctx.output.new_probes) >= 1
+
+
+@dataclass
+class NoDuplicateProbes(Evaluator[AnalystCaseInputs, AnalysisUpdate, None]):
+    """No two probes share more than `threshold` Jaccard word-overlap.
+
+    Catches cases where the analyst generates two near-identical questions
+    phrased slightly differently. Embedding-level dedup would be more precise
+    but requires an extra dep; word Jaccard is accurate enough for a prototype.
+    """
+
+    threshold: float = 0.60
+
+    def evaluate(
+        self, ctx: EvaluatorContext[AnalystCaseInputs, AnalysisUpdate, None]
+    ) -> bool:
+        probes = ctx.output.new_probes
+        for i, a in enumerate(probes):
+            for b in probes[i + 1 :]:
+                if _jaccard(a.question, b.question) > self.threshold:
+                    return False
+        return True
+
+
+def probes_specific_judge() -> LLMJudge:
+    """Score 1–5: do probes reference specifics from the transcript?"""
+    return LLMJudge(
+        rubric=(
+            "You are grading the PROBES produced by a qualitative research "
+            "analyst who just read an interview transcript.\n\n"
+            "Score 1–5 on SPECIFICITY:\n"
+            "  5 = every probe quotes or directly references a specific detail "
+            "from the transcript (a named thing, a verbatim phrase, a concrete "
+            "event like a date, route, or product name)\n"
+            "  4 = most probes are specific; one may be a bit generic\n"
+            "  3 = half specific, half could apply to any interview\n"
+            "  2 = mostly generic — probes could have been written without "
+            "reading this transcript\n"
+            "  1 = entirely generic; no transcript specifics referenced\n\n"
+            "Judge the `new_probes` list. The transcript is provided as the "
+            "input. Pass (score >= 3) if specificity is adequate."
+        ),
+        model=JUDGE_MODEL,
+        include_input=True,
+        score={"evaluation_name": "probes_specific"},
+        assertion=False,
+    )
+
+
+def probes_non_leading_judge() -> LLMJudge:
+    """Pass/fail: are all probes open and non-leading?"""
+    return LLMJudge(
+        rubric=(
+            "You are grading the PROBES produced by a qualitative research "
+            "analyst after reading an interview transcript.\n\n"
+            "A LEADING probe presupposes the answer, adds an unstated emotion, "
+            "or funnels the respondent toward a specific view. Examples:\n"
+            "  BAD: 'You said you were frustrated — how badly did that hurt you?'\n"
+            "  BAD: 'So the alerts are basically useless, right?'\n"
+            "  GOOD: 'What was that experience like for you?'\n"
+            "  GOOD: 'You mentioned the alerts changed — can you walk me through that?'\n\n"
+            "PASS if all probes are open and neutral. FAIL if any probe is "
+            "leading, presupposes an answer, or adds judgment the respondent "
+            "didn't express. Probes that echo the respondent's own words "
+            "without adding blame or emotion are fine."
+        ),
+        model=JUDGE_MODEL,
+        include_input=True,
+        score=False,
+        assertion={"evaluation_name": "probes_non_leading"},
+    )
+
+
+def priority_calibrated_judge() -> LLMJudge:
+    """Pass/fail: is priority-1 reserved for real contradictions/surprises?"""
+    return LLMJudge(
+        rubric=(
+            "You are grading the priority assignments on PROBES produced by a "
+            "qualitative research analyst after reading an interview transcript.\n\n"
+            "Priority rules:\n"
+            "  Priority 1 = reserved for a REAL contradiction (respondent "
+            "clearly said two conflicting things) or a MAJOR surprise (an "
+            "admission that fundamentally changes interpretation).\n"
+            "  Priority 2 = interesting thread worth exploring if time allows.\n"
+            "  Priority 3 = nice-to-have depth question.\n\n"
+            "PASS if:\n"
+            "  - Priority-1 probes target genuine contradictions or major "
+            "surprises visible in the transcript, AND\n"
+            "  - No priority-1 probe is assigned to a routine follow-up that "
+            "doesn't involve a contradiction or surprise.\n"
+            "FAIL if:\n"
+            "  - A probe is marked priority 1 when the transcript shows no "
+            "real contradiction or surprise, OR\n"
+            "  - A clear contradiction/surprise in the transcript has no "
+            "priority-1 probe assigned to it.\n\n"
+            "The transcript is provided as the input. Judge both directions: "
+            "priority-1 when warranted, and not when unwarranted."
+        ),
+        model=JUDGE_MODEL,
+        include_input=True,
+        score=False,
+        assertion={"evaluation_name": "priority_calibrated"},
     )
 
 

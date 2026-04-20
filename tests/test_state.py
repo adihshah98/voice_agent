@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from models import (
+from voice_agent.models import (
     AnalysisUpdate,
     InterviewerOutput,
     NewProbe,
     ReportOutput,
     ThemeWithQuotes,
 )
-from state import (
+from voice_agent.state import (
     AnalystSnapshot,
     Call,
     Probe,

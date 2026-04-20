@@ -93,6 +93,7 @@ class Probe(SQLModel, table=True):
     question: str
     priority: int  # 1 (highest) .. 3
     rationale: Optional[str] = None
+    generated_after_turn: Optional[int] = None  # turn number after which this probe was created
     asked: bool = Field(default=False)
     asked_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)

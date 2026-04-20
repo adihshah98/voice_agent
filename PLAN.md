@@ -416,18 +416,37 @@ Endpoints:
 
 ---
 
-## Out of scope (explicitly)
-
-- Multi-tenant auth, rate limiting, production deployment.
-- Cross-call analytics, long-term memory.
-- Fine-tuning or model distillation.
-- Prompt versioning infra beyond a `prompts/` folder with git history.
-- Barge-in / interruption handling beyond Vapi's defaults.
-
----
-
 ## My questions/Future improvements
 
-- [[interviewer.py](http://Interviewer.py)] What if the answer to the next scripted quesion is already given by respondent? Skip it/How to mark it?
-- 
+- Immediate
+  - Voice
+    - Wire in Vapi
+  - E2E
+    - Stream the outputDo an E2E call w/o Vapi - mimic an atual diligence call
+    - Understand how to view Pydantic Logfire traces
+    - The play.py, [server.py](http://server.py) and whatever else should use the same loop right
+    - The Evals for Trajectory call
+  - Interview Loop
+    - What if the answer to the next scripted quesion is already given by respondent? Skip it/How to mark it?
+  - Analyst 
+    - If context >200, how will it reads contras from before
+- Prod Level
+  - See where traces go & have a good observabilty process/dashnoard
+  - Vesioned prompts/datasets/eval runs
+  - Live DB
+  - Caching & Latency
+  - Prompt Caching
+  - Secrets Management
+  - Dependency Mgmt on pyproject.timl and remove requirements.txt
+- Deployment Level
+  - SQS Queues
+  - Secrets manager 
+  - Render Deployment + CI/CD
+  - Multi-tenant auth
+  - Rate limiting
+- Per Customer per project configuration
+  - Add a configurable per customer per project config - eg. Duplo diligence, I list my question list, and have that be part of the scripted questions, what to focus on, what to probe on etc.
+- Advanced
+  - Long-term memory.
+  - Barge-in / interruption handling beyond Vapi's defaults.
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logfire
 from logfire.testing import CaptureLogfire
 
-from tracing import agent_span, init_tracing, log_interviewer_decision, turn_span
+from voice_agent.tracing import agent_span, init_tracing, log_interviewer_decision, turn_span
 
 
 def test_init_tracing_idempotent(capfire: CaptureLogfire) -> None:

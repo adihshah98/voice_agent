@@ -1,9 +1,0 @@
-sqlmodel>=0.0.22
-pydantic>=2.7
-pytest>=8.0
-pytest-asyncio>=1.0
-logfire[httpx]>=4.0
-pydantic-ai-slim[anthropic]>=1.0
-pydantic-evals>=1.0
-pyyaml>=6.0
-python-dotenv>=1.0

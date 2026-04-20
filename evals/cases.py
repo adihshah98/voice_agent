@@ -14,7 +14,7 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_evals import Case
 
-from models import InterviewerOutput
+from voice_agent.models import AnalysisUpdate, InterviewerOutput
 
 
 class TurnLine(BaseModel):
@@ -68,10 +68,35 @@ def load_cases(
     return cases
 
 
+class AnalystCaseInputs(BaseModel):
+    """A transcript to feed to the analyst. No expected_output — quality is
+    judged by LLM scorers and deterministic checks, not output matching."""
+
+    transcript: list[TurnLine]
+
+
+def load_analyst_cases(
+    path: str | Path,
+) -> list[Case[AnalystCaseInputs, AnalysisUpdate, None]]:
+    """Load YAML analyst cases. expected_output is always None."""
+    raw = yaml.safe_load(Path(path).read_text())
+    cases: list[Case[AnalystCaseInputs, AnalysisUpdate, None]] = []
+    for entry in raw["cases"]:
+        cases.append(
+            Case(
+                name=entry["name"],
+                inputs=AnalystCaseInputs.model_validate(entry["inputs"]),
+            )
+        )
+    return cases
+
+
 __all__ = [
+    "AnalystCaseInputs",
     "InterviewerCaseInputs",
     "InterviewerOutput",
     "ProbeSeed",
     "TurnLine",
+    "load_analyst_cases",
     "load_cases",
 ]

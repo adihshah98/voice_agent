@@ -1,1 +1,1 @@
-"""Ensures the project root is on sys.path so tests can import top-level modules."""
+"""Shared pytest configuration. Package is installed via pyproject.toml so no sys.path manipulation needed."""

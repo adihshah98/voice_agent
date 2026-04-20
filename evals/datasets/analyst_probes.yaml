@@ -1,0 +1,91 @@
+# Tier 2 analyst dataset — 6 transcripts covering:
+#   - clear contradictions (should generate priority-1 probes)
+#   - specificity signals (named things / events probes must reference)
+#   - clean transcripts (no contradictions → priority 1 should NOT appear)
+#   - surprises (unexpected admissions → priority-1 or priority-2)
+#
+# Each case is a 6–10 turn transcript. No expected_output: quality is judged
+# by LLM scorers (ProbesAreSpecific, ProbesAreNonLeading, PriorityIsCalibrated)
+# and deterministic scorers (HasProbes, NoDuplicateProbes).
+
+cases:
+
+  # --- contradictions -------------------------------------------------------
+
+  - name: trust_contradiction
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How do you currently use the product?"}
+        - {speaker: respondent, text: "I rely on it every single morning to plan my commute. Honestly I trust it 100% — it has never once given me a bad route."}
+        - {speaker: interviewer, text: "What do you like most about it?"}
+        - {speaker: respondent, text: "The accuracy. I've recommended it to at least ten people because of how reliable it is."}
+        - {speaker: interviewer, text: "Has there ever been a moment it let you down?"}
+        - {speaker: respondent, text: "Oh yeah, March was a disaster. It rerouted me onto a closed highway three days in a row."}
+        - {speaker: interviewer, text: "How did you handle that?"}
+        - {speaker: respondent, text: "I just turned it off and went back to Apple Maps. To be honest, I don't really trust it anymore after that week."}
+
+  - name: alert_feature_flip
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "Walk me through the features you use most."}
+        - {speaker: respondent, text: "The real-time accident alerts, for sure. They've saved me probably an hour a week — I leave earlier now because of them."}
+        - {speaker: interviewer, text: "What would you change about it?"}
+        - {speaker: respondent, text: "Honestly not much. The UI could be cleaner but the core stuff works great."}
+        - {speaker: interviewer, text: "How has your usage changed over the past few months?"}
+        - {speaker: respondent, text: "I've actually started ignoring the alerts completely. They're always wrong — either late by 20 minutes or reporting accidents that cleared hours ago."}
+        - {speaker: interviewer, text: "What made you stop relying on them?"}
+        - {speaker: respondent, text: "Three times in one week they sent me into traffic they said was clear. I just filter them out now."}
+
+  - name: usage_frequency_flip
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How often do you use the product?"}
+        - {speaker: respondent, text: "Every single day. Sometimes twice a day if I have an evening meeting. It's basically part of my routine at this point."}
+        - {speaker: interviewer, text: "And what keeps you coming back day after day?"}
+        - {speaker: respondent, text: "The habit, mostly. And the time savings — I'd say it saves me 30 minutes a week at least."}
+        - {speaker: interviewer, text: "Has anything disrupted that habit recently?"}
+        - {speaker: respondent, text: "There was that big update in the fall — it changed the whole layout. I actually just... forgot about the app for like six weeks. Used Google Maps instead without really thinking about it."}
+        - {speaker: interviewer, text: "What brought you back?"}
+        - {speaker: respondent, text: "A colleague mentioned it. I re-downloaded it and had to relearn where everything was."}
+
+  # --- specificity signals --------------------------------------------------
+
+  - name: named_competitor_switch
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How long have you been using the product?"}
+        - {speaker: respondent, text: "About two and a half years. I switched from Waze in early 2022 when they removed the police-trap reporting feature — that was a dealbreaker for me."}
+        - {speaker: interviewer, text: "What made you choose this one over other alternatives?"}
+        - {speaker: respondent, text: "The community map editing. I actually submitted three map corrections in my neighborhood and they all went live within a week."}
+        - {speaker: interviewer, text: "What would make you consider switching again?"}
+        - {speaker: respondent, text: "If Waze brought back police reporting and improved their traffic layer, I'd probably at least try them again. Or if something else matched the map editing quality."}
+
+  # --- surprise / advocacy gap ---------------------------------------------
+
+  - name: advocacy_gap_surprise
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How do you feel about the product overall?"}
+        - {speaker: respondent, text: "I love it. It's genuinely one of the best tools I use. I couldn't imagine my commute without it."}
+        - {speaker: interviewer, text: "Would you recommend it to others?"}
+        - {speaker: respondent, text: "Absolutely not. I mean — I do use it myself, but I've stopped telling people about it."}
+        - {speaker: interviewer, text: "What changed?"}
+        - {speaker: respondent, text: "I recommended it to my manager and she got routed into a flooded underpass during the storm last November. She was furious. I felt terrible."}
+        - {speaker: interviewer, text: "Has that affected how you use it personally?"}
+        - {speaker: respondent, text: "No, I still use it every day. But I'd never put my name behind it for someone else now."}
+
+  # --- clean / no contradictions -------------------------------------------
+
+  - name: satisfied_longtime_user
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How long have you been using the product?"}
+        - {speaker: respondent, text: "Five years, almost to the day. I started when I moved cities for a new job and haven't looked back."}
+        - {speaker: interviewer, text: "What keeps you using it after all this time?"}
+        - {speaker: respondent, text: "It just works. Every feature does what I expect. I set it up once and it's been consistent ever since."}
+        - {speaker: interviewer, text: "Is anyone else in your life using it?"}
+        - {speaker: respondent, text: "My whole team at work — I introduced it to them about three years ago and now it's basically company policy for anyone who drives to client sites."}
+        - {speaker: interviewer, text: "What would you change about it?"}
+        - {speaker: respondent, text: "Maybe the onboarding for new users — my newer colleagues found it a bit confusing at first. Otherwise I genuinely can't think of anything major."}
+        - {speaker: interviewer, text: "Any other thoughts?"}
+        - {speaker: respondent, text: "Just that it's one of those products where I'd notice immediately if it went away. It's become invisible infrastructure for me."}

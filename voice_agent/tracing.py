@@ -29,7 +29,7 @@ def init_tracing(
     app: Any | None = None,
     engine: Any | None = None,
     send_to_logfire: Optional[bool] = None,
-    console: bool = True,
+    console: Optional[bool] = None,
 ) -> None:
     """Configure Logfire and attach auto-instrumentation.
 
@@ -41,6 +41,10 @@ def init_tracing(
       - None   → honor LOGFIRE_TOKEN env (default Logfire behaviour).
       - False  → force local-only (useful in CI/tests).
       - True   → require a token; raises if missing.
+
+    `console`:
+      - None   → off when exporting to Logfire (token set or send_to_logfire
+        True); on when local-only (no export). Pass True/False to override.
     """
     global _configured
     if _configured:
@@ -53,6 +57,16 @@ def init_tracing(
     effective_send = send_to_logfire
     if effective_send is None and not os.getenv("LOGFIRE_TOKEN"):
         effective_send = False
+
+    if send_to_logfire is False:
+        exports_to_logfire = False
+    elif send_to_logfire is True:
+        exports_to_logfire = True
+    else:
+        exports_to_logfire = bool(os.getenv("LOGFIRE_TOKEN"))
+
+    if console is None:
+        console = not exports_to_logfire
 
     logfire.configure(
         service_name=service_name,

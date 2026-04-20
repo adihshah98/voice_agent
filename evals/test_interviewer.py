@@ -25,7 +25,7 @@ from sqlmodel import create_engine
 
 load_dotenv()
 
-import state
+from voice_agent import state
 from evals.cases import InterviewerCaseInputs, load_cases
 from evals.evaluators import (
     ActionMatches,
@@ -33,10 +33,10 @@ from evals.evaluators import (
     no_leading_questions_judge,
     utterance_warmth_judge,
 )
-from interviewer import run_interviewer
-from models import InterviewerDeps, InterviewerOutput
+from voice_agent.agents.interviewer import run_interviewer
+from voice_agent.models import InterviewerDeps, InterviewerOutput
 from pydantic_evals import Dataset
-from tracing import init_tracing
+from voice_agent.tracing import init_tracing
 
 
 DATASET_PATH = Path(__file__).parent / "datasets" / "interviewer_turns.yaml"
