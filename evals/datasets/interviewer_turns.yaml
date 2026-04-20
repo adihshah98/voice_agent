@@ -1,0 +1,255 @@
+# Tier 1 interviewer dataset — 18 single-turn decisions.
+#
+# Each case seeds a minimal DB (scripted_questions, prior_turns, probes) and
+# hands the agent a `last_respondent` utterance. `expected_output.action` is
+# what a well-behaved interviewer should choose.
+#
+# Coverage: probe x5, scripted x5, clarify x3, wrap_up x3, off_topic x2.
+# `acknowledge` is intentionally not tested here — it's context-dependent and
+# rarely the unique right answer, so it belongs in Tier 3 trajectory evals.
+
+cases:
+  # --- probe (analyst flagged something worth digging into) ---------------
+
+  - name: priority_1_probe_beats_scripted
+    inputs:
+      scripted_questions:
+        - How do you currently use the product?
+        - What would you change about it?
+        - Who else might benefit from it?
+        - How much would you pay for a premium version?
+      prior_turns:
+        - {speaker: interviewer, text: "How do you currently use the product?", action: scripted}
+        - {speaker: respondent, text: "Mostly for planning my morning commute. I stopped trusting it a few months ago though."}
+      probes:
+        - {question: "You said you stopped trusting it — what happened?", priority: 1, rationale: "Trust break is a strong signal; worth unpacking."}
+      last_respondent: "Yeah, I stopped using it after that routing disaster."
+    expected_output:
+      action: probe
+
+  - name: priority_2_probe_still_beats_scripted
+    inputs:
+      scripted_questions:
+        - What do you like most about it?
+        - How often do you use it?
+      prior_turns:
+        - {speaker: interviewer, text: "What do you like most about it?", action: scripted}
+        - {speaker: respondent, text: "The price, honestly. Not much else."}
+      probes:
+        - {question: "You mentioned the price — what else did you compare it to?", priority: 2, rationale: "Pricing is a comparative claim; context matters."}
+      last_respondent: "Yeah, it's the cheapest option I found."
+    expected_output:
+      action: probe
+
+  - name: contradiction_probe_after_flip
+    inputs:
+      scripted_questions:
+        - How has your usage changed over time?
+      prior_turns:
+        - {speaker: interviewer, text: "First tell me, what drew you to it originally?", action: scripted}
+        - {speaker: respondent, text: "It was the community — everyone I knew used it."}
+        - {speaker: interviewer, text: "And now?", action: scripted}
+        - {speaker: respondent, text: "Honestly? I never really cared about the community part."}
+      probes:
+        - {question: "Earlier you said the community drew you in — what changed?", priority: 1, rationale: "Direct contradiction between turn 2 and turn 4."}
+      last_respondent: "I guess I'm just in a different place now."
+    expected_output:
+      action: probe
+
+  - name: probe_after_detailed_anecdote
+    inputs:
+      scripted_questions:
+        - What else have you tried?
+      prior_turns:
+        - {speaker: interviewer, text: "Walk me through the last time you used it.", action: scripted}
+        - {speaker: respondent, text: "Last Tuesday my flight got delayed and the app rerouted me to a train, which saved me about four hours. I was honestly shocked."}
+      probes:
+        - {question: "The Tuesday rerouting — was that a manual search or did it notify you?", priority: 1, rationale: "Specificity check on the rerouting claim."}
+      last_respondent: "Yeah it was surprisingly smooth."
+    expected_output:
+      action: probe
+
+  - name: probe_available_vague_answer
+    inputs:
+      scripted_questions:
+        - What features matter most?
+      prior_turns:
+        - {speaker: interviewer, text: "You mentioned switching — from what?", action: probe}
+        - {speaker: respondent, text: "Something else. A competitor."}
+      probes:
+        - {question: "Which competitor specifically did you switch from?", priority: 1, rationale: "Open probe on unnamed competitor."}
+      last_respondent: "Does it matter which one?"
+    expected_output:
+      action: probe
+
+  # --- scripted (no probe available; scripted queue has content) ----------
+
+  - name: no_probe_use_scripted
+    inputs:
+      scripted_questions:
+        - How do you currently use the product?
+        - What would you change about it?
+        - Who else might benefit from it?
+      prior_turns:
+        - {speaker: interviewer, text: "How do you currently use the product?", action: scripted}
+        - {speaker: respondent, text: "I've used it for about a year, mostly on weekdays."}
+      probes: []
+      last_respondent: "Yeah, every weekday for the commute."
+    expected_output:
+      action: scripted
+
+  - name: first_turn_open_scripted
+    inputs:
+      scripted_questions:
+        - To start, can you tell me a bit about yourself?
+        - How do you currently use the product?
+        - What would you change about it?
+      prior_turns: []
+      probes: []
+      last_respondent: "Hi, yeah — ready when you are."
+    expected_output:
+      action: scripted
+
+  - name: detailed_answer_no_probe_go_scripted
+    inputs:
+      scripted_questions:
+        - How often do you use it?
+        - What else have you tried?
+      prior_turns:
+        - {speaker: interviewer, text: "How often do you use it?", action: scripted}
+        - {speaker: respondent, text: "Most mornings, sometimes evenings when I'm planning a longer trip. Maybe 5 or 6 times a week."}
+      probes: []
+      last_respondent: "Yeah probably five or six times a week on average."
+    expected_output:
+      action: scripted
+
+  - name: probe_queue_exhausted_back_to_scripted
+    inputs:
+      scripted_questions:
+        - What would make you recommend it?
+        - What's the biggest frustration?
+      prior_turns:
+        - {speaker: interviewer, text: "Earlier you mentioned trust — what broke it?", action: probe}
+        - {speaker: respondent, text: "The rerouting got me lost one night. I was late for dinner."}
+      probes: []
+      last_respondent: "But I mean, it's fine now."
+    expected_output:
+      action: scripted
+
+  - name: clear_complete_answer_advance
+    inputs:
+      scripted_questions:
+        - What would you change about it?
+        - Who else might benefit from it?
+      prior_turns:
+        - {speaker: interviewer, text: "What would you change about it?", action: scripted}
+        - {speaker: respondent, text: "The onboarding. It took me three attempts to finish signup because the email verification kept expiring."}
+      probes: []
+      last_respondent: "Yeah, the email verification is the main thing."
+    expected_output:
+      action: scripted
+
+  # --- clarify (genuinely ambiguous or vague one-word answers) ------------
+
+  - name: ambiguous_fine_i_guess
+    inputs:
+      scripted_questions:
+        - How do you find the pricing?
+        - What would you change?
+      prior_turns:
+        - {speaker: interviewer, text: "How do you find the pricing?", action: scripted}
+      probes: []
+      last_respondent: "It's... fine I guess? kind of."
+    expected_output:
+      action: clarify
+
+  - name: one_word_vague
+    inputs:
+      scripted_questions:
+        - How do you feel about the recent update?
+        - What would you change?
+      prior_turns:
+        - {speaker: interviewer, text: "How do you feel about the recent update?", action: scripted}
+      probes: []
+      last_respondent: "Mixed."
+    expected_output:
+      action: clarify
+
+  - name: noncommittal_maybe
+    inputs:
+      scripted_questions:
+        - Would you recommend it to a friend?
+      prior_turns:
+        - {speaker: interviewer, text: "Would you recommend it to a friend?", action: scripted}
+      probes: []
+      last_respondent: "Maybe."
+    expected_output:
+      action: clarify
+
+  # --- wrap_up (respondent signals end, or nothing left to ask) -----------
+
+  - name: respondent_explicit_done
+    inputs:
+      scripted_questions:
+        - Any final thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "Any final thoughts?", action: scripted}
+        - {speaker: respondent, text: "No, I think that covers it. I should get going."}
+      probes: []
+      last_respondent: "I really need to run, sorry."
+    expected_output:
+      action: wrap_up
+
+  - name: nothing_left_to_ask
+    inputs:
+      scripted_questions:
+        - What would you change?
+      prior_turns:
+        - {speaker: interviewer, text: "What would you change?", action: scripted}
+        - {speaker: respondent, text: "Honestly nothing major — it works for me."}
+      probes: []
+      last_respondent: "Yeah, that's really all I've got."
+    expected_output:
+      action: wrap_up
+
+  - name: respondent_leaving_meeting
+    inputs:
+      scripted_questions:
+        - Who else might benefit?
+      prior_turns:
+        - {speaker: interviewer, text: "Who else might benefit?", action: scripted}
+        - {speaker: respondent, text: "My sister, probably — she commutes further."}
+      probes: []
+      last_respondent: "Hey — I've got a meeting in like one minute, I have to hop off."
+    expected_output:
+      action: wrap_up
+
+  # --- off_topic (respondent drifts; interviewer should redirect) ---------
+
+  - name: dog_rambler_redirect
+    inputs:
+      scripted_questions:
+        - What features do you use most?
+        - What would you change?
+      prior_turns:
+        - {speaker: interviewer, text: "What features do you use most?", action: scripted}
+        - {speaker: respondent, text: "Mostly the route planner. Oh, and my dog Biscuit hates the new update sound."}
+        - {speaker: interviewer, text: "Got it — what is it about the route planner you find most useful?", action: probe}
+        - {speaker: respondent, text: "Biscuit is a border collie, by the way. He's five. I got him from a shelter in Oakland."}
+      probes: []
+      last_respondent: "They had this whole adoption event — I was only there for coffee but then I saw him and it was all over."
+    expected_output:
+      action: off_topic
+
+  - name: politics_tangent_redirect
+    inputs:
+      scripted_questions:
+        - What would make you pay more?
+        - Who else might benefit?
+      prior_turns:
+        - {speaker: interviewer, text: "What would make you pay more?", action: scripted}
+        - {speaker: respondent, text: "Honestly? With the economy the way it is, nobody's paying more for anything."}
+      probes: []
+      last_respondent: "And don't get me started on what the current administration is doing to small businesses — it's absolutely outrageous, let me tell you about my cousin's bakery..."
+    expected_output:
+      action: off_topic
