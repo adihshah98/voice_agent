@@ -1,193 +1,299 @@
-"""Interactive E2E playground — you play the respondent.
-
-Runs the full pipeline each turn: analyst (background) + interviewer (foreground),
-then synthesis at the end. Uses the same scripted questions as the trajectory evals.
+#!/usr/bin/env python3
+"""play.py — terminal E2E simulation of a voice research interview.
 
 Usage:
-    uv run python play.py
-    uv run python play.py --call-id my-test-1
+    uv run python scripts/play.py                          # generic terminal REPL
+    uv run python scripts/play.py "Notion AI"              # substitute [product]
+    uv run python scripts/play.py "Notion AI" --phone +14155551234  # live Vapi call
 
-Traces:
-    LOGFIRE_TOKEN set  → logfire.pydantic.dev (no console trace tree)
-    LOGFIRE_TOKEN unset → Logfire pretty-print on console only
+Loads evals/datasets/investor_questions.yaml.
+
+Local REPL mode drives the interviewer in-process against the same SQLite DB
+the server uses — no running server required.
+
+--phone mode hits a running server to dial out via Vapi:
+    uv run uvicorn voice_agent.server:app --reload
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import logging
 import os
 import sys
-import time
 import uuid
-import argparse
+from datetime import datetime, timezone
+from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 load_dotenv()
 
-from sqlalchemy.pool import StaticPool
-from sqlmodel import create_engine
+_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+_root_level = getattr(logging, _level_name, logging.INFO)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=_root_level,
+        format="%(levelname)s %(name)s %(message)s",
+    )
+play_logger = logging.getLogger("voice_agent.play")
+
+from sqlmodel import Session, select
 
 from voice_agent import state
-from voice_agent.agents.analyst import run_analyst_safely
-from voice_agent.agents.interviewer import run_interviewer_with_timeout
-from voice_agent.config import INTERVIEWER_BUDGET_S
-from voice_agent.models import AnalystDeps, InterviewerDeps
 from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely
-from voice_agent.tracing import init_tracing, turn_span, log_interviewer_decision
+from voice_agent.config import ENABLE_SYNTHESIS_REPORT
+from voice_agent.tracing import agent_span, init_tracing
+from voice_agent.turn import run_speech_turn
 
-SCRIPTED_QUESTIONS = [
-    "How do you currently use this product?",
-    "What do you value most about it?",
-    "Has anything frustrated you about it recently?",
-    "Would you recommend it to someone else?",
-    "What would make you use it more often?",
-]
+BASE_URL = "http://localhost:8000"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///voice_agent.db")
 
 
-def _make_engine():
-    return create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+def _investor_questions_path() -> Path:
+    here = Path(__file__).resolve().parent
+    for root in [here.parent, *here.parents]:
+        candidate = root / "evals" / "datasets" / "investor_questions.yaml"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "evals/datasets/investor_questions.yaml not found. "
+        f"Searched upward from {here}. Run from the voice_agent repo clone."
     )
 
 
-def _seed(engine, call_id: str) -> None:
-    with state.session_scope(engine) as s:
-        s.add(
+QUESTIONS_FILE = _investor_questions_path()
+
+
+# --- Question loading -------------------------------------------------------
+
+
+def load_questions(product: str | None) -> list[str]:
+    raw = yaml.safe_load(QUESTIONS_FILE.read_text())
+    questions = []
+    for entry in raw["questions"]:
+        q = entry["question"].strip()
+        q = q.replace("[product]", product if product else "the product")
+        questions.append(q)
+    return questions
+
+
+# --- In-process call ops ----------------------------------------------------
+
+
+def seed_call(engine, questions: list[str]) -> str:
+    call_id = str(uuid.uuid4())
+    with state.session_scope(engine) as session:
+        session.add(
             state.Call(
                 id=call_id,
-                scripted_questions=SCRIPTED_QUESTIONS,
+                scripted_questions=questions,
                 status="active",
             )
         )
+    return call_id
 
 
-async def _run(call_id: str) -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("ANTHROPIC_API_KEY not set — check .env", file=sys.stderr)
-        sys.exit(2)
+def mark_ended(engine, call_id: str) -> None:
+    with state.session_scope(engine) as session:
+        call = session.get(state.Call, call_id)
+        if call and call.status != "ended":
+            call.status = "ended"
+            call.end_reason = "local-simulation"
+            call.ended_at = datetime.now(timezone.utc)
+            session.add(call)
 
-    engine = _make_engine()
+
+async def run_synthesis_inproc(engine, call_id: str) -> None:
+    session = Session(engine)
+    try:
+        with agent_span("synthesis", call_id):
+            deps = SynthesisDeps(call_id=call_id, session=session)
+            await run_synthesis_safely(deps)
+    finally:
+        session.close()
+
+
+def load_report(engine, call_id: str) -> dict | None:
+    with state.session_scope(engine) as session:
+        report = session.exec(
+            select(state.SynthesisReport).where(state.SynthesisReport.call_id == call_id)
+        ).first()
+        if report is None:
+            return None
+        return {
+            "summary": report.summary,
+            "themes": report.themes,
+            "contradictions": report.contradictions,
+            "key_quotes": report.key_quotes,
+            "follow_up_questions": report.follow_up_questions,
+        }
+
+
+# --- Report display ---------------------------------------------------------
+
+
+def print_report(report: dict) -> None:
+    sep = "─" * 60
+    print(f"\n{sep}")
+    print("SYNTHESIS REPORT")
+    print(sep)
+
+    print(f"\nSUMMARY:\n{report.get('summary', '')}")
+
+    themes = report.get("themes", [])
+    if themes:
+        print(f"\nTHEMES ({len(themes)}):")
+        for t in themes:
+            if isinstance(t, dict):
+                print(f"  • {t.get('theme', t)}")
+                for q in t.get("quotes", []):
+                    print(f'      "{q}"')
+            else:
+                print(f"  • {t}")
+
+    contradictions = report.get("contradictions", [])
+    if contradictions:
+        print("\nCONTRADICTIONS:")
+        for c in contradictions:
+            print(f"  • {c}")
+
+    key_quotes = report.get("key_quotes", [])
+    if key_quotes:
+        print("\nKEY QUOTES:")
+        for q in key_quotes:
+            print(f'  "{q}"')
+
+    follow_ups = report.get("follow_up_questions", [])
+    if follow_ups:
+        print("\nFOLLOW-UP QUESTIONS:")
+        for q in follow_ups:
+            print(f"  • {q}")
+
+    print(sep)
+
+
+# --- REPL -------------------------------------------------------------------
+
+
+async def run_local_repl(questions: list[str]) -> None:
+    engine = state.make_engine(DATABASE_URL)
     state.init_db(engine)
-    _seed(engine, call_id)
+    init_tracing(engine=engine)
 
-    print(f"\n  call_id : {call_id}")
-    print(f"  questions: {len(SCRIPTED_QUESTIONS)} scripted")
-    print("  Type your reply and press Enter. Ctrl-D or empty line to end early.\n")
+    call_id = seed_call(engine, questions)
+    print(f"Call created: {call_id}")
+
+    print('\nType respondent answers below. Enter "quit" or Ctrl-D to stop.')
     print("─" * 60)
 
-    # Open with the first scripted question
-    with state.session_scope(engine) as s:
-        opening = state.next_scripted(s, call_id)
-        state.mark_scripted_asked(s, call_id)
-        s.add(
-            state.Turn(
-                call_id=call_id,
-                turn_number=1,
-                speaker="interviewer",
-                text=opening,
-                action="scripted",
-            )
-        )
+    opening = await run_speech_turn(engine, call_id, "")
+    print(f"\ninterviewer> {opening['message']}")
+    print(f"  [ACTION: {opening['action']}]")
+    print(f"  [WHY: {opening['reasoning']}]")
 
-    print(f"\nInterviewer: {opening}\n")
-    turn_number = 2
-
+    loop = asyncio.get_running_loop()
     while True:
         try:
-            line = input("You: ").strip()
+            user_input = (await loop.run_in_executor(None, input, "\nrespondent> ")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
-        if not line:
+
+        if user_input.lower() in ("quit", "exit", "q"):
+            break
+        if not user_input:
+            continue
+
+        result = await run_speech_turn(engine, call_id, user_input)
+        print(f"\ninterviewer> {result['message']}")
+        print(f"  [ACTION: {result['action']}]")
+        print(f"  [WHY: {result['reasoning']}]")
+
+        if result["action"] == "wrap_up":
+            print("\n[wrap_up — ending call...]")
             break
 
-        # Analyst runs in background (fire-and-forget, same as prod)
-        async def _analyst():
-            with state.session_scope(engine) as s:
-                await run_analyst_safely(AnalystDeps(call_id=call_id, session=s))
+    print("\nEnding call...")
+    mark_ended(engine, call_id)
 
-        analyst_task = asyncio.create_task(_analyst())
-
-        with state.session_scope(engine) as s:
-            s.add(
-                state.Turn(
-                    call_id=call_id,
-                    turn_number=turn_number,
-                    speaker="respondent",
-                    text=line,
-                )
-            )
-
-        # Interviewer (foreground, same 1.8 s budget as prod)
-        with state.session_scope(engine) as s:
-            deps = InterviewerDeps(
-                call_id=call_id, session=s, turn_number=turn_number + 1
-            )
-            with turn_span(call_id, turn_number, respondent_text=line):
-                t0 = time.perf_counter()
-                out = await run_interviewer_with_timeout(deps, line, budget_s=INTERVIEWER_BUDGET_S)
-                latency_ms = int((time.perf_counter() - t0) * 1000)
-                log_interviewer_decision(
-                    call_id=call_id,
-                    turn_number=turn_number + 1,
-                    action=out.action,
-                    utterance=out.utterance,
-                    reasoning=out.reasoning,
-                    latency_ms=latency_ms,
-                )
-            s.add(
-                state.Turn(
-                    call_id=call_id,
-                    turn_number=turn_number + 1,
-                    speaker="interviewer",
-                    text=out.utterance,
-                    action=out.action,
-                    reasoning=out.reasoning,
-                    latency_ms=latency_ms,
-                )
-            )
-
-        print(f"\nInterviewer: {out.utterance}")
-        print(f"  [{out.action} · {latency_ms} ms · {out.reasoning}]\n")
-
-        turn_number += 2
-
-        if out.action == "wrap_up":
-            break
-
-    # Synthesis
-    print("─" * 60)
-    print("Generating synthesis report…")
-    with state.session_scope(engine) as s:
-        report = await run_synthesis_safely(SynthesisDeps(call_id=call_id, session=s))
-
-    if report:
-        print(f"\nSummary:\n  {report.summary}")
-        if report.themes:
-            print(f"\nThemes:\n  " + "\n  ".join(f"• {t}" for t in report.themes))
-        if report.key_quotes:
-            print(f"\nKey quotes:\n  " + "\n  ".join(f'"{q}"' for q in report.key_quotes))
-        if report.contradictions:
-            print(f"\nContradictions:\n  " + "\n  ".join(f"• {c}" for c in report.contradictions))
-        if report.follow_up_questions:
-            print(f"\nFollow-ups:\n  " + "\n  ".join(f"• {q}" for q in report.follow_up_questions))
+    if ENABLE_SYNTHESIS_REPORT:
+        print("Running synthesis...")
+        await run_synthesis_inproc(engine, call_id)
+        report = load_report(engine, call_id)
+        if report is None:
+            print("Synthesis produced no report (see logs).")
+        else:
+            print_report(report)
     else:
-        print("(No synthesis report generated.)")
+        print("Synthesis disabled (ENABLE_SYNTHESIS_REPORT=false).")
 
-    print(f"\n  call_id for traces: {call_id}\n")
+
+# --- --phone mode: dial via server ------------------------------------------
+
+
+def dial_via_server(questions: list[str], phone_number: str) -> None:
+    import httpx
+
+    call_id = str(uuid.uuid4())
+    with httpx.Client() as client:
+        try:
+            client.get(f"{BASE_URL}/docs", timeout=3)
+        except httpx.ConnectError:
+            play_logger.error("Cannot connect to server at %s", BASE_URL)
+            play_logger.error("Start it with: uv run uvicorn voice_agent.server:app --reload")
+            sys.exit(1)
+
+        resp = client.post(
+            f"{BASE_URL}/calls/start",
+            json={
+                "scripted_questions": questions,
+                "call_id": call_id,
+                "phone_number": phone_number,
+            },
+            timeout=15,
+        )
+        if not resp.is_success:
+            play_logger.error(
+                "POST /calls/start failed status=%s body=%s",
+                resp.status_code,
+                resp.text,
+            )
+        resp.raise_for_status()
+
+    play_logger.info("Call created call_id=%s", call_id)
+    play_logger.info("Dialing %s via Vapi (interviewer should call you now)", phone_number)
+    play_logger.info(
+        "After the call, synthesis report: curl %s/calls/%s/report",
+        BASE_URL,
+        call_id,
+    )
+
+
+# --- Entrypoint -------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Interactive voice-agent playground")
-    parser.add_argument("--call-id", default=None, help="Stable call ID (default: random UUID)")
+    parser = argparse.ArgumentParser(description="Terminal E2E voice interview simulation")
+    parser.add_argument("product", nargs="?", help="Product name to substitute in questions (optional)")
+    parser.add_argument("--phone", metavar="NUMBER", help="Dial this number via Vapi (e.g. +14155551234)")
     args = parser.parse_args()
 
-    call_id = args.call_id or f"play-{uuid.uuid4().hex[:8]}"
-    init_tracing(service_name="voice-agent-play")
-    asyncio.run(_run(call_id))
+    product: str | None = args.product or None
+    questions = load_questions(product)
+    label = f"'{product}'" if product else "generic (no product)"
+    print(f"\nLoaded {len(questions)} scripted questions — {label}")
+
+    if args.phone:
+        dial_via_server(questions, args.phone)
+        return
+
+    asyncio.run(run_local_repl(questions))
 
 
 if __name__ == "__main__":

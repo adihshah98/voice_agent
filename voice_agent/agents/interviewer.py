@@ -1,8 +1,8 @@
 """Interviewer agent — single-call, pre-fetched context.
 
 Instead of a ReAct tool loop, we read all DB state before the LLM call and
-inject it as a structured context block. One LLM call per turn → fits
-comfortably inside the 1.8 s latency budget even without streaming.
+inject it as a structured context block. One LLM call per turn; wall-clock is
+bounded by `INTERVIEWER_BUDGET_S` in `config.py` (hard timeout wrapper).
 
 Side effects (marking a probe as asked) happen in Python after the call,
 based on the structured output, so the model never needs to call a tool.
@@ -11,7 +11,6 @@ based on the structured output, so the model never needs to call a tool.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
 
 from pydantic_ai import Agent
 
@@ -21,7 +20,11 @@ from voice_agent.models import InterviewerDeps, InterviewerOutput
 
 
 INTERVIEWER_PROMPT = """\
-You are a skilled market-research interviewer on a live phone call.
+You are conducting a customer interview on behalf of an investor or research firm
+doing due diligence on a B2B SaaS or AI product. Your job is to understand how
+real customers use the product, what value they get, and what signals exist around
+product-market fit, competitive position, and revenue dynamics.
+
 You speak one short, conversational question at a time.
 
 You receive a CONTEXT block, then the respondent's latest utterance.
@@ -30,45 +33,81 @@ analyst suggestions are inputs. You decide what happens next.
 
 CONTEXT fields:
 - SCRIPTED_REMAINING / NEXT_SCRIPTED: structured study questions
-- TOP_PROBE: a suggestion from your analyst, with priority (1=urgent, 2=worthwhile,
-  3=nice-to-have) and TURNS_AGO (how stale it is)
-- RECENT_TURNS: last few turns
+- PENDING_PROBES: up to 3 analyst suggestions, each tagged with [id, priority, turns_ago].
+  Priority 1=urgent, 2=worthwhile, 3=nice-to-have. All are fresh (turns_ago ≤ 8).
+  When you use one, set action=probe and probe_id_used to its exact id.
+- COVERED_TOPICS: every question you have already asked — never revisit these
+- RECENT_TURNS: last several turns of conversation
 
 Decision framework — use your judgment in this order:
+
+0. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_TOPICS.
+   If the topic you're about to ask about was already addressed, skip it entirely and
+   move to the next step, unless the answer was incomplete or evasive.
 
 1. OFF-TOPIC: If the respondent went on a personal tangent unrelated to the study,
    acknowledge briefly and steer back with one open question. Use `off_topic`.
 
-2. IMMEDIATE FOLLOW-UP: If the respondent just said something worth digging into
-   - a crash
-   - a complaint
-   - a surprise
-   - a specific event
-   -  a contradiction
-   - or even some detail but we want to go deeper 
-   - limited info/details where more info would helo our research
-   Then probe it NOW. Don't wait for the analyst. Ask the natural next question:
-   "What happens when it crashes?", "When does that usually come up?",
-   "What made you stop trusting it?" This beats scripted questions and analyst probes.
+2. IMMEDIATE FOLLOW-UP: If the respondent just said something worth digging into —
+   a complaint, surprise, contradiction, specific detail, red flag, or investor signal
+   (see triggers below) — probe it NOW. Don't wait for the analyst.
    Use action=`probe`.
 
-3. ANALYST PROBE — TOP_PROBE is present:
-   - TURNS_AGO ≤ 2 and still relevant to the current moment: use it. Rephrase naturally.
-   - TURNS_AGO > 2: only revisit if it's still live in the conversation.
-     If you use it, bridge explicitly: "Earlier you mentioned X — I wanted to come back
-     to that..." Priority 1 is worth revisiting; priority 2–3, skip it if the
-     moment has passed.
-   - Skip entirely (and maybe come back to it later) if the current utterance gives you something more pressing.
+3. ANALYST PROBE — PENDING_PROBES is non-empty:
+   - Pick the highest-priority probe not already in COVERED_TOPICS.
+   - TURNS_AGO ≤ 2: use it directly, rephrase naturally.
+   - TURNS_AGO 3–8: bridge with "Earlier you mentioned X..." if needed.
+   - Set probe_id_used to the probe's exact id.
+   - Skip if the current utterance gives you something more pressing.
    Use action=`probe`.
 
 4. SCRIPTED: No immediate follow-up and no timely probe — ask NEXT_SCRIPTED.
    A small natural lead-in is fine; don't change the meaning. Use action=`scripted`.
+   EXCEPTION — if the respondent has already answered NEXT_SCRIPTED earlier in the
+   conversation (check COVERED_TOPICS and RECENT_TURNS), skip it silently: set
+   action=`skip_scripted` and move on to a probe or the following scripted question.
+   Do NOT ask a question you already have the answer to.
 
 5. CLARIFY: Only if the answer was genuinely ambiguous before you can move on.
    Do not use for clear, on-topic answers. Use action=`clarify`.
 
 6. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
    Use action=`wrap_up`.
+
+--- INVESTOR SIGNAL TRIGGERS ---
+These are high-value moments. When you hear them, deviate from scripted order
+and probe immediately (action=`probe`):
+
+REFERRAL / WORD-OF-MOUTH — "a colleague recommended it", "everyone I know uses it",
+"I just found it on my own": probe one level deeper.
+→ "How did your colleague come across it?" / "Has anyone else on your team started using it on their own?"
+
+AI TRUST / VERIFICATION — "I always double-check it", "I don't fully trust the AI",
+"it sometimes hallucinates", "I verify everything": probe the gap.
+→ "What's your process for checking the outputs?" / "What would it take for you to trust it without checking?"
+
+ROI / QUANTIFICATION — "it saves a lot of time", "we're seeing real value", any
+mention of hours saved, deals closed, cost reduced: get specific.
+→ "Can you give me a rough sense of the scale — hours per week, something like that?"
+
+COMPETITOR MENTION — any named alternative tool or vendor: probe differentiation and stickiness.
+→ "What made [X] not the right fit?" / "Is [X] still something your team looks at?"
+
+BUDGET / APPROVAL PATH — "we had to get approval", "it's in the IT budget",
+"our VP signed off", contract details: probe ownership and structure.
+→ "Who owns that budget at your company — is it a central IT decision or team-by-team?"
+
+EXPANSION SIGNAL — "other teams are asking about it", "we're thinking of rolling it out
+more broadly", "we almost didn't renew but...": probe what's driving or blocking it.
+→ "What would a broader rollout look like?" / "What's the main thing holding that back?"
+
+RED FLAGS — always probe these; don't move on without understanding them:
+- "We bought it but haven't fully rolled it out" → "What got in the way of the rollout?"
+- "It's mostly used for demos / one-off projects" → "What's kept it from production use?"
+- "IT or security pushed back on it" → "What specifically concerned them?"
+- Low rating (1–5) → "What specific experience is behind that number?"
+- "We're evaluating other options" → "What's prompting that?"
+--- END TRIGGERS ---
 
 Hard rules:
 - One question per utterance. Max one `?`.
@@ -77,46 +116,64 @@ Hard rules:
   Always use open, neutral phrasing: "What happened?", "How did that feel?",
   "What was that like for you?"
 - Keep utterances under ~30 words — this is spoken, not written.
+- Valid actions: scripted, probe, clarify, off_topic, wrap_up. Do not use `acknowledge`
+  as a standalone action — brief acknowledgments belong in the utterance itself before
+  steering back.
 - Populate `reasoning` with one sentence on why you chose this action.
   Not spoken; for traces and evals only.
 """
 
 
-def _build_context(session, call_id: str, current_turn: int) -> tuple[str, Optional[state.Probe]]:
-    """Read all relevant DB state and return (context_block, top_probe).
+def _build_context(session, call_id: str, current_turn: int) -> tuple[str, list[state.Probe]]:
+    """Read all relevant DB state and return (context_block, active_probes).
 
-    top_probe is returned separately so the caller can mark it asked after
-    the LLM decides to use it — no second DB round-trip needed.
+    active_probes are the non-stale unasked probes passed to the model. The model
+    returns probe_id_used so the caller can mark exactly the right one asked.
     Nothing is written to the DB here.
     """
     next_q = state.next_scripted(session, call_id)
     remaining = state.scripted_remaining(session, call_id)
-    top_probe = state.pop_top_probe(session, call_id)
-    turns = state.recent_turns(session, call_id, n=6)
+    probes = state.top_probes(session, call_id, n=3)
+    turns = state.recent_turns(session, call_id, n=30)
 
     lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {remaining}"]
 
     lines.append(f"NEXT_SCRIPTED: {next_q}" if next_q else "NEXT_SCRIPTED: none")
 
-    if top_probe:
-        turns_ago = current_turn - (top_probe.generated_after_turn or 0)
-        probe_line = (
-            f"TOP_PROBE: [priority={top_probe.priority}, turns_ago={turns_ago}]"
-            f" \"{top_probe.question}\""
-        )
-        if top_probe.rationale:
-            probe_line += f"\n  rationale: {top_probe.rationale}"
-        lines.append(probe_line)
+    active_probes = [
+        p for p in probes
+        if (current_turn - (p.generated_after_turn or 0)) <= 8
+    ]
+    if active_probes:
+        lines.append("PENDING_PROBES (analyst suggestions, in priority order):")
+        for probe in active_probes:
+            turns_ago = current_turn - (probe.generated_after_turn or 0)
+            line = f'  [id={probe.id}, priority={probe.priority}, turns_ago={turns_ago}] "{probe.question}"'
+            if probe.rationale:
+                line += f"\n    rationale: {probe.rationale}"
+            lines.append(line)
     else:
-        lines.append("TOP_PROBE: none")
+        lines.append("PENDING_PROBES: none")
 
-    if turns:
+    # Questions already asked — model must not revisit these topics
+    covered = [
+        t.text
+        for t in turns
+        if t.speaker == "interviewer" and t.action in ("scripted", "probe", "clarify")
+    ]
+    if covered:
+        lines.append("COVERED_TOPICS (do NOT revisit these):")
+        for q in covered:
+            lines.append(f"  - {q}")
+
+    recent = turns[-14:] if len(turns) > 14 else turns
+    if recent:
         lines.append("RECENT_TURNS:")
-        for t in turns:
+        for t in recent:
             lines.append(f"  {t.speaker}: {t.text}")
 
     lines.append("[/CONTEXT]")
-    return "\n".join(lines), top_probe
+    return "\n".join(lines), active_probes
 
 
 interviewer = Agent(
@@ -133,16 +190,16 @@ async def run_interviewer(
     respondent_text: str,
 ) -> InterviewerOutput:
     """Pre-fetch context → one LLM call → mark probe if used."""
-    context_block, top_probe = _build_context(deps.session, deps.call_id, deps.turn_number)
+    context_block, active_probes = _build_context(deps.session, deps.call_id, deps.turn_number)
     prompt = f"{context_block}\n\nRespondent: {respondent_text}"
 
     result = await interviewer.run(prompt, deps=deps)
     out = result.output
 
-    if out.action == "scripted":
+    if out.action in ("scripted", "skip_scripted"):
         state.mark_scripted_asked(deps.session, deps.call_id)
-    elif out.action == "probe" and top_probe is not None:
-        state.mark_probe_asked(deps.session, top_probe.id)
+    if out.probe_id_used is not None:
+        state.mark_probe_asked(deps.session, out.probe_id_used)
 
     return out
 
@@ -199,9 +256,12 @@ def _seed_demo_db():
                 id=call_id,
                 phone_number="+15550100",
                 scripted_questions=[
-                    "How do you currently use the product?",
-                    "What would you change about it?",
-                    "Who else might benefit from it?",
+                    "Walk me through how your team actually uses the product day-to-day.",
+                    "When you were evaluating options, what else did you look at?",
+                    "What ultimately made you go with this product over those alternatives?",
+                    "How did the buying and rollout process go — anything that stood out?",
+                    "If you had to rate the product from one to ten based on your experience so far, what would you say — and what's behind that number?",
+                    "What's the one thing you'd most want the product to change or add?",
                 ],
                 status="active",
             )
@@ -211,22 +271,22 @@ def _seed_demo_db():
                 call_id=call_id,
                 turn_number=1,
                 speaker="interviewer",
-                text="How do you currently use the product?",
+                text="Walk me through how your team actually uses the product day-to-day.",
                 action="scripted",
             ),
             state.Turn(
                 call_id=call_id,
                 turn_number=2,
                 speaker="respondent",
-                text="Mostly for planning my morning commute. I stopped trusting it a few months ago though.",
+                text="We use it mainly for sales call summaries. Our AEs love it — a colleague actually recommended it to our VP after seeing it at another company.",
             ),
         ])
         s.add(
             state.Probe(
                 call_id=call_id,
-                question="You said you stopped trusting it — what happened?",
+                question="How did your colleague first come across it at that other company?",
                 priority=1,
-                rationale="Respondent hinted at a trust break; worth digging into.",
+                rationale="Word-of-mouth referral chain — strong PMF signal worth probing.",
             )
         )
     return engine, call_id
@@ -244,7 +304,7 @@ def _repl() -> None:
         sys.exit(2)
     engine, call_id = _seed_demo_db()
     print(f"Seeded demo call '{call_id}'. Type respondent lines; Ctrl-D to exit.")
-    print("(Try: 'Yeah, there was a bad routing day and I just lost faith in it.')\n")
+    print("(Try: 'We evaluated Gong and Chorus too, but honestly security flagged both of them.')\n")
 
     turn_number = 3
     while True:

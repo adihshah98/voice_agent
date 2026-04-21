@@ -23,48 +23,103 @@ from voice_agent.models import AnalysisUpdate, AnalystDeps
 
 
 ANALYST_PROMPT = """\
-You are a qualitative research analyst reviewing a live interview transcript.
+You are an investment research analyst reviewing a live B2B SaaS/AI customer interview.
+The interviewer is gathering intelligence on behalf of an investor doing due diligence.
+
+You may receive an ESTABLISHED CONTEXT block summarising prior analysis, followed by a
+NEW TRANSCRIPT block containing only the turns since that analysis. If present, treat
+ESTABLISHED CONTEXT as already confirmed — do not re-flag the same themes, contradictions,
+or signals. Build on it: surface what's new, changed, or now contradicted.
+If there is no ESTABLISHED CONTEXT, you receive the full TRANSCRIPT from the start.
 
 Your job:
-1. THEMES — recurring ideas or patterns in the respondent's answers.
-2. CONTRADICTIONS — places where the respondent says things that conflict with each other.
-3. SURPRISES — answers that were unexpected or reveal something the interviewer didn't anticipate.
-4. NEW_PROBES — follow-up questions worth asking to dig deeper.
+1. THEMES — recurring ideas or patterns. Focus on what's investment-relevant:
+   adoption depth, use-case clarity, workflow integration, team dependence.
 
-Probe guidelines:
-- Reference specifics from the transcript (direct quotes, named things, moments).
-- Use open, neutral phrasing — never leading questions.
-- Priority 1 = real contradiction or major surprise worth asking immediately.
-- Priority 2 = interesting thread worth exploring if time allows.
-- Priority 3 = nice-to-have depth.
-- Maximum 3 new probes per pass.
-- Never repeat a question already in EXISTING_PROBES.
+2. CONTRADICTIONS — places where the respondent contradicts themselves.
+   Pay special attention to gaps between stated satisfaction and actual usage behavior.
 
-Be concise — bullet-point style for themes/contradictions/surprises.
+3. SURPRISES — unexpected answers that reveal novel signal: an unexpected use case,
+   a competitor you didn't know was in the market, a pricing structure that's unusual,
+   an adoption barrier that's non-obvious.
+
+4. INVESTOR_SIGNALS — the most important output. Tag each signal with its category:
+   - [PMF] product-market fit signals: daily habit, word-of-mouth, "can't live without it",
+     organic expansion within the org, strong unprompted advocacy, high NPS-equivalent
+   - [COMPETITIVE] competitive intelligence: named alternatives, why they were rejected,
+     switching triggers, what would make the respondent reconsider
+   - [REVENUE] revenue/business signals: who owns the budget, annual vs. monthly contract,
+     seat expansion signals, price sensitivity, renewal risk or intent
+   - [AI-SIGNAL] AI-specific signals: trust in AI outputs, verification habits, ROI clarity,
+     adoption barriers (security, compliance, hallucinations), workflow integration depth
+   - [RED-FLAG] churn risk or weak PMF: low seat utilization, "mostly for demos",
+     implementation stalled, IT/security pushback, evaluating alternatives, low rating
+
+   Format each signal as a tagged one-liner citing the transcript:
+   "[PMF] Uses it before every meeting — daily habit, cited 'can't imagine going back'"
+   "[RED-FLAG] Only 3 of 20 seats active after 6 months — rollout stalled"
+
+5. NEW_PROBES — follow-up questions worth asking. Probe guidelines:
+   - Reference specifics from the transcript.
+   - Use open, neutral phrasing — never leading questions.
+   - Priority 1 = contradiction about value/usage OR red flag (churn risk, stalled adoption)
+                  OR strong PMF signal that hasn't been probed yet (word-of-mouth source,
+                  expansion plans, who else uses it)
+   - Priority 2 = competitive signal needing clarification, or revenue/budget detail missing
+   - Priority 3 = AI trust/adoption depth, nice-to-have context
+   - Maximum 3 new probes per pass.
+   - Never repeat a question already in EXISTING_PROBES.
+
+Be concise — bullet-point style for all lists except investor_signals (one tagged line each).
 """
 
 
 def _build_prompt(session, call_id: str) -> tuple[str, int]:
-    """Return (prompt_text, last_turn_number)."""
-    turns = state.recent_turns(session, call_id, n=200)
-    if not turns:
-        return "(no turns yet)", 0
+    """Return (prompt_text, last_turn_number).
 
-    lines = []
-    for t in turns:
-        lines.append(f"{t.speaker.upper()} [{t.turn_number}]: {t.text}")
-    transcript = "\n".join(lines)
+    If a prior AnalystSnapshot exists, feeds it as established context and only
+    appends turns since that snapshot — keeps the prompt within context limits
+    regardless of interview length.
+    """
+    snapshot = state.latest_snapshot(session, call_id)
+
+    if snapshot:
+        new_turns = state.turns_since(session, call_id, after_turn=snapshot.after_turn)
+        last_turn = new_turns[-1].turn_number if new_turns else snapshot.after_turn
+
+        lines = [
+            "ESTABLISHED CONTEXT (from prior analysis — treat as already confirmed):",
+            f"  Themes: {'; '.join(snapshot.themes) if snapshot.themes else 'none'}",
+            f"  Contradictions: {'; '.join(snapshot.contradictions) if snapshot.contradictions else 'none'}",
+            f"  Surprises: {'; '.join(snapshot.surprises) if snapshot.surprises else 'none'}",
+            "  Investor signals:",
+        ]
+        for sig in snapshot.investor_signals:
+            lines.append(f"    {sig}")
+        lines.append(f"  (covers turns 1–{snapshot.after_turn})")
+        lines.append("")
+        lines.append(f"NEW TRANSCRIPT (turns {snapshot.after_turn + 1}–{last_turn}):")
+        for t in new_turns:
+            lines.append(f"  {t.speaker.upper()} [{t.turn_number}]: {t.text}")
+    else:
+        new_turns = state.recent_turns(session, call_id, n=200)
+        if not new_turns:
+            return "(no turns yet)", 0
+        last_turn = new_turns[-1].turn_number
+        lines = ["TRANSCRIPT:"]
+        for t in new_turns:
+            lines.append(f"{t.speaker.upper()} [{t.turn_number}]: {t.text}")
 
     existing_stmt = select(state.Probe).where(state.Probe.call_id == call_id)
     existing = [p.question for p in session.exec(existing_stmt)]
 
-    prompt = f"TRANSCRIPT:\n{transcript}"
+    prompt = "\n".join(lines)
     if existing:
         prompt += "\n\nEXISTING_PROBES (do not repeat):\n" + "\n".join(
             f"- {q}" for q in existing
         )
 
-    return prompt, turns[-1].turn_number
+    return prompt, last_turn
 
 
 analyst = Agent(
@@ -93,6 +148,7 @@ async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
             themes=update.themes,
             contradictions=update.contradictions,
             surprises=update.surprises,
+            investor_signals=update.investor_signals,
             latency_ms=latency_ms,
         )
     )
@@ -115,6 +171,7 @@ async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
         themes_count=len(update.themes),
         contradictions_count=len(update.contradictions),
         surprises_count=len(update.surprises),
+        investor_signals_count=len(update.investor_signals),
         new_probes_count=len(update.new_probes),
         latency_ms=latency_ms,
     )
@@ -140,22 +197,23 @@ def _seed_canned_transcript(session, call_id: str) -> None:
             id=call_id,
             phone_number="+15550100",
             scripted_questions=[
-                "How do you currently use the product?",
-                "What would you change about it?",
-                "Who else might benefit from it?",
+                "Walk me through how your team actually uses the product day-to-day.",
+                "When you were evaluating options, what else did you look at?",
+                "What ultimately made you go with this product over those alternatives?",
+                "If you had to rate the product from one to ten, what would you say and why?",
             ],
             status="active",
         )
     )
     turns = [
-        ("interviewer", 1, "How do you currently use the product?", "scripted"),
-        ("respondent", 2, "I use it every morning to plan my commute. It's usually great.", None),
-        ("interviewer", 3, "What would you change about it?", "scripted"),
-        ("respondent", 4, "Honestly nothing — I think it's perfect as-is. Well, except the alerts are always wrong.", None),
-        ("interviewer", 5, "Who else might benefit from it?", "scripted"),
-        ("respondent", 6, "My whole team, probably. But actually I stopped recommending it because it gave bad directions last week.", None),
-        ("interviewer", 7, "That sounds frustrating — what happened exactly?", "probe"),
-        ("respondent", 8, "It routed me through a closed road. Cost me 40 minutes. I was really upset. But I still use it every day, can't live without it.", None),
+        ("interviewer", 1, "Walk me through how your team actually uses the product day-to-day.", "scripted"),
+        ("respondent", 2, "Our AEs use it for call summaries after every customer meeting. A colleague recommended it — she'd seen it at her previous company.", None),
+        ("interviewer", 3, "How did your colleague first come across it at that previous company?", "probe"),
+        ("respondent", 4, "It had spread organically there. Apparently one sales rep started using it and within a month the whole team was on it.", None),
+        ("interviewer", 5, "When you were evaluating options, what else did you look at?", "scripted"),
+        ("respondent", 6, "We looked at Gong and Chorus. They're fine but honestly they felt like overkill — this was much easier to deploy. Though I'll say IT had some questions about where the data goes.", None),
+        ("interviewer", 7, "What specifically concerned IT about the data?", "probe"),
+        ("respondent", 8, "SOC 2 compliance, mostly. Once we confirmed that it was fine. We went annual — our VP of Sales owns the contract, not IT.", None),
     ]
     for speaker, turn_number, text, action in turns:
         session.add(
@@ -210,6 +268,9 @@ async def _smoke_test() -> None:
     print(f"\nSurprises ({len(update.surprises)}):")
     for s in update.surprises:
         print(f"  - {s}")
+    print(f"\nInvestor Signals ({len(update.investor_signals)}):")
+    for sig in update.investor_signals:
+        print(f"  {sig}")
     print(f"\nNew probes ({len(update.new_probes)}):")
     for p in update.new_probes:
         print(f"  [{p.priority}] {p.question}")

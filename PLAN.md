@@ -418,34 +418,58 @@ Endpoints:
 
 ## My questions/Future improvements
 
-- Immediate
-  - Voice
-    - Wire in Vapi
-  - E2E
-    - Stream the outputDo an E2E call w/o Vapi - mimic an atual diligence call
-    - Understand how to view Pydantic Logfire traces
-    - The play.py, [server.py](http://server.py) and whatever else should use the same loop right
-    - The Evals for Trajectory call
-  - Interview Loop
-    - What if the answer to the next scripted quesion is already given by respondent? Skip it/How to mark it?
-  - Analyst 
-    - If context >200, how will it reads contras from before
-- Prod Level
+- Voice
+  - Questions
+    - See how it is doing pre-emptive asking and re-asking - causing many probes and returning 1? - handling the speech & convo update webhooks
+    - Should know if probe is coming from analyst or interviewer
+    - Log which one was finally sent to customer vs redone?
+    - Logfire shows an interview run within interview run
+    - DB is logging lines multiple times
+    - Where did you see the Vapi documentation 
+    - How to constantly update [Plan.md](http://Plan.md) and [Claude.md](http://Claude.md) 
+    - Best way to allow Claude to access API docs
+- Correctness Edges
+  - **Race condition:** `vapi_call_id` is written to DB *after* `POST /call/phone` returns, but Vapi can fire `assistant.started` before that write commits. In practice the first event is usually `status-update` (`ringing`) which is long enough — but it's fragile.
+  - **Two paths for "end of call":** `/vapi/webhook` end-of-call-report AND `/calls/{id}/end`. If both fire, the second is a no-op due to the `status=="ended"` guard — OK, but worth a comment.
+  - **No Vapi call cancellation** — if a user deletes a call mid-flight, there's no DELETE path to Vapi.
+- Observability
+  - `print()` statements mixed with Logfire — fine for debug, strip for prod.
+  - No per-call cost tracking (input/output tokens × rate).
+  - No alerting on `vapi_unknown_call` or `vapi_dial_error` — they just log.
+- Latency
+  - **Non-streaming LLM response.** Vapi's Custom LLM supports SSE streaming of tokens; we return the full response at once, which means 3-5 s of silence before TTS starts. Production should stream tokens so TTS begins as soon as the first sentence is ready.
+  - `firstMessageMode: assistant-speaks-first` + Custom LLM = guaranteed awkward silence on pickup. A common production pattern is a static cached opener ("Hi, thanks for taking the time — one moment…") while the real agent warms up.
+  - **No prompt caching** on Anthropic calls — the system prompt is reprocessed every turn. Needs `cache_control` breakpoints.
+- Vapi Configs
+  - Barge in etc.
+- Things to watch out for (Seem to be solved)
+  - What if the answer to the next scripted quesion is already given by respondent? Skip it/How to mark it?
+  - Interviewer has low memory, so it keeps repeating sometimes even if it has been answered earlier? Memory for last N turns in context?
+  - If context >200, how will it reads contras from before - solved by the Analyst Context, also analyst now fires only when scripted answered
+  - Top probe stays the same. Maybe we should show it top 3 probes list? (Bc right now, if top probe is too stale, there is not other probe replacing it)
+- E2E Evals
+  - The Evals for Trajectory call
+- Synthesis Report
+  - Reinstate synthesis report once this works
+- Infra - Prod Level
+  - Webhook correctness (auth/idempotency)
   - See where traces go & have a good observabilty process/dashnoard
   - Vesioned prompts/datasets/eval runs
-  - Live DB
+  - Live DB + Alembic
   - Caching & Latency
   - Prompt Caching
+  - Model Pinning & Rollback
   - Secrets Management
   - Dependency Mgmt on pyproject.timl and remove requirements.txt
-- Deployment Level
+- Infra - Deployment Level
   - SQS Queues
   - Secrets manager 
   - Render Deployment + CI/CD
   - Multi-tenant auth
   - Rate limiting
+  - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
 - Per Customer per project configuration
-  - Add a configurable per customer per project config - eg. Duplo diligence, I list my question list, and have that be part of the scripted questions, what to focus on, what to probe on etc.
+  - Add a configurable per customer and per project config - eg. Duplo diligence, I list my question list, and have that be part of the scripted questions, what to focus on, what to probe on etc.
 - Advanced
   - Long-term memory.
   - Barge-in / interruption handling beyond Vapi's defaults.

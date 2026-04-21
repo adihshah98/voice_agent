@@ -1,0 +1,55 @@
+# Investor due-diligence question bank for B2B SaaS/AI customer interviews.
+#
+# These questions follow the 11-topic arc: intro → role → status quo → use cases →
+# discovery → alternatives → why chosen → sales/implementation → pricing → rating →
+# improvements.
+#
+# Usage: load these as `scripted_questions` when creating a Call via POST /calls/start,
+# substituting [product] with the actual product name before the call.
+
+questions:
+  - topic: intro
+    question: >
+      Hey! Thank you for taking the time to talk to me today. Before we dive in, I wanted to share some context — I'm doing research to better understand how teams like yours
+      use Notion. Everything you share is completely confidential. Can you start by telling me about your role and what your
+      team does day-to-day?
+
+  - topic: status_quo
+    question: >
+      Before you started using [product], how were you handling that problem —
+      what was your previous setup?
+
+  - topic: use_cases
+    question: >
+      Walk me through how your team actually uses [product] day-to-day.
+
+  - topic: discovery
+    question: >
+      How did you first come across [product]?
+
+  - topic: alternatives
+    question: >
+      When you were evaluating options, what else did you look at?
+
+  - topic: why_chosen
+    question: >
+      What ultimately made you go with [product] over those alternatives?
+
+  - topic: sales_and_implementation
+    question: >
+      How did the buying and rollout process go — anything that stood out,
+      positively or negatively?
+
+  - topic: pricing
+    question: >
+      How does [product] fit into your team's budget —
+      is it a central IT decision or more of a team-by-team thing?
+
+  - topic: rating
+    question: >
+      If you had to rate [product] from one to ten based on your experience so far,
+      what would you say — and what's behind that number?
+
+  - topic: improvements
+    question: >
+      What's the one thing you'd most want [product] to change or add?

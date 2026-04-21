@@ -75,7 +75,7 @@ class Turn(SQLModel, table=True):
     turn_number: int
     speaker: str  # "interviewer" | "respondent"
     text: str
-    action: Optional[str] = None  # scripted|probe|clarify|acknowledge|off_topic|wrap_up
+    action: Optional[str] = None  # scripted|skip_scripted|probe|clarify|off_topic|wrap_up
     reasoning: Optional[str] = None
     latency_ms: Optional[int] = None
     created_at: datetime = Field(default_factory=_utcnow)
@@ -112,6 +112,7 @@ class AnalystSnapshot(SQLModel, table=True):
     themes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     contradictions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     surprises: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    investor_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     latency_ms: Optional[int] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
@@ -130,6 +131,13 @@ class SynthesisReport(SQLModel, table=True):
     contradictions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     key_quotes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     follow_up_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    pmf_score: int = Field(default=0)
+    pmf_score_rationale: str = Field(default="")
+    competitive_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    revenue_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    ai_adoption_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    red_flags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    investment_thesis_bullets: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=_utcnow)
 
     call: Call = Relationship(
@@ -200,14 +208,14 @@ def mark_scripted_asked(session: Session, call_id: str) -> None:
     session.add(call)
 
 
-def pop_top_probe(session: Session, call_id: str) -> Optional[Probe]:
+def top_probes(session: Session, call_id: str, n: int = 3) -> list[Probe]:
     stmt = (
         select(Probe)
         .where(Probe.call_id == call_id, Probe.asked == False)  # noqa: E712
         .order_by(Probe.priority.asc(), Probe.created_at.asc())
-        .limit(1)
+        .limit(n)
     )
-    return session.exec(stmt).first()
+    return list(session.exec(stmt))
 
 
 def mark_probe_asked(session: Session, probe_id: int) -> None:
@@ -217,6 +225,25 @@ def mark_probe_asked(session: Session, probe_id: int) -> None:
     probe.asked = True
     probe.asked_at = _utcnow()
     session.add(probe)
+
+
+def latest_snapshot(session: Session, call_id: str) -> Optional["AnalystSnapshot"]:
+    stmt = (
+        select(AnalystSnapshot)
+        .where(AnalystSnapshot.call_id == call_id)
+        .order_by(AnalystSnapshot.after_turn.desc())
+        .limit(1)
+    )
+    return session.exec(stmt).first()
+
+
+def turns_since(session: Session, call_id: str, after_turn: int) -> list[Turn]:
+    stmt = (
+        select(Turn)
+        .where(Turn.call_id == call_id, Turn.turn_number > after_turn)
+        .order_by(Turn.turn_number.asc())
+    )
+    return list(session.exec(stmt))
 
 
 def recent_turns(session: Session, call_id: str, n: int = 6) -> list[Turn]:

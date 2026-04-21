@@ -7,14 +7,14 @@ the LLM and evals, not persistence shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 from sqlmodel import Session
 
 
 Action = Literal[
-    "scripted", "probe", "clarify", "acknowledge", "off_topic", "wrap_up"
+    "scripted", "probe", "clarify", "off_topic", "wrap_up", "skip_scripted"
 ]
 
 
@@ -37,6 +37,10 @@ class InterviewerOutput(BaseModel):
     reasoning: str = Field(
         description="Why this action/utterance was chosen. Not spoken; kept for traces + evals."
     )
+    probe_id_used: int | None = Field(
+        default=None,
+        description="The id of the PENDING_PROBE used, if action=probe. Must match exactly.",
+    )
 
 
 # --- Analyst ---------------------------------------------------------------
@@ -58,6 +62,14 @@ class AnalysisUpdate(BaseModel):
     themes: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     surprises: list[str] = Field(default_factory=list)
+    investor_signals: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tagged investor-relevant signals. Each entry is prefixed with a category tag: "
+            "[PMF], [COMPETITIVE], [REVENUE], [AI-SIGNAL], or [RED-FLAG]. "
+            'Example: "[PMF] Uses it daily before every meeting — strong habit formation"'
+        ),
+    )
     new_probes: list[NewProbe] = Field(default_factory=list)
 
 
@@ -75,6 +87,13 @@ class ReportOutput(BaseModel):
     contradictions: list[str] = Field(default_factory=list)
     key_quotes: list[str] = Field(default_factory=list)
     follow_up_questions: list[str] = Field(default_factory=list)
+    pmf_score: int = Field(default=0, ge=1, le=5, description="1=no PMF evidence, 5=strong PMF")
+    pmf_score_rationale: str = Field(default="")
+    competitive_signals: list[str] = Field(default_factory=list)
+    revenue_signals: list[str] = Field(default_factory=list)
+    ai_adoption_signals: list[str] = Field(default_factory=list)
+    red_flags: list[str] = Field(default_factory=list)
+    investment_thesis_bullets: list[str] = Field(default_factory=list)
 
 
 # --- Simulated respondent (used by Tier 3 evals) ---------------------------
@@ -89,11 +108,49 @@ class SimulatedReply(BaseModel):
     text: str
 
 
-# --- Vapi webhook payloads (minimal subset) --------------------------------
+# --- Vapi webhook payloads -------------------------------------------------
 
 
-class VapiEvent(BaseModel):
-    type: Literal["speech-update", "call-ended", "call-started"]
-    call_id: str
-    text: str | None = None
-    end_reason: str | None = None
+class VapiCallRef(BaseModel):
+    id: str  # Vapi's call ID — maps to Call.vapi_call_id in our DB
+
+
+class VapiArtifactMessage(BaseModel):
+    role: str  # "bot" | "user"
+    message: str
+    time: float | None = None
+
+
+class VapiArtifact(BaseModel):
+    messages: list[VapiArtifactMessage] = Field(default_factory=list)
+    transcript: str | None = None
+
+
+class VapiStatusUpdate(BaseModel):
+    type: Literal["status-update"]
+    status: str  # "in-progress" | "ended" | "ringing" | etc.
+    call: VapiCallRef
+
+
+class VapiAssistantRequest(BaseModel):
+    type: Literal["assistant-request"]
+    call: VapiCallRef
+    artifact: VapiArtifact | None = None
+
+
+class VapiEndOfCallReport(BaseModel):
+    type: Literal["end-of-call-report"]
+    endedReason: str | None = None
+    call: VapiCallRef
+
+
+VapiMessage = Annotated[
+    VapiStatusUpdate | VapiAssistantRequest | VapiEndOfCallReport,
+    Field(discriminator="type"),
+]
+
+
+class VapiWebhookPayload(BaseModel):
+    """Top-level payload sent by Vapi to the serverUrl webhook."""
+    message: VapiMessage | None = None
+    model_config = {"extra": "allow"}

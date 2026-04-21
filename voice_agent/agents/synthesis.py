@@ -23,18 +23,47 @@ from voice_agent.config import SYNTHESIS_MODEL
 from voice_agent.models import ReportOutput
 
 SYNTHESIS_PROMPT = """\
-You are a senior qualitative researcher writing a post-call synthesis report.
+You are a senior investment research analyst writing a post-call memo for an investor
+doing due diligence on a B2B SaaS or AI product. You will receive the full interview
+transcript and analyst notes (themes, contradictions, surprises, investor signals).
 
-You will receive the full interview transcript and any analyst notes produced
-during the call (themes, contradictions, surprises).
+Produce a concise, actionable investor memo with these sections:
 
-Your job is to produce a concise, actionable report:
+SUMMARY — 3-5 bullets sentences answering: "What did we learn that's investment-relevant?"
+  Focus on PMF strength, competitive position, and revenue signals.
 
-SUMMARY — 2-3 sentence overview of what was learned.
-THEMES — recurring ideas, each paired with direct quotes that support it.
-CONTRADICTIONS — specific places where the respondent contradicted themselves.
-KEY_QUOTES — 3-5 verbatim quotes that best capture the respondent's perspective.
+THEMES — recurring ideas, each paired with direct transcript quotes.
+
+CONTRADICTIONS — specific self-contradictions in the respondent's account.
+  Flag gaps between stated satisfaction and actual usage behavior.
+
+KEY_QUOTES — 3-5 verbatim quotes that best capture investment-relevant perspective.
+
 FOLLOW_UP_QUESTIONS — 3-5 questions worth exploring in a follow-up call.
+
+PMF_SCORE — integer 1-5 with explicit rationale:
+  5 = daily habit, "can't live without it", organic word-of-mouth, unprompted advocacy
+  4 = strong regular use, would miss it, considering expansion to more teams
+  3 = satisfied user, uses it regularly, neutral on switching, hasn't advocated for it
+  2 = sporadic or limited use, wouldn't miss it much, evaluating alternatives
+  1 = minimal use, considering switching, no clear demonstrated value
+
+PMF_SCORE_RATIONALE — one sentence explaining the score, citing transcript evidence.
+
+COMPETITIVE_SIGNALS — why this product was chosen over alternatives, what would make
+  the respondent switch, named competitors and how they were characterized.
+
+REVENUE_SIGNALS — budget ownership, contract structure (annual/monthly), seat count
+  and utilization, expansion signals or blockers, pricing sensitivity.
+
+AI_ADOPTION_SIGNALS — trust level in AI outputs, verification habits, ROI clarity,
+  adoption barriers (security, compliance, hallucinations), workflow integration depth.
+
+RED_FLAGS — anything suggesting churn risk, weak adoption, or poor PMF:
+  low seat utilization, implementation stalls, IT/security issues, evaluating alternatives.
+
+INVESTMENT_THESIS_BULLETS — 2-4 crisp bullets stating what this customer proves or disproves
+  about the investment thesis. Start each with "SUPPORTS:" or "QUESTIONS:".
 
 Be specific and evidence-based. Cite the transcript directly.
 Do not hallucinate or infer beyond what was said.
@@ -68,6 +97,8 @@ def _build_prompt(session: Session, call_id: str) -> str:
             notes.append("ANALYST CONTRADICTIONS:\n" + "\n".join(f"- {c}" for c in latest_snap.contradictions))
         if latest_snap.surprises:
             notes.append("ANALYST SURPRISES:\n" + "\n".join(f"- {s}" for s in latest_snap.surprises))
+        if latest_snap.investor_signals:
+            notes.append("ANALYST INVESTOR SIGNALS:\n" + "\n".join(f"- {s}" for s in latest_snap.investor_signals))
         if notes:
             prompt += "\n\n" + "\n\n".join(notes)
 
@@ -100,6 +131,13 @@ async def run_synthesis(deps: SynthesisDeps) -> ReportOutput:
         contradictions=report.contradictions,
         key_quotes=report.key_quotes,
         follow_up_questions=report.follow_up_questions,
+        pmf_score=report.pmf_score,
+        pmf_score_rationale=report.pmf_score_rationale,
+        competitive_signals=report.competitive_signals,
+        revenue_signals=report.revenue_signals,
+        ai_adoption_signals=report.ai_adoption_signals,
+        red_flags=report.red_flags,
+        investment_thesis_bullets=report.investment_thesis_bullets,
     )
     if existing:
         for k, v in row_data.items():
