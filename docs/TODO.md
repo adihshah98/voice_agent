@@ -2,26 +2,25 @@
 
 - Voice
   - Immediate
-    - Seems like only calls LLM after conversation update based on logs? But the prior int context shows smthn else? 
-    - See how it is doing pre-emptive asking and re-asking - causing many probes and returning 1? - handling the speech & convo update webhooks
-    - DB is logging lines multiple times - Why 2 interview_turn in logs
-    - Vapi - how to know if it's an update or the final transcript (for logging) - Log which one was finally sent to customer vs redone?
+    - Vapi - how to know if it's an update or the final transcript (for logging) - Log which one was finally sent to customer vs redone? - 
     - Can probs send lesser info in context?
-    - Play around with this frequent speech-updates
-      - Gate LLM calls till final-transcript (more chatlike)
-      - Debounce partial updates (Wait 500ms of silence before triggering LLM)
-      - Reduce ASR chunk frequency
-      - See how to modify Vapi config
     - Should know if probe is coming from analyst or interviewe
-  - Interview Pre-context
-    - Tell it it is diligencing which product
-    - Tell it which direction to go, where not to spend too much time
-  - TTS
-    - Right now, it's too fake sounding
-  - Voice Nuances
-    - If the respondent says hmm, or yes - it shouldn't stop
-    - If responder is taking time to think, it shoudn't interrupt/know when to interrupt
-    - If it asks for name, it should not give it. But make the transition back to the question smoother
+    - Callig. analyst less frequent;y?
+- Interview Pre-Context
+  - Tell it it is diligencing which product
+  - Tell it which direction to go, where not to spend too much time
+- Vapi Configs
+  - Barge in etc.
+  - Gate LLM calls till final-transcript (more chatlike)
+  - Debounce partial updates (Wait 500ms of silence before triggering LLM)
+  - Reduce ASR chunk frequency
+  - See how to modify Vapi config
+- TTS
+  - Right now, it's too fake sounding
+- Voice Nuances
+  - If the respondent says hmm, or yes - it shouldn't stop
+  - If responder is taking time to think, it shoudn't interrupt/know when to interrupt
+  - If it asks for name, it should not give it. But make the transition back to the question smoother
 - Correctness Edges
   - **Race condition:** `vapi_call_id` is written to DB *after* `POST /call/phone` returns, but Vapi can fire `assistant.started` before that write commits. In practice the first event is usually `status-update` (`ringing`) which is long enough — but it's fragile.
   - **Two paths for "end of call":** `/vapi/webhook` end-of-call-report AND `/calls/{id}/end`. If both fire, the second is a no-op due to the `status=="ended"` guard — OK, but worth a comment.
@@ -33,8 +32,6 @@
   - **Non-streaming LLM response.** Vapi's Custom LLM supports SSE streaming of tokens; we return the full response at once, which means 3-5 s of silence before TTS starts. Production should stream tokens so TTS begins as soon as the first sentence is ready.
   - `firstMessageMode: assistant-speaks-first` + Custom LLM = guaranteed awkward silence on pickup. A common production pattern is a static cached opener ("Hi, thanks for taking the time — one moment…") while the real agent warms up.
   - **No prompt caching** on Anthropic calls — the system prompt is reprocessed every turn. Needs `cache_control` breakpoints.
-- Vapi Configs
-  - Barge in etc.
 - Things to watch out for (Seem to be solved)
   - What if the answer to the next scripted quesion is already given by respondent? Skip it/How to mark it?
   - Interviewer has low memory, so it keeps repeating sometimes even if it has been answered earlier? Memory for last N turns in context?

@@ -79,6 +79,68 @@ async def _synthesis_task(call_id: str) -> None:
         session.close()
 
 
+async def _analyst_task(call_id: str) -> None:
+    from voice_agent.agents.analyst import run_analyst_safely
+    from voice_agent.models import AnalystDeps
+    session = Session(engine)
+    try:
+        with agent_span("analyst", call_id):
+            deps = AnalystDeps(call_id=call_id, session=session)
+            await run_analyst_safely(deps)
+    except Exception:
+        logfire.exception("analyst_task_error", call_id=call_id)
+    finally:
+        session.close()
+
+
+def _vapi_call_id_to_call_id(vapi_call_id: str) -> str | None:
+    """Resolve vapi_call_id → internal call_id. Returns None if not found."""
+    with state.session_scope(engine) as session:
+        call = session.exec(
+            select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
+        ).first()
+        return call.id if call else None
+
+
+def _write_confirmed_turns(call_id: str, messages: list[dict]) -> int:
+    """Upsert confirmed turns from Vapi's conversation-update messages array.
+
+    Vapi sends the full message history each time. We diff against what's already
+    in the DB (by turn_number) and only insert new rows. Returns the last turn number
+    written, or 0 if nothing new.
+
+    messages is the granular msg["messages"] array (role=user/bot with timestamps),
+    not messagesOpenAIFormatted. We map bot→interviewer, user→respondent.
+    """
+    # Filter to user/bot only (skip system)
+    convo = [m for m in messages if m.get("role") in ("user", "bot")]
+    if not convo:
+        return 0
+
+    with state.session_scope(engine) as session:
+        # Find how many turns are already confirmed in DB
+        from sqlmodel import func
+        existing_count = session.exec(
+            select(func.count()).where(state.Turn.call_id == call_id)
+        ).one()
+
+        new_msgs = convo[existing_count:]
+        if not new_msgs:
+            return 0
+
+        start_turn = existing_count + 1
+        for i, m in enumerate(new_msgs):
+            speaker = "interviewer" if m["role"] == "bot" else "respondent"
+            session.add(state.Turn(
+                call_id=call_id,
+                turn_number=start_turn + i,
+                speaker=speaker,
+                text=m.get("message", ""),
+            ))
+
+        return start_turn + len(new_msgs) - 1
+
+
 # --- Webhook ----------------------------------------------------------------
 
 
@@ -134,20 +196,41 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
             return {}
 
         if event_type == "speech-update":
+            status = msg.get("status")
+            role = msg.get("role")
+            turn = msg.get("turn")
             logfire.info(
                 "vapi_speech_update",
                 vapi_call_id=vapi_call_id,
-                status=msg.get("status"),
-                role=msg.get("role"),
+                status=status,
+                role=role,
+                turn=turn,
+                # assistant+started = Vapi is playing this turn's LLM response
+                tts_started=(role == "assistant" and status == "started"),
             )
             return {}
 
         if event_type == "conversation-update":
+            messages = msg.get("messages", [])
+            last_role = messages[-1].get("role") if messages else None
+            last_user = next(
+                (m["message"] for m in reversed(messages) if m.get("role") == "user"),
+                None,
+            )
             logfire.info(
                 "vapi_conversation_update",
                 vapi_call_id=vapi_call_id,
-                message_count=len(msg.get("messages", [])),
+                message_count=len(messages),
+                last_user_utterance=last_user,
+                last_role=last_role,
             )
+            # Write confirmed turns and trigger analyst after a complete exchange
+            # (last_role == "bot" means Vapi just finished speaking a response).
+            if vapi_call_id and last_role == "bot":
+                call_id_inner = _vapi_call_id_to_call_id(vapi_call_id)
+                if call_id_inner:
+                    _write_confirmed_turns(call_id_inner, messages)
+                    asyncio.create_task(_analyst_task(call_id_inner))
             return {}
 
         logfire.debug("vapi_event_ignored", type=event_type, payload=msg)
@@ -296,7 +379,7 @@ async def vapi_llm(request: Request):
 
         if call_id is not None:
             t0 = time.perf_counter()
-            result = await run_speech_turn(engine, call_id, respondent_text)
+            result = await run_speech_turn(engine, call_id, respondent_text, vapi_messages=messages)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             content = result["message"]
             req_span.set_attribute("action", result["action"])

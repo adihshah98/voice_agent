@@ -181,6 +181,30 @@ def print_report(report: dict) -> None:
 # --- REPL -------------------------------------------------------------------
 
 
+def _write_turns_local(engine, call_id: str, respondent_text: str | None, interviewer_text: str) -> None:
+    """Write one exchange to the DB for analyst/synthesis use in local mode.
+
+    In production, turns are written from conversation-update webhooks.
+    In local REPL mode there is no Vapi, so we write them here directly.
+    """
+    with state.session_scope(engine) as session:
+        from sqlmodel import func
+        existing = session.exec(
+            select(func.count()).where(state.Turn.call_id == call_id)
+        ).one()
+        turn_num = existing + 1
+        if respondent_text:
+            session.add(state.Turn(
+                call_id=call_id, turn_number=turn_num,
+                speaker="respondent", text=respondent_text,
+            ))
+            turn_num += 1
+        session.add(state.Turn(
+            call_id=call_id, turn_number=turn_num,
+            speaker="interviewer", text=interviewer_text,
+        ))
+
+
 async def run_local_repl(questions: list[str]) -> None:
     engine = state.make_engine(DATABASE_URL)
     state.init_db(engine)
@@ -192,7 +216,12 @@ async def run_local_repl(questions: list[str]) -> None:
     print('\nType respondent answers below. Enter "quit" or Ctrl-D to stop.')
     print("─" * 60)
 
-    opening = await run_speech_turn(engine, call_id, "")
+    # messages mirrors what Vapi would send as body["messages"] — built locally
+    messages: list[dict] = []
+
+    opening = await run_speech_turn(engine, call_id, "", vapi_messages=messages)
+    messages.append({"role": "assistant", "content": opening["message"]})
+    _write_turns_local(engine, call_id, None, opening["message"])
     print(f"\ninterviewer> {opening['message']}")
     print(f"  [ACTION: {opening['action']}]")
     print(f"  [WHY: {opening['reasoning']}]")
@@ -210,7 +239,11 @@ async def run_local_repl(questions: list[str]) -> None:
         if not user_input:
             continue
 
-        result = await run_speech_turn(engine, call_id, user_input)
+        messages.append({"role": "user", "content": user_input})
+        result = await run_speech_turn(engine, call_id, user_input, vapi_messages=messages)
+        messages.append({"role": "assistant", "content": result["message"]})
+        _write_turns_local(engine, call_id, user_input, result["message"])
+
         print(f"\ninterviewer> {result['message']}")
         print(f"  [ACTION: {result['action']}]")
         print(f"  [WHY: {result['reasoning']}]")

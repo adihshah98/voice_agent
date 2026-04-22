@@ -126,20 +126,24 @@ Hard rules:
 """
 
 
-def _build_context(session, call_id: str, current_turn: int) -> tuple[str, list[state.Probe]]:
-    """Read all relevant DB state and return (context_block, active_probes).
+def _build_context(
+    session,
+    call_id: str,
+    current_turn: int,
+    vapi_messages: list[dict],
+) -> tuple[str, list[state.Probe]]:
+    """Read study state from DB and conversation history from Vapi's messages.
 
-    active_probes are the non-stale unasked probes passed to the model. The model
-    returns probe_id_used so the caller can mark exactly the right one asked.
+    vapi_messages is the OpenAI-formatted array Vapi sends with each LLM request
+    (body["messages"]). It reflects what was actually spoken — no provisional turns.
+    active_probes are returned so the caller can mark the used one after the LLM call.
     Nothing is written to the DB here.
     """
     next_q = state.next_scripted(session, call_id)
     remaining = state.scripted_remaining(session, call_id)
     probes = state.top_probes(session, call_id, n=3)
-    turns = state.recent_turns(session, call_id, n=30)
 
     lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {remaining}"]
-
     lines.append(f"NEXT_SCRIPTED: {next_q}" if next_q else "NEXT_SCRIPTED: none")
 
     active_probes = [
@@ -157,22 +161,25 @@ def _build_context(session, call_id: str, current_turn: int) -> tuple[str, list[
     else:
         lines.append("PENDING_PROBES: none")
 
-    # Questions already asked — model must not revisit these topics
+    # Build COVERED_TOPICS and RECENT_TURNS from Vapi's confirmed message history.
+    # Skip the system prompt (index 0); alternate assistant/user from there.
+    convo = [m for m in vapi_messages if m.get("role") in ("assistant", "user")]
+
     covered = [
-        t.text
-        for t in turns
-        if t.speaker == "interviewer" and t.action in ("scripted", "probe", "clarify")
+        m["content"] for m in convo
+        if m.get("role") == "assistant" and m.get("content", "").strip().endswith("?")
     ]
     if covered:
         lines.append("COVERED_TOPICS (do NOT revisit these):")
         for q in covered:
             lines.append(f"  - {q}")
 
-    recent = turns[-14:] if len(turns) > 14 else turns
+    recent = convo[-14:]
     if recent:
         lines.append("RECENT_TURNS:")
-        for t in recent:
-            lines.append(f"  {t.speaker}: {t.text}")
+        for m in recent:
+            speaker = "interviewer" if m["role"] == "assistant" else "respondent"
+            lines.append(f"  {speaker}: {m.get('content', '')}")
 
     lines.append("[/CONTEXT]")
     return "\n".join(lines), active_probes
@@ -190,13 +197,34 @@ interviewer = Agent(
 async def run_interviewer(
     deps: InterviewerDeps,
     respondent_text: str,
+    vapi_messages: list[dict] | None = None,
 ) -> InterviewerOutput:
-    """Pre-fetch context → one LLM call → mark probe if used."""
-    context_block, active_probes = _build_context(deps.session, deps.call_id, deps.turn_number)
+    """Pre-fetch context → one LLM call → return output.
+
+    vapi_messages: OpenAI-formatted message array from Vapi (body["messages"]).
+    When None (evals / play.py), falls back to reading recent_turns from the DB.
+    """
+    context_block, active_probes = _build_context(
+        deps.session, deps.call_id, deps.turn_number,
+        vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
+    )
     prompt = f"{context_block}\n\nRespondent: {respondent_text}"
 
     result = await interviewer.run(prompt, deps=deps)
     return result.output
+
+
+def _db_messages_fallback(session, call_id: str) -> list[dict]:
+    """Build an OpenAI-format messages list from DB turns.
+
+    Used by play.py and evals that don't go through the Vapi LLM endpoint.
+    """
+    turns = state.recent_turns(session, call_id, n=60)
+    messages = []
+    for t in turns:
+        role = "assistant" if t.speaker == "interviewer" else "user"
+        messages.append({"role": role, "content": t.text})
+    return messages
 
 
 async def run_interviewer_with_timeout(

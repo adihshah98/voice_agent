@@ -101,22 +101,22 @@ async def run_interviewer_on_case(
     inputs: InterviewerCaseInputs,
 ) -> InterviewerOutput:
     engine, call_id, prior_count = _seed_engine(inputs)
+
+    # Build the vapi_messages list from prior_turns + the current respondent utterance,
+    # mirroring what Vapi would send as body["messages"] to the LLM endpoint.
+    vapi_messages: list[dict] = []
+    for t in inputs.prior_turns:
+        role = "assistant" if t.speaker == "interviewer" else "user"
+        vapi_messages.append({"role": role, "content": t.text})
+    vapi_messages.append({"role": "user", "content": inputs.last_respondent})
+
     with state.session_scope(engine) as session:
-        session.add(
-            state.Turn(
-                call_id=call_id,
-                turn_number=prior_count + 1,
-                speaker="respondent",
-                text=inputs.last_respondent,
-            )
-        )
-        session.flush()
         deps = InterviewerDeps(
             call_id=call_id,
             session=session,
             turn_number=prior_count + 2,
         )
-        return await run_interviewer(deps, inputs.last_respondent)
+        return await run_interviewer(deps, inputs.last_respondent, vapi_messages=vapi_messages)
 
 
 @pytest.mark.asyncio

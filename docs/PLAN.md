@@ -403,6 +403,73 @@ Endpoints:
 
 ---
 
+## Vapi Flow
+
+## 1. The three concepts
+
+**speech-update** — Vapi's VAD (voice activity detection) telling you about audio-level state changes. Two statuses: `started` (someone is speaking) and `stopped` (they went quiet). Fires on the webhook, no LLM involved. Your server just logs it and returns `{}`.
+
+**conversation-update** — Vapi maintaining its own internal message history. Fires after speech is transcribed and appended, and again after assistant responses are confirmed. Contains the running `messages[]` array. Also webhook-only, no LLM involved.
+
+**utterance boundary** — Not a Vapi event name, it's the internal decision Vapi makes: "this person has finished their thought, time to call the LLM." Vapi combines `speech-update: stopped` + a silence timeout (endpointing threshold) to decide this. Only *then* does it POST to `/vapi/llm/chat/completions`. This is the only path that triggers your code.
+
+Timeline for one turn:
+
+```
+speech-update: started     (user starts talking)
+speech-update: stopped     (user goes quiet — VAD fires)
+[Vapi waits ~300-500ms endpointing window]
+→ POST /vapi/llm/chat/completions   ← utterance boundary confirmed
+conversation-update                  (Vapi logs the transcript)
+speech-update: started     (assistant TTS starts playing)
+speech-update: stopped     (assistant TTS done)
+conversation-update                  (Vapi logs the assistant turn)
+
+```
+
+---
+
+## 2. Which LLM response wins when Vapi fires multiple?
+
+This is **entirely Vapi's responsibility** — your server doesn't know. Vapi's pipeline works like this:
+
+When a second utterance boundary fires while the first LLM response is still being streamed/played, Vapi treats it as a **barge-in / interruption**. It:
+
+1. Stops the TTS playback of the first response mid-stream
+2. Discards the remainder of the first SSE stream
+3. Calls your LLM endpoint again with the updated `messages[]` (now including the newer transcript)
+4. Plays whatever the second call returns
+
+The **last LLM call to complete wins** from Vapi's perspective. Earlier in-flight calls whose responses arrive after Vapi has moved on get discarded at the TTS layer — Vapi won't play stale audio.
+
+Vapi fires the LLM call **optimistically at the utterance boundary** so that if the user has genuinely finished, the LLM response is already in flight or done by the time TTS needs it. This directly cuts the perceived response latency.
+
+The tradeoff: if the user continues speaking (mid-thought pause), Vapi detects barge-in, kills the in-flight/playing response, and fires a new LLM call with the full updated transcript. You pay for a wasted LLM call but the common case (user actually done) is faster.
+
+---
+
+## 3. Can we demarcate played vs. overridden in current traces?
+
+The signal you want is `speech-update` **with** `role=assistant` **+** `status=started` arriving after an LLM call. That's Vapi telling you "TTS started playing this response." You can correlate by `vapi_call_id` + timing.
+
+The problem right now: your `vapi_speech_update` span logs the fields but they're coming back null in traces, meaning Vapi's webhook payload nests them differently than expected. The fix is two parts:
+
+**First**, log the raw payload shape so we can see exactly what Vapi sends. In [server.py:136-143](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L136-L143):
+
+```python
+if event_type == "speech-update":
+    logfire.info(
+        "vapi_speech_update",
+        vapi_call_id=vapi_call_id,
+        status=msg.get("status"),
+        role=msg.get("role"),
+        raw=msg,   # temporary — remove once confirmed
+    )
+
+```
+
+**Second**, once you can see `role=assistant, status=started` events, the cleanest observability approach is: in `vapi_llm_request`, set a `response_id` (e.g. the `X-Trace-ID` already being set as a header). Then if Vapi's `speech-update` payload ever echoes back an ID (some platforms do), you can join them. If not, the timing correlation approach works: last `vapi_llm_request` completed before an `assistant speech-update: started` = the one that was played.
+
 ## Verification (end-to-end)
 
 - **Traces:** `logfire` UI shows a timeline for a test call: span per turn, nested spans for interviewer and analyst, with model, tokens, latency.
