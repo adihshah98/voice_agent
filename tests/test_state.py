@@ -22,10 +22,11 @@ from voice_agent.state import (
     mark_probe_asked,
     mark_scripted_asked,
     next_scripted,
-    pop_top_probe,
+    next_turn_number,
     recent_turns,
     scripted_remaining,
     session_scope,
+    top_probes,
 )
 
 
@@ -60,6 +61,14 @@ def test_call_roundtrip(engine, seeded_call):
         assert call.status == "active"
         assert len(call.scripted_questions) == 3
         assert call.scripted_questions[0].startswith("How do you")
+
+
+def test_next_turn_number_returns_int(engine, seeded_call):
+    with session_scope(engine) as s:
+        n = next_turn_number(s, seeded_call)
+        assert n == 1
+        assert type(n) is int
+        assert next_turn_number(s, seeded_call) == 2
 
 
 def test_turns_order_and_cascade(engine, seeded_call):
@@ -113,15 +122,16 @@ def test_probe_priority_pop_and_mark(engine, seeded_call):
         ])
 
     with session_scope(engine) as s:
-        top = pop_top_probe(s, seeded_call)
-        assert top is not None
+        tops = top_probes(s, seeded_call, n=1)
+        assert tops
+        top = tops[0]
         assert top.priority == 1
         assert top.question == "Why specifically?"
         mark_probe_asked(s, top.id)
 
     with session_scope(engine) as s:
-        top = pop_top_probe(s, seeded_call)
-        assert top is not None and top.priority == 2
+        tops = top_probes(s, seeded_call, n=1)
+        assert tops and tops[0].priority == 2
 
 
 def test_analyst_snapshot_and_synthesis(engine, seeded_call):

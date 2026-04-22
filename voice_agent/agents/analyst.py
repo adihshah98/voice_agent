@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 
 import logfire
+from opentelemetry import trace
 from dotenv import load_dotenv
 from pydantic_ai import Agent
 from sqlmodel import select
@@ -164,17 +165,14 @@ async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
         )
     deps.session.commit()
 
-    logfire.info(
-        "analyst_update",
-        call_id=deps.call_id,
-        after_turn=after_turn,
-        themes_count=len(update.themes),
-        contradictions_count=len(update.contradictions),
-        surprises_count=len(update.surprises),
-        investor_signals_count=len(update.investor_signals),
-        new_probes_count=len(update.new_probes),
-        latency_ms=latency_ms,
-    )
+    span = trace.get_current_span()
+    span.set_attribute("after_turn", after_turn)
+    span.set_attribute("latency_ms", latency_ms)
+    span.set_attribute("themes_count", len(update.themes))
+    span.set_attribute("contradictions_count", len(update.contradictions))
+    span.set_attribute("surprises_count", len(update.surprises))
+    span.set_attribute("investor_signals_count", len(update.investor_signals))
+    span.set_attribute("new_probes_count", len(update.new_probes))
 
     return update
 

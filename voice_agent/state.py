@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column
+from sqlalchemy import Column, update
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
 from sqlmodel import Field, Relationship, Session, SQLModel, create_engine, select
@@ -29,6 +29,7 @@ class Call(SQLModel, table=True):
     phone_number: Optional[str] = None
     scripted_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     scripted_cursor: int = Field(default=0)
+    turn_count: int = Field(default=0)
     status: str = Field(default="pending")  # pending|active|ended
     end_reason: Optional[str] = None
     started_at: datetime = Field(default_factory=_utcnow)
@@ -184,6 +185,23 @@ def session_scope(engine) -> Iterator[Session]:
 
 
 # --- Read helpers used by interviewer tools --------------------------------
+
+
+def next_turn_number(session: Session, call_id: str) -> int:
+    """Atomically increment turn_count and return the new value.
+
+    Using UPDATE + RETURNING avoids the SELECT max() race where two concurrent
+    requests read the same max and assign duplicate turn numbers.
+    """
+    result = session.exec(
+        update(Call)
+        .where(Call.id == call_id)
+        .values(turn_count=Call.turn_count + 1)
+        .returning(Call.turn_count)
+    )
+    row = result.one()
+    # SQLAlchemy returns a Row for RETURNING, not a bare int.
+    return int(row[0])
 
 
 def next_scripted(session: Session, call_id: str) -> Optional[str]:

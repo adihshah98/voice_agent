@@ -6,8 +6,7 @@ is attempted best-effort so this module is safe to import before those
 packages land.
 
 Every span that matters should carry `call_id` + `turn_number` so Logfire can
-slice by call or by turn. Use `turn_span(...)` / `agent_span(...)` to get that
-for free.
+slice by call or by turn. Use `agent_span(...)` to get that for free.
 """
 
 from __future__ import annotations
@@ -90,22 +89,12 @@ def init_tracing(
 
 
 @contextmanager
-def turn_span(call_id: str, turn_number: int, respondent_text: str | None = None) -> Iterator[Any]:
-    """One span per Vapi webhook turn. Wrap the interviewer run inside."""
-    with logfire.span(
-        "turn",
-        call_id=call_id,
-        turn_number=turn_number,
-        respondent_text=respondent_text,
-    ) as span:
-        yield span
-
-
-@contextmanager
 def agent_span(agent: str, call_id: str, **attrs: Any) -> Iterator[Any]:
     """Generic span for interviewer/analyst/synthesis runs.
 
     `agent` should be one of: "interviewer", "analyst", "synthesis".
+    Callers may set_attribute on the yielded span to attach post-run data
+    (e.g. action/utterance/reasoning/latency_ms for the interviewer).
     """
     with logfire.span(
         "{agent}_run",
@@ -117,21 +106,3 @@ def agent_span(agent: str, call_id: str, **attrs: Any) -> Iterator[Any]:
         yield span
 
 
-def log_interviewer_decision(
-    *,
-    call_id: str,
-    turn_number: int,
-    action: str,
-    utterance: str,
-    reasoning: str,
-    latency_ms: int,
-) -> None:
-    logfire.info(
-        "interviewer_decision",
-        call_id=call_id,
-        turn_number=turn_number,
-        action=action,
-        utterance=utterance,
-        reasoning=reasoning,
-        latency_ms=latency_ms,
-    )

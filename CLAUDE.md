@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Documentation
+
+Always use Context7 MCP when I need library/API documentation, code generation, setup or configuration steps without me having to explicitly ask.
+
 ## Commands
 
 Package manager is `uv`; env vars load from `.env` (see `.env.example`). Minimum is `ANTHROPIC_API_KEY`.
@@ -45,6 +49,7 @@ The single entry point for a speech turn is `run_speech_turn` in [voice_agent/tu
 ### Vapi lifecycle
 
 Two endpoints, different roles:
+
 - `/vapi/llm/chat/completions` — per-turn inference (replaces OpenAI from Vapi's perspective).
 - `/vapi/webhook` — lifecycle events only: `status-update` (flips `Call.status` pending→active) and `end-of-call-report` (flips to ended, schedules synthesis).
 
@@ -61,6 +66,7 @@ Single file `voice_agent.db`; schema is Postgres-compatible. Key reads used by t
 ### Evals
 
 Three tiers under `evals/`, all using `pydantic_evals`:
+
 - **Tier 1** ([evals/test_interviewer.py](evals/test_interviewer.py)) — single-turn decision eval, seeds in-memory SQLite per case from `interviewer_turns.yaml`. Thresholds: ActionMatches ≥90%, SingleQuestion 100%, warmth ≥4/5, non-leading ≥90%.
 - **Tier 2** ([evals/test_analyst.py](evals/test_analyst.py)) — analyst probe quality against canned transcripts in `analyst_probes.yaml`.
 - **Tier 3** ([evals/test_trajectories.py](evals/test_trajectories.py)) — full conversation driven by `evals/simulator.py` respondent personas (`personas.yaml`) against the real interviewer + analyst.

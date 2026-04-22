@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import logging
 import os
 import time
 import uuid
@@ -20,8 +19,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 import logfire
+from opentelemetry import trace
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -33,18 +34,6 @@ from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely as 
 from voice_agent.config import ENABLE_SYNTHESIS_REPORT
 from voice_agent.tracing import agent_span, init_tracing
 from voice_agent.turn import run_speech_turn
-
-logger = logging.getLogger(__name__)
-
-
-def _configure_voice_agent_logging() -> None:
-    """Honor LOG_LEVEL for the ``voice_agent`` package (uvicorn configures the root logger)."""
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.getLogger("voice_agent").setLevel(level)
-
-
-_configure_voice_agent_logging()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///voice_agent.db")
 VAPI_API_KEY = os.getenv("VAPI_API_KEY", "")
@@ -64,12 +53,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="voice-agent", lifespan=lifespan)
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # HTTPException and RequestValidationError are expected control flow — don't noise-up Logfire.
+    if isinstance(exc, (HTTPException, RequestValidationError)):
+        raise exc
+    logfire.exception(
+        "unhandled_exception",
+        method=request.method,
+        path=request.url.path,
+        exc_type=type(exc).__name__,
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
 async def _synthesis_task(call_id: str) -> None:
     session = Session(engine)
     try:
         with agent_span("synthesis", call_id):
             deps = SynthesisDeps(call_id=call_id, session=session)
             await _synthesis_safely(deps)
+    except Exception:
+        logfire.exception("synthesis_task_error", call_id=call_id)
     finally:
         session.close()
 
@@ -84,25 +89,12 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
     event_type = msg.get("type")
     vapi_call_id = msg.get("call", {}).get("id")
 
-    if event_type in ("speech-update", "conversation-update"):
-        logger.debug(
-            "vapi_webhook event=%s vapi_call_id=%s",
-            event_type,
-            vapi_call_id,
-        )
-    else:
-        logger.info(
-            "vapi_webhook event=%s vapi_call_id=%s status=%s ended_reason=%s",
-            event_type,
-            vapi_call_id,
-            msg.get("status"),
-            msg.get("endedReason"),
-        )
-
-    with logfire.span("vapi_event", type=event_type, vapi_call_id=vapi_call_id):
+    with logfire.span("vapi_event", type=event_type, vapi_call_id=vapi_call_id) as event_span:
 
         if event_type == "status-update":
-            if msg.get("status") == "in-progress" and vapi_call_id:
+            status = msg.get("status")
+            event_span.set_attribute("status", status)
+            if status == "in-progress" and vapi_call_id:
                 with state.session_scope(engine) as session:
                     call = session.exec(
                         select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
@@ -110,10 +102,13 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
                     if call and call.status == "pending":
                         call.status = "active"
                         session.add(call)
+                        event_span.set_attribute("call_id", call.id)
+                        logfire.info("call_activated", call_id=call.id, vapi_call_id=vapi_call_id)
             return {}
 
         if event_type == "end-of-call-report":
             if not vapi_call_id:
+                logfire.warning("end_of_call_missing_vapi_id")
                 return {}
             call_id: str | None = None
             with state.session_scope(engine) as session:
@@ -126,14 +121,36 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
                     call.ended_at = datetime.now(timezone.utc)
                     session.add(call)
                     call_id = call.id
+                    event_span.set_attribute("call_id", call_id)
+                    event_span.set_attribute("ended_reason", msg.get("endedReason"))
+                else:
+                    logfire.warning("end_of_call_unknown_vapi_id", vapi_call_id=vapi_call_id)
             if call_id:
+                logfire.info("call_ended", call_id=call_id, ended_reason=msg.get("endedReason"))
                 if ENABLE_SYNTHESIS_REPORT:
                     asyncio.create_task(_synthesis_task(call_id))
                 else:
                     logfire.info("synthesis_skipped", call_id=call_id, reason="ENABLE_SYNTHESIS_REPORT=false")
             return {}
 
-        logfire.debug("vapi_event_ignored", type=event_type)
+        if event_type == "speech-update":
+            logfire.info(
+                "vapi_speech_update",
+                vapi_call_id=vapi_call_id,
+                status=msg.get("status"),
+                role=msg.get("role"),
+            )
+            return {}
+
+        if event_type == "conversation-update":
+            logfire.info(
+                "vapi_conversation_update",
+                vapi_call_id=vapi_call_id,
+                message_count=len(msg.get("messages", [])),
+            )
+            return {}
+
+        logfire.debug("vapi_event_ignored", type=event_type, payload=msg)
         return {}
 
 
@@ -164,7 +181,8 @@ async def start_call(req: StartCallRequest) -> dict[str, str]:
             )
         )
 
-    logfire.info("call_created", call_id=call_id, phone_number=req.phone_number)
+    logfire.info("call_created", call_id=call_id, phone_number=req.phone_number,
+                 question_count=len(req.scripted_questions))
 
     if req.phone_number and VAPI_API_KEY:
         await _dial_vapi(call_id, req.phone_number)
@@ -219,7 +237,8 @@ async def get_trace(call_id: str) -> dict[str, str]:
 
     import urllib.parse
     query = urllib.parse.quote(f'call_id="{call_id}"')
-    url = f"{LOGFIRE_BASE_URL}/{LOGFIRE_PROJECT}/live?filter={query}"
+    project_path = os.getenv("LOGFIRE_PROJECT_PATH", LOGFIRE_PROJECT)
+    url = f"{LOGFIRE_BASE_URL}/{project_path}/live?filter={query}"
     return {"call_id": call_id, "trace_url": url}
 
 
@@ -235,7 +254,6 @@ async def vapi_llm(request: Request):
     """
     import json
 
-    llm_request_id = str(uuid.uuid4())
     body = await request.json()
     vapi_call_id = body.get("call", {}).get("id")
     messages = body.get("messages", [])
@@ -248,73 +266,56 @@ async def vapi_llm(request: Request):
         if respondent_text
         else ""
     )
-    preview = (respondent_text[:120] + "…") if len(respondent_text) > 120 else respondent_text
 
     with state.session_scope(engine) as session:
         call = session.exec(
             select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
         ).first()
         if call is None:
-            logfire.warning("vapi_llm_unknown_call", vapi_call_id=vapi_call_id)
-            logger.warning(
-                "vapi_llm_unknown_call llm_request_id=%s vapi_call_id=%s messages=%s stream=%s",
-                llm_request_id,
-                vapi_call_id,
-                len(messages),
-                stream,
+            logfire.warning(
+                "vapi_llm_unknown_call",
+                vapi_call_id=vapi_call_id,
+                message_count=len(messages),
             )
             content = "Thank you for your time."
             call_id = None
         else:
             call_id = call.id
 
-    logger.info(
-        "vapi_llm_request_start llm_request_id=%s vapi_call_id=%s internal_call_id=%s "
-        "messages=%s stream=%s respondent_chars=%s respondent_sha256_16=%s respondent_preview=%r",
-        llm_request_id,
-        vapi_call_id,
-        call_id,
-        len(messages),
-        stream,
-        len(respondent_text),
-        respondent_hash,
-        preview,
-    )
+    with logfire.span(
+        "vapi_llm_request",
+        call_id=call_id,
+        vapi_call_id=vapi_call_id,
+        respondent_chars=len(respondent_text),
+        respondent_sha256_16=respondent_hash,
+        message_count=len(messages),
+        stream=stream,
+    ) as req_span:
+        otel_span = trace.get_current_span()
+        trace_id = format(otel_span.get_span_context().trace_id, "032x")
 
-    if call_id is not None:
-        t0 = time.perf_counter()
-        result = await run_speech_turn(engine, call_id, respondent_text)
-        elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        content = result["message"]
-        reply_preview = (content[:120] + "…") if len(content) > 120 else content
-        logger.info(
-            "vapi_llm_request_done llm_request_id=%s vapi_call_id=%s internal_call_id=%s "
-            "action=%s reply_chars=%s elapsed_ms=%s reply_preview=%r",
-            llm_request_id,
-            vapi_call_id,
-            call_id,
-            result["action"],
-            len(content),
-            elapsed_ms,
-            reply_preview,
-        )
-    else:
-        rp = (content[:120] + "…") if len(content) > 120 else content
-        logger.info(
-            "vapi_llm_request_done llm_request_id=%s vapi_call_id=%s internal_call_id=None "
-            "action=fallback_unknown_call reply_chars=%s elapsed_ms=0 reply_preview=%r",
-            llm_request_id,
-            vapi_call_id,
-            len(content),
-            rp,
-        )
+        if call_id is not None:
+            t0 = time.perf_counter()
+            result = await run_speech_turn(engine, call_id, respondent_text)
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            content = result["message"]
+            req_span.set_attribute("action", result["action"])
+            req_span.set_attribute("reply_chars", len(content))
+            req_span.set_attribute("elapsed_ms", elapsed_ms)
+        else:
+            req_span.set_attribute("action", "fallback_unknown_call")
+
+    headers = {"X-Trace-ID": trace_id}
 
     if not stream:
-        return JSONResponse({
-            "id": "interviewer",
-            "object": "chat.completion",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-        })
+        return JSONResponse(
+            {
+                "id": "interviewer",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            },
+            headers=headers,
+        )
 
     async def sse():
         chunk = {
@@ -331,7 +332,7 @@ async def vapi_llm(request: Request):
         yield f"data: {json.dumps(done)}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(sse(), media_type="text/event-stream")
+    return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
 
 
 # --- Vapi dial-out helper ---------------
@@ -381,11 +382,9 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
 
     if not phone_number_id:
         logfire.warning("vapi_dial_skipped", reason="VAPI_PHONE_NUMBER_ID not set", call_id=call_id)
-        logger.warning("vapi_dial_skipped call_id=%s reason=VAPI_PHONE_NUMBER_ID not set", call_id)
         return
     if not webhook_url:
         logfire.warning("vapi_dial_skipped", reason="WEBHOOK_URL not set", call_id=call_id)
-        logger.warning("vapi_dial_skipped call_id=%s reason=WEBHOOK_URL not set", call_id)
         return
 
     payload: dict[str, Any] = {
@@ -412,15 +411,9 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
             timeout=10,
         )
     if not resp.is_success:
-        body = resp.text
-        logfire.error("vapi_dial_error", status=resp.status_code, body=body, call_id=call_id)
-        logger.error(
-            "vapi_dial_failed call_id=%s status=%s body=%s",
-            call_id,
-            resp.status_code,
-            body[:4000],
-        )
-        raise HTTPException(status_code=502, detail=f"Vapi error {resp.status_code}: {body}")
+        logfire.error("vapi_dial_error", call_id=call_id, status=resp.status_code, body=resp.text[:4000])
+        raise HTTPException(status_code=502, detail=f"Vapi error {resp.status_code}: {resp.text}")
+
     vapi_call_id = resp.json().get("id")
 
     with state.session_scope(engine) as session:
@@ -429,13 +422,7 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
             call.vapi_call_id = vapi_call_id
             session.add(call)
 
-    logfire.info("vapi_dial_initiated", call_id=call_id, vapi_call_id=vapi_call_id)
-    logger.info(
-        "vapi_dial_initiated call_id=%s vapi_call_id=%s phone_number=%s",
-        call_id,
-        vapi_call_id,
-        phone_number,
-    )
+    logfire.info("vapi_dial_initiated", call_id=call_id, vapi_call_id=vapi_call_id, phone_number=phone_number)
 
 
 # --- Dev entrypoint ---------------------------------------------------------

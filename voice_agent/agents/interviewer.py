@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 
+import anyio
+import logfire
 from pydantic_ai import Agent
 
 from voice_agent import state
@@ -194,14 +196,7 @@ async def run_interviewer(
     prompt = f"{context_block}\n\nRespondent: {respondent_text}"
 
     result = await interviewer.run(prompt, deps=deps)
-    out = result.output
-
-    if out.action in ("scripted", "skip_scripted"):
-        state.mark_scripted_asked(deps.session, deps.call_id)
-    if out.probe_id_used is not None:
-        state.mark_probe_asked(deps.session, out.probe_id_used)
-
-    return out
+    return result.output
 
 
 async def run_interviewer_with_timeout(
@@ -210,14 +205,23 @@ async def run_interviewer_with_timeout(
     *,
     budget_s: float = INTERVIEWER_BUDGET_S,
 ) -> InterviewerOutput:
-    """Hard deadline wrapper. Returns a scripted fallback on timeout."""
-    try:
-        return await asyncio.wait_for(
-            run_interviewer(deps, respondent_text),
-            timeout=budget_s,
-        )
-    except asyncio.TimeoutError:
+    """Hard deadline wrapper. Returns a scripted fallback on timeout.
+
+    Uses anyio.move_on_after instead of asyncio.wait_for — PydanticAI uses
+    anyio task groups internally, and asyncio cancellation injects a cancel
+    that races with anyio's stream teardown, producing ClosedResourceError.
+    """
+    result: InterviewerOutput | None = None
+
+    with anyio.move_on_after(budget_s) as cancel_scope:
+        result = await run_interviewer(deps, respondent_text)
+
+    if cancel_scope.cancelled_caught:
+        logfire.warning("interviewer_timeout", call_id=deps.call_id, turn_number=deps.turn_number, budget_s=budget_s)
         return _fallback(deps)
+
+    assert result is not None
+    return result
 
 
 def _fallback(deps: InterviewerDeps) -> InterviewerOutput:
@@ -296,7 +300,7 @@ def _repl() -> None:
     import os
     import sys
     import time
-    from tracing import init_tracing, turn_span, log_interviewer_decision
+    from tracing import agent_span, init_tracing
 
     init_tracing(send_to_logfire=False)
     if not os.getenv("ANTHROPIC_API_KEY"):
@@ -320,18 +324,14 @@ def _repl() -> None:
             deps = InterviewerDeps(
                 call_id=call_id, session=session, turn_number=turn_number
             )
-            with turn_span(call_id, turn_number, respondent_text=line):
+            with agent_span("interviewer", call_id, turn_number=turn_number, respondent_text=line) as span:
                 t0 = time.perf_counter()
                 out = asyncio.run(run_interviewer_with_timeout(deps, line))
                 latency_ms = int((time.perf_counter() - t0) * 1000)
-                log_interviewer_decision(
-                    call_id=call_id,
-                    turn_number=turn_number,
-                    action=out.action,
-                    utterance=out.utterance,
-                    reasoning=out.reasoning,
-                    latency_ms=latency_ms,
-                )
+                span.set_attribute("action", out.action)
+                span.set_attribute("utterance", out.utterance)
+                span.set_attribute("reasoning", out.reasoning)
+                span.set_attribute("latency_ms", latency_ms)
 
             session.add_all([
                 state.Turn(
