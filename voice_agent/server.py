@@ -93,13 +93,22 @@ async def _analyst_task(call_id: str) -> None:
         session.close()
 
 
-def _vapi_call_id_to_call_id(vapi_call_id: str) -> str | None:
-    """Resolve vapi_call_id → internal call_id. Returns None if not found."""
-    with state.session_scope(engine) as session:
-        call = session.exec(
-            select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
-        ).first()
-        return call.id if call else None
+async def _resolve_vapi_call_id(vapi_call_id: str, retries: int = 5) -> str | None:
+    """Resolve vapi_call_id → internal call_id with exponential backoff.
+
+    Vapi can fire the first webhook event before _dial_vapi has committed
+    vapi_call_id to the DB. Retrying covers that window without any extra infra.
+    Waits: 100ms, 200ms, 400ms, 800ms, 1600ms → 3.1s worst case.
+    """
+    for i in range(retries):
+        with state.session_scope(engine) as session:
+            call = session.exec(
+                select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
+            ).first()
+            if call:
+                return call.id
+        await asyncio.sleep(0.1 * (2 ** i))
+    return None
 
 
 def _write_confirmed_turns(call_id: str, messages: list[dict]) -> int:
@@ -178,6 +187,9 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
                     select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
                 ).first()
                 if call:
+                    # Guard is a no-op if /calls/{id}/end already fired — both paths are valid.
+                    if call.status == "ended":
+                        return {}
                     call.status = "ended"
                     call.end_reason = msg.get("endedReason")
                     call.ended_at = datetime.now(timezone.utc)
@@ -235,7 +247,7 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
             # Write confirmed turns and trigger analyst after a complete exchange
             # (last_role == "bot" means Vapi just finished speaking a response).
             if vapi_call_id and last_role == "bot":
-                call_id_inner = _vapi_call_id_to_call_id(vapi_call_id)
+                call_id_inner = await _resolve_vapi_call_id(vapi_call_id)
                 if call_id_inner:
                     _write_confirmed_turns(call_id_inner, messages)
                     with state.session_scope(engine) as _s:
@@ -361,20 +373,14 @@ async def vapi_llm(request: Request):
         else ""
     )
 
-    with state.session_scope(engine) as session:
-        call = session.exec(
-            select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
-        ).first()
-        if call is None:
-            logfire.warning(
-                "vapi_llm_unknown_call",
-                vapi_call_id=vapi_call_id,
-                message_count=len(messages),
-            )
-            content = "Thank you for your time."
-            call_id = None
-        else:
-            call_id = call.id
+    call_id = await _resolve_vapi_call_id(vapi_call_id)
+    if call_id is None:
+        logfire.warning(
+            "vapi_llm_unknown_call",
+            vapi_call_id=vapi_call_id,
+            message_count=len(messages),
+        )
+        content = "Thank you for your time."
 
     with logfire.span(
         "vapi_llm_request",
@@ -427,6 +433,38 @@ async def vapi_llm(request: Request):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
+
+
+@app.delete("/calls/{call_id}")
+async def delete_call(call_id: str) -> dict[str, str]:
+    """Cancel an in-flight call. Fires DELETE to Vapi if the call is still active."""
+    import httpx
+
+    with state.session_scope(engine) as session:
+        call = session.get(state.Call, call_id)
+        if call is None:
+            raise HTTPException(status_code=404, detail="Call not found")
+        if call.status == "ended":
+            return {"call_id": call_id, "status": "already_ended"}
+        vapi_call_id = call.vapi_call_id
+        call.status = "ended"
+        call.end_reason = "deleted"
+        call.ended_at = datetime.now(timezone.utc)
+        session.add(call)
+
+    if vapi_call_id and VAPI_API_KEY:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"https://api.vapi.ai/call/{vapi_call_id}",
+                headers={"Authorization": f"Bearer {VAPI_API_KEY}"},
+                timeout=10,
+            )
+        if not resp.is_success:
+            logfire.warning("vapi_cancel_failed", call_id=call_id, vapi_call_id=vapi_call_id,
+                            status=resp.status_code)
+
+    logfire.info("call_deleted", call_id=call_id, vapi_call_id=vapi_call_id)
+    return {"call_id": call_id, "status": "ended"}
 
 
 # --- Vapi dial-out helper ---------------
@@ -510,6 +548,8 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
 
     vapi_call_id = resp.json().get("id")
 
+    # Write vapi_call_id immediately so the first Vapi webhook event (which can
+    # arrive within milliseconds of this POST returning) can resolve the call.
     with state.session_scope(engine) as session:
         call = session.get(state.Call, call_id)
         if call and vapi_call_id:

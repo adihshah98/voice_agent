@@ -1,41 +1,35 @@
 ## My questions/Future improvements
 
-- Interview Pre-Context
-  - Tell it it is diligencing which product
-  - Tell it which direction to go, where not to spend too much time
-- Vapi Configs
+- Correctness Edges
+  - **Race condition:** `vapi_call_id` is written to DB *after* `POST /call/phone` returns, but Vapi can fire `assistant.started` before that write commits. In practice the first event is usually `status-update` (`ringing`) which is long enough — but it's fragile.
+  - **Two paths for "end of call":** `/vapi/webhook` end-of-call-report AND `/calls/{id}/end`. If both fire, the second is a no-op due to the `status=="ended"` guard — OK, but worth a comment.
+  - **No Vapi call cancellation** — if a user deletes a call mid-flight, there's no DELETE path to Vapi.
+
+- Latency
+  - **Non-streaming LLM response.** Vapi's Custom LLM supports SSE streaming of tokens; we return the full response at once, which means 3-5 s of silence before TTS starts. Production should stream tokens so TTS begins as soon as the first sentence is ready.
+  - `firstMessageMode: assistant-speaks-first` + Custom LLM = guaranteed awkward silence on pickup. A common production pattern is a static cached opener ("Hi, thanks for taking the time — one moment…") while the real agent warms up.
+  - **No prompt caching** on Anthropic calls — the system prompt is reprocessed every turn. Needs `cache_control` breakpoints.
+- Voice Nuances/Vapi Config
   - Barge in etc.
   - Gate LLM calls till final-transcript (more chatlike)
   - Debounce partial updates (Wait 500ms of silence before triggering LLM)
   - Reduce ASR chunk frequency
   - See how to modify Vapi config
-- TTS
-  - Right now, it's too fake sounding
-- Voice Nuances
   - If the respondent says hmm, or yes - it shouldn't stop
   - If responder is taking time to think, it shoudn't interrupt/know when to interrupt
   - If it asks for name, it should not give it. But make the transition back to the question smoother
-- Correctness Edges
-  - **Race condition:** `vapi_call_id` is written to DB *after* `POST /call/phone` returns, but Vapi can fire `assistant.started` before that write commits. In practice the first event is usually `status-update` (`ringing`) which is long enough — but it's fragile.
-  - **Two paths for "end of call":** `/vapi/webhook` end-of-call-report AND `/calls/{id}/end`. If both fire, the second is a no-op due to the `status=="ended"` guard — OK, but worth a comment.
-  - **No Vapi call cancellation** — if a user deletes a call mid-flight, there's no DELETE path to Vapi.
-- Observability
+- Interview Pre-Context
+  - Tell it it is diligencing which product
+  - Tell it which direction to go, where not to spend too much time
+- TTS
+  - Right now, it's too fake sounding
+- Live Observability
   - No per-call cost tracking (input/output tokens × rate).
   - No alerting on `vapi_unknown_call` or `vapi_dial_error` — they just log.
-- Latency
-  - **Non-streaming LLM response.** Vapi's Custom LLM supports SSE streaming of tokens; we return the full response at once, which means 3-5 s of silence before TTS starts. Production should stream tokens so TTS begins as soon as the first sentence is ready.
-  - `firstMessageMode: assistant-speaks-first` + Custom LLM = guaranteed awkward silence on pickup. A common production pattern is a static cached opener ("Hi, thanks for taking the time — one moment…") while the real agent warms up.
-  - **No prompt caching** on Anthropic calls — the system prompt is reprocessed every turn. Needs `cache_control` breakpoints.
-- Things to watch out for (Seem to be solved)
-  - What if the answer to the next scripted quesion is already given by respondent? Skip it/How to mark it?
-  - Interviewer has low memory, so it keeps repeating sometimes even if it has been answered earlier? Memory for last N turns in context?
-  - If context >200, how will it reads contras from before - solved by the Analyst Context, also analyst now fires only when scripted answered
-  - Top probe stays the same. Maybe we should show it top 3 probes list? (Bc right now, if top probe is too stale, there is not other probe replacing it)
-- E2E Evals
-  - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
-- Online Evals
-- Synthesis Report
-  - Reinstate synthesis report once this works
+- Evals
+  - E2E Evals
+    - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
+  - Online Evals
 - Infra - Prod Level
   - Webhook correctness (auth/idempotency)
   - See where traces go & have a good observabilty process/dashnoard
@@ -47,6 +41,8 @@
   - Model Pinning & Rollback
   - Secrets Management
   - Dependency Mgmt on pyproject.timl and remove requirements.txt
+- Synthesis Report
+  - Reinstate synthesis report once this works
 - Infra - Deployment Level
   - SQS Queues
   - Secrets manager 
@@ -57,6 +53,5 @@
 - Per Customer per project configuration
   - Add a configurable per customer and per project config - eg. Duplo diligence, I list my question list, and have that be part of the scripted questions, what to focus on, what to probe on etc.
 - Advanced
-  - Long-term memory.
-  - Barge-in / interruption handling beyond Vapi's defaults.
+  - Barge-in / interruption handling beyond Vapi's capabilities - Using Livekit
 
