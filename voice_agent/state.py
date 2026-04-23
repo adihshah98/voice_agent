@@ -14,6 +14,7 @@ from typing import Optional
 from sqlalchemy import Column, update
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
+from sqlalchemy.pool import NullPool, StaticPool
 from sqlmodel import Field, Relationship, Session, SQLModel, create_engine, select
 
 
@@ -168,8 +169,16 @@ class EvalRun(SQLModel, table=True):
 
 
 def make_engine(url: str = "sqlite:///voice_agent.db", *, echo: bool = False):
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(url, echo=echo, connect_args=connect_args)
+    if url.startswith("sqlite"):
+        if ":memory:" in url:
+            # StaticPool keeps a single connection so all sessions share the
+            # same in-memory DB — required for tests/evals.
+            return create_engine(url, echo=echo, connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        # NullPool: open/close a connection per session. File-based SQLite has
+        # no TCP overhead, and pooling only causes QueuePool exhaustion under
+        # concurrent requests.
+        return create_engine(url, echo=echo, connect_args={"check_same_thread": False}, poolclass=NullPool)
+    return create_engine(url, echo=echo)
 
 
 def init_db(engine) -> None:

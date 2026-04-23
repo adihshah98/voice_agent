@@ -11,10 +11,13 @@ based on the structured output, so the model never needs to call a tool.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 
 import anyio
 import logfire
 from pydantic_ai import Agent
+from pydantic_ai.messages import CachePoint
+from pydantic_ai.models.anthropic import AnthropicModelSettings
 
 from voice_agent import state
 from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_MODEL
@@ -128,61 +131,67 @@ Hard rules:
 """
 
 
-def _build_context(
+def _build_prompt_parts(
     session,
     call_id: str,
     current_turn: int,
+    respondent_text: str,
     vapi_messages: list[dict],
-) -> tuple[str, list[state.Probe]]:
-    """Read study state from DB and conversation history from Vapi's messages.
+) -> list[str | CachePoint]:
+    """Build cache-aware prompt parts for Anthropic prompt caching.
 
-    vapi_messages is the OpenAI-formatted array Vapi sends with each LLM request
-    (body["messages"]). It reflects what was actually spoken — no provisional turns.
-    active_probes are returned so the caller can mark the used one after the LLM call.
-    Nothing is written to the DB here.
+    We isolate additive covered subtopics as the only cache-pointed user block.
+    Dynamic turn state (scripted/probes/recent turns/respondent line) stays in the
+    non-cache-pointed tail because it changes almost every turn.
     """
     next_q = state.next_scripted(session, call_id)
     remaining = state.scripted_remaining(session, call_id)
     probes = state.top_probes(session, call_id, n=3)
     snapshot = state.latest_snapshot(session, call_id)
 
-    lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {remaining}"]
-    lines.append(f"NEXT_SCRIPTED: {next_q}" if next_q else "NEXT_SCRIPTED: none")
+    covered_lines = []
+    if snapshot and snapshot.covered_subtopics:
+        covered_lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
+        for topic in snapshot.covered_subtopics:
+            covered_lines.append(f"  - {topic}")
+    else:
+        covered_lines.append("COVERED_SUBTOPICS: none")
+
+    convo = [m for m in vapi_messages if m.get("role") in ("assistant", "user")]
+    recent = convo[-30:]
+    dynamic_lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {remaining}"]
+    dynamic_lines.append(f"NEXT_SCRIPTED: {next_q}" if next_q else "NEXT_SCRIPTED: none")
 
     active_probes = [
         p for p in probes
         if (current_turn - (p.generated_after_turn or 0)) <= 8
     ]
     if active_probes:
-        lines.append("PENDING_PROBES (analyst suggestions, in priority order):")
+        dynamic_lines.append("PENDING_PROBES (analyst suggestions, in priority order):")
         for probe in active_probes:
             turns_ago = current_turn - (probe.generated_after_turn or 0)
             line = f'  [id={probe.id}, priority={probe.priority}, turns_ago={turns_ago}] "{probe.question}"'
             if probe.rationale:
                 line += f"\n    rationale: {probe.rationale}"
-            lines.append(line)
+            dynamic_lines.append(line)
     else:
-        lines.append("PENDING_PROBES: none")
-
-    convo = [m for m in vapi_messages if m.get("role") in ("assistant", "user")]
-    recent = convo[-30:]
-
-    # COVERED_SUBTOPICS: analyst-compressed topic phrases for ground already covered,
-    # including topics answered organically. Only includes turns that have scrolled out
-    # of the RECENT_TURNS window so there's no redundancy.
-    if snapshot and snapshot.covered_subtopics:
-        lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
-        for topic in snapshot.covered_subtopics:
-            lines.append(f"  - {topic}")
+        dynamic_lines.append("PENDING_PROBES: none")
 
     if recent:
-        lines.append("RECENT_TURNS:")
+        dynamic_lines.append("RECENT_TURNS:")
         for m in recent:
             speaker = "interviewer" if m["role"] == "assistant" else "respondent"
-            lines.append(f"  {speaker}: {m.get('content', '')}")
+            dynamic_lines.append(f"  {speaker}: {m.get('content', '')}")
+    dynamic_lines.append("[/CONTEXT]")
+    dynamic_lines.append("")
+    dynamic_lines.append(f"Respondent: {respondent_text}")
 
-    lines.append("[/CONTEXT]")
-    return "\n".join(lines), active_probes
+    prompt_parts: list[str | CachePoint] = [
+        "\n".join(covered_lines),
+        CachePoint(ttl="1h"),
+        "\n".join(dynamic_lines),
+    ]
+    return prompt_parts
 
 
 interviewer = Agent(
@@ -191,6 +200,9 @@ interviewer = Agent(
     output_type=InterviewerOutput,
     system_prompt=INTERVIEWER_PROMPT,
     instrument=True,
+    model_settings=AnthropicModelSettings(
+        anthropic_cache_instructions='1h',
+    ),
 )
 
 
@@ -204,13 +216,12 @@ async def run_interviewer(
     vapi_messages: OpenAI-formatted message array from Vapi (body["messages"]).
     When None (evals / play.py), falls back to reading recent_turns from the DB.
     """
-    context_block, active_probes = _build_context(
+    prompt_parts = _build_prompt_parts(
         deps.session, deps.call_id, deps.turn_number,
+        respondent_text=respondent_text,
         vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
     )
-    prompt = f"{context_block}\n\nRespondent: {respondent_text}"
-
-    result = await interviewer.run(prompt, deps=deps)
+    result = await interviewer.run(prompt_parts, deps=deps)
     return result.output
 
 
@@ -250,6 +261,51 @@ async def run_interviewer_with_timeout(
 
     assert result is not None
     return result
+
+
+async def stream_interviewer_utterance(
+    deps: InterviewerDeps,
+    respondent_text: str,
+    vapi_messages: list[dict] | None = None,
+    *,
+    budget_s: float = INTERVIEWER_BUDGET_S,
+) -> AsyncGenerator[str | InterviewerOutput, None]:
+    """Async generator: yields str deltas as the utterance arrives, then the
+    final InterviewerOutput as the last item for the caller to apply side effects.
+
+    On timeout yields the fallback utterance string then the fallback output object.
+    """
+    prompt_parts = _build_prompt_parts(
+        deps.session, deps.call_id, deps.turn_number,
+        respondent_text=respondent_text,
+        vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
+    )
+
+    final_output: InterviewerOutput | None = None
+
+    with anyio.move_on_after(budget_s) as cancel_scope:
+        prev = ""
+        async with interviewer.run_stream(prompt_parts, deps=deps) as streamed:
+            async for partial in streamed.stream_output(debounce_by=None):
+                current = partial.utterance or ""
+                if len(current) > len(prev):
+                    yield current[len(prev):]
+                    prev = current
+            final_output = await streamed.get_output()
+
+    if cancel_scope.cancelled_caught:
+        logfire.warning(
+            "interviewer_timeout",
+            call_id=deps.call_id,
+            turn_number=deps.turn_number,
+            budget_s=budget_s,
+        )
+        fb = _fallback(deps)
+        yield fb.utterance
+        yield fb
+        return
+
+    yield final_output
 
 
 def _fallback(deps: InterviewerDeps) -> InterviewerOutput:

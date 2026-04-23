@@ -33,7 +33,7 @@ from voice_agent import state
 from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely as _synthesis_safely
 from voice_agent.config import ENABLE_SYNTHESIS_REPORT
 from voice_agent.tracing import agent_span, init_tracing
-from voice_agent.turn import run_speech_turn
+from voice_agent.turn import run_speech_turn, run_speech_turn_stream
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///voice_agent.db")
 VAPI_API_KEY = os.getenv("VAPI_API_KEY", "")
@@ -382,32 +382,31 @@ async def vapi_llm(request: Request):
         )
         content = "Thank you for your time."
 
-    with logfire.span(
-        "vapi_llm_request",
-        call_id=call_id,
-        vapi_call_id=vapi_call_id,
-        respondent_chars=len(respondent_text),
-        respondent_sha256_16=respondent_hash,
-        message_count=len(messages),
-        stream=stream,
-    ) as req_span:
-        otel_span = trace.get_current_span()
-        trace_id = format(otel_span.get_span_context().trace_id, "032x")
-
-        if call_id is not None:
-            t0 = time.perf_counter()
-            result = await run_speech_turn(engine, call_id, respondent_text, vapi_messages=messages)
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            content = result["message"]
-            req_span.set_attribute("action", result["action"])
-            req_span.set_attribute("reply_chars", len(content))
-            req_span.set_attribute("elapsed_ms", elapsed_ms)
-        else:
-            req_span.set_attribute("action", "fallback_unknown_call")
-
+    otel_span = trace.get_current_span()
+    trace_id = format(otel_span.get_span_context().trace_id, "032x")
     headers = {"X-Trace-ID": trace_id}
 
     if not stream:
+        with logfire.span(
+            "vapi_llm_request",
+            call_id=call_id,
+            vapi_call_id=vapi_call_id,
+            respondent_chars=len(respondent_text),
+            respondent_sha256_16=respondent_hash,
+            message_count=len(messages),
+            stream=False,
+        ) as req_span:
+            if call_id is not None:
+                t0 = time.perf_counter()
+                result = await run_speech_turn(engine, call_id, respondent_text, vapi_messages=messages)
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                content = result["message"]
+                req_span.set_attribute("action", result["action"])
+                req_span.set_attribute("reply_chars", len(content))
+                req_span.set_attribute("elapsed_ms", elapsed_ms)
+            else:
+                req_span.set_attribute("action", "fallback_unknown_call")
+                content = "Thank you for your time."
         return JSONResponse(
             {
                 "id": "interviewer",
@@ -417,18 +416,57 @@ async def vapi_llm(request: Request):
             headers=headers,
         )
 
+    # Streaming path — return StreamingResponse immediately so Vapi gets the
+    # first token as soon as the LLM starts producing, not after it finishes.
     async def sse():
-        chunk = {
-            "id": "interviewer",
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        done = {
-            "id": "interviewer",
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }
+        stream_cancelled = False
+        if call_id is None:
+            fallback = "Thank you for your time."
+            chunk = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": fallback}, "finish_reason": None}]}
+            yield f"data: {json.dumps(chunk)}\n\n"
+        else:
+            with logfire.span(
+                "vapi_llm_request",
+                call_id=call_id,
+                vapi_call_id=vapi_call_id,
+                respondent_chars=len(respondent_text),
+                respondent_sha256_16=respondent_hash,
+                message_count=len(messages),
+                stream=True,
+            ) as req_span:
+                reply_chars = 0
+                try:
+                    async for item in run_speech_turn_stream(engine, call_id, respondent_text, vapi_messages=messages):
+                        if isinstance(item, str):
+                            reply_chars += len(item)
+                            chunk = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": item}, "finish_reason": None}]}
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        else:
+                            req_span.set_attribute("action", item["action"])
+                            req_span.set_attribute("reply_chars", reply_chars)
+                            req_span.set_attribute("elapsed_ms", item["latency_ms"])
+                            llm_latency_ms = item.get("llm_latency_ms")
+                            persist_ms = item.get("persist_ms")
+                            ttft_ms = item.get("ttft_ms")
+                            if llm_latency_ms is not None:
+                                req_span.set_attribute("llm_latency_ms", llm_latency_ms)
+                            if persist_ms is not None:
+                                req_span.set_attribute("persist_ms", persist_ms)
+                            if ttft_ms is not None:
+                                req_span.set_attribute("ttft_ms", ttft_ms)
+                except asyncio.CancelledError:
+                    stream_cancelled = True
+                    logfire.info(
+                        "vapi_llm_stream_cancelled",
+                        call_id=call_id,
+                        vapi_call_id=vapi_call_id,
+                        reply_chars=reply_chars,
+                    )
+                    return
+
+        if stream_cancelled:
+            return
+        done = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
         yield f"data: {json.dumps(done)}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -531,6 +569,7 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
             "serverUrl": f"{webhook_url}/vapi/webhook",
             "voice": _vapi_assistant_voice(),
             "transcriber": {"provider": "deepgram", "model": "nova-2", "language": "en"},
+            "firstMessage": "Hey! Thank you for getting on the call — just want to check if you can hear me before we get started.",
             "firstMessageMode": "assistant-speaks-first",
         },
     }

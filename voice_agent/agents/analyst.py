@@ -14,6 +14,8 @@ import logfire
 from opentelemetry import trace
 from dotenv import load_dotenv
 from pydantic_ai import Agent
+from pydantic_ai.messages import CachePoint
+from pydantic_ai.models.anthropic import AnthropicModelSettings
 from sqlmodel import select
 
 load_dotenv()
@@ -129,15 +131,20 @@ analyst = Agent(
     output_type=AnalysisUpdate,
     system_prompt=ANALYST_PROMPT,
     instrument=True,
+    model_settings=AnthropicModelSettings(
+        anthropic_cache_instructions='1h',
+    ),
 )
 
 SUBTOPIC_COMPRESSION_PROMPT = """\
-You are reviewing a customer interview transcript. Produce a cumulative list of short
-noun-phrase labels (3-6 words each) for every specific subtopic addressed — whether
-asked explicitly or answered organically by the respondent.
+You are reviewing only NEW transcript turns from a customer interview.
+Produce only NEW short noun-phrase labels (3-6 words each) for specific subtopics
+addressed in this NEW transcript — whether asked explicitly or answered organically.
 
-If EXISTING_COVERED_SUBTOPICS are provided, keep every entry from that list and only
-add new subtopics from the transcript. Never remove or merge existing entries.
+If EXISTING_COVERED_SUBTOPICS are provided, treat them as already known memory:
+- Do not repeat them.
+- Output only net-new subtopics found in the NEW transcript.
+- If no new subtopics were introduced, return an empty list.
 
 Granularity rules:
 - Name specific entities, not categories. Use 'Notion vs Google Docs product features'
@@ -156,6 +163,9 @@ _compression_agent = Agent(
     output_type=SubtopicCompression,
     system_prompt=SUBTOPIC_COMPRESSION_PROMPT,
     instrument=True,
+    model_settings=AnthropicModelSettings(
+        anthropic_cache_instructions='1h',
+    ),
 )
 
 SUBTOPIC_COMPRESSION_INTERVAL = 25
@@ -175,18 +185,37 @@ async def _maybe_compress_subtopics(
     if after_turn - last_compression < SUBTOPIC_COMPRESSION_INTERVAL:
         return prior_subtopics, last_compression
 
-    all_turns = state.recent_turns(session, call_id, n=200)
-    lines = ["TRANSCRIPT:"]
-    for t in all_turns:
-        lines.append(f"  {t.speaker.upper()} [{t.turn_number}]: {t.text}")
+    delta_turns = state.turns_since(session, call_id, after_turn=last_compression)
+    if not delta_turns:
+        return prior_subtopics, last_compression
 
+    existing_lines = []
     if prior_subtopics:
-        lines.append("\nEXISTING_COVERED_SUBTOPICS (already confirmed — keep all of these, only add new ones):")
+        existing_lines.append("EXISTING_COVERED_SUBTOPICS (already confirmed memory):")
         for topic in prior_subtopics:
-            lines.append(f"  - {topic}")
+            existing_lines.append(f"  - {topic}")
+    else:
+        existing_lines.append("EXISTING_COVERED_SUBTOPICS: none")
 
-    result = await _compression_agent.run("\n".join(lines))
-    return result.output.covered_subtopics, after_turn
+    new_lines = [f"NEW TRANSCRIPT (turns {last_compression + 1}–{after_turn}):"]
+    for t in delta_turns:
+        new_lines.append(f"  {t.speaker.upper()} [{t.turn_number}]: {t.text}")
+
+    prompt_parts: list[str | CachePoint] = [
+        "\n".join(existing_lines),
+        CachePoint(ttl="1h"),
+        "\n".join(new_lines),
+    ]
+
+    result = await _compression_agent.run(prompt_parts)
+    merged = list(prior_subtopics)
+    seen = set(prior_subtopics)
+    for topic in result.output.covered_subtopics:
+        if topic not in seen:
+            merged.append(topic)
+            seen.add(topic)
+
+    return merged, after_turn
 
 
 async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:

@@ -10,8 +10,8 @@
 questions:
   - topic: intro
     question: >
-      Hey! Thank you for taking the time to talk to me today. Before we dive in, I wanted to share some context — I'm doing research to better understand how teams like yours
-      use [product]. Everything you share is completely confidential. Can you start by telling me about your role and what your
+      Hey! Before we dive in, I wanted to share some context — I'm doing some research to better understand how teams like yours
+      use [product]. So as part of that, I am talking to a bunch of users. Everything you share is completely confidential. Can you start by telling me about your role and what your
       team does day-to-day?
 
   - topic: status_quo

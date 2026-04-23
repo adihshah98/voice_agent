@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import logfire
 from dotenv import load_dotenv
 from pydantic_ai import Agent
+from pydantic_ai.models.anthropic import AnthropicModelSettings
 from sqlmodel import Session, select
 
 load_dotenv()
@@ -111,6 +112,9 @@ synthesis_agent = Agent(
     output_type=ReportOutput,
     system_prompt=SYNTHESIS_PROMPT,
     instrument=True,
+    model_settings=AnthropicModelSettings(
+        anthropic_cache_instructions=True,
+    ),
 )
 
 
