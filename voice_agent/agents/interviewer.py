@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 
 import anyio
 import logfire
@@ -22,6 +23,167 @@ from pydantic_ai.models.anthropic import AnthropicModelSettings
 from voice_agent import state
 from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_MODEL
 from voice_agent.models import InterviewerDeps, InterviewerOutput
+
+
+@dataclass
+class PreparedInterviewerTurn:
+    prompt_parts: list[str | CachePoint]
+    fallback_scripted_question: str | None
+
+
+@dataclass
+class InterviewerContextReads:
+    next_scripted_question: str | None
+    scripted_remaining: int
+    probes: list[state.Probe]
+    snapshot: state.AnalystSnapshot | None
+
+
+def _build_prompt_parts_from_reads(
+    reads: InterviewerContextReads,
+    current_turn: int,
+    respondent_text: str,
+    vapi_messages: list[dict],
+) -> list[str | CachePoint]:
+    covered_lines = []
+    if reads.snapshot and reads.snapshot.covered_subtopics:
+        covered_lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
+        for topic in reads.snapshot.covered_subtopics:
+            covered_lines.append(f"  - {topic}")
+    else:
+        covered_lines.append("COVERED_SUBTOPICS: none")
+
+    convo = [m for m in vapi_messages if m.get("role") in ("assistant", "user")]
+    recent = convo[-30:]
+    dynamic_lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {reads.scripted_remaining}"]
+    dynamic_lines.append(
+        f"NEXT_SCRIPTED: {reads.next_scripted_question}"
+        if reads.next_scripted_question
+        else "NEXT_SCRIPTED: none"
+    )
+
+    active_probes = [
+        p for p in reads.probes
+        if (current_turn - (p.generated_after_turn or 0)) <= 8
+    ]
+    if active_probes:
+        dynamic_lines.append("PENDING_PROBES (analyst suggestions, in priority order):")
+        for probe in active_probes:
+            turns_ago = current_turn - (probe.generated_after_turn or 0)
+            line = f'  [id={probe.id}, priority={probe.priority}, turns_ago={turns_ago}] "{probe.question}"'
+            if probe.rationale:
+                line += f"\n    rationale: {probe.rationale}"
+            dynamic_lines.append(line)
+    else:
+        dynamic_lines.append("PENDING_PROBES: none")
+
+    if recent:
+        dynamic_lines.append("RECENT_TURNS:")
+        for m in recent:
+            speaker = "interviewer" if m["role"] == "assistant" else "respondent"
+            dynamic_lines.append(f"  {speaker}: {m.get('content', '')}")
+    dynamic_lines.append("[/CONTEXT]")
+    dynamic_lines.append("")
+    dynamic_lines.append(f"Respondent: {respondent_text}")
+
+    return [
+        "\n".join(covered_lines),
+        CachePoint(ttl="1h"),
+        "\n".join(dynamic_lines),
+    ]
+
+
+def prepare_interviewer_turn(
+    session,
+    call_id: str,
+    current_turn: int,
+    respondent_text: str,
+    vapi_messages: list[dict] | None,
+) -> PreparedInterviewerTurn:
+    """Load DB-backed context in one short-lived read session."""
+    messages = vapi_messages or _db_messages_fallback(session, call_id)
+    reads = InterviewerContextReads(
+        next_scripted_question=state.next_scripted(session, call_id),
+        scripted_remaining=state.scripted_remaining(session, call_id),
+        probes=state.top_probes(session, call_id, n=3),
+        snapshot=state.latest_snapshot(session, call_id),
+    )
+    prompt_parts = _build_prompt_parts_from_reads(
+        reads,
+        current_turn,
+        respondent_text=respondent_text,
+        vapi_messages=messages,
+    )
+    return PreparedInterviewerTurn(
+        prompt_parts=prompt_parts,
+        fallback_scripted_question=reads.next_scripted_question,
+    )
+
+
+async def prepare_interviewer_turn_concurrent(
+    engine,
+    call_id: str,
+    current_turn: int,
+    respondent_text: str,
+    vapi_messages: list[dict] | None,
+) -> PreparedInterviewerTurn:
+    """Read context with parallel short sessions (best for pooled Postgres)."""
+    next_q: str | None = None
+    remaining: int | None = None
+    probes: list[state.Probe] | None = None
+    snapshot: state.AnalystSnapshot | None = None
+    messages: list[dict] | None = vapi_messages
+
+    async def load_next_q() -> None:
+        nonlocal next_q
+        with state.session_scope(engine) as session:
+            next_q = await anyio.to_thread.run_sync(state.next_scripted, session, call_id)
+
+    async def load_remaining() -> None:
+        nonlocal remaining
+        with state.session_scope(engine) as session:
+            remaining = await anyio.to_thread.run_sync(state.scripted_remaining, session, call_id)
+
+    async def load_probes() -> None:
+        nonlocal probes
+        with state.session_scope(engine) as session:
+            probes = await anyio.to_thread.run_sync(state.top_probes, session, call_id, 3)
+
+    async def load_snapshot() -> None:
+        nonlocal snapshot
+        with state.session_scope(engine) as session:
+            snapshot = await anyio.to_thread.run_sync(state.latest_snapshot, session, call_id)
+
+    async def load_messages() -> None:
+        nonlocal messages
+        if messages is not None:
+            return
+        with state.session_scope(engine) as session:
+            messages = await anyio.to_thread.run_sync(_db_messages_fallback, session, call_id)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(load_next_q)
+        tg.start_soon(load_remaining)
+        tg.start_soon(load_probes)
+        tg.start_soon(load_snapshot)
+        tg.start_soon(load_messages)
+
+    reads = InterviewerContextReads(
+        next_scripted_question=next_q,
+        scripted_remaining=remaining or 0,
+        probes=probes or [],
+        snapshot=snapshot,
+    )
+    prompt_parts = _build_prompt_parts_from_reads(
+        reads,
+        current_turn,
+        respondent_text=respondent_text,
+        vapi_messages=messages or [],
+    )
+    return PreparedInterviewerTurn(
+        prompt_parts=prompt_parts,
+        fallback_scripted_question=reads.next_scripted_question,
+    )
 
 
 INTERVIEWER_PROMPT = """\
@@ -131,69 +293,6 @@ Hard rules:
 """
 
 
-def _build_prompt_parts(
-    session,
-    call_id: str,
-    current_turn: int,
-    respondent_text: str,
-    vapi_messages: list[dict],
-) -> list[str | CachePoint]:
-    """Build cache-aware prompt parts for Anthropic prompt caching.
-
-    We isolate additive covered subtopics as the only cache-pointed user block.
-    Dynamic turn state (scripted/probes/recent turns/respondent line) stays in the
-    non-cache-pointed tail because it changes almost every turn.
-    """
-    next_q = state.next_scripted(session, call_id)
-    remaining = state.scripted_remaining(session, call_id)
-    probes = state.top_probes(session, call_id, n=3)
-    snapshot = state.latest_snapshot(session, call_id)
-
-    covered_lines = []
-    if snapshot and snapshot.covered_subtopics:
-        covered_lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
-        for topic in snapshot.covered_subtopics:
-            covered_lines.append(f"  - {topic}")
-    else:
-        covered_lines.append("COVERED_SUBTOPICS: none")
-
-    convo = [m for m in vapi_messages if m.get("role") in ("assistant", "user")]
-    recent = convo[-30:]
-    dynamic_lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {remaining}"]
-    dynamic_lines.append(f"NEXT_SCRIPTED: {next_q}" if next_q else "NEXT_SCRIPTED: none")
-
-    active_probes = [
-        p for p in probes
-        if (current_turn - (p.generated_after_turn or 0)) <= 8
-    ]
-    if active_probes:
-        dynamic_lines.append("PENDING_PROBES (analyst suggestions, in priority order):")
-        for probe in active_probes:
-            turns_ago = current_turn - (probe.generated_after_turn or 0)
-            line = f'  [id={probe.id}, priority={probe.priority}, turns_ago={turns_ago}] "{probe.question}"'
-            if probe.rationale:
-                line += f"\n    rationale: {probe.rationale}"
-            dynamic_lines.append(line)
-    else:
-        dynamic_lines.append("PENDING_PROBES: none")
-
-    if recent:
-        dynamic_lines.append("RECENT_TURNS:")
-        for m in recent:
-            speaker = "interviewer" if m["role"] == "assistant" else "respondent"
-            dynamic_lines.append(f"  {speaker}: {m.get('content', '')}")
-    dynamic_lines.append("[/CONTEXT]")
-    dynamic_lines.append("")
-    dynamic_lines.append(f"Respondent: {respondent_text}")
-
-    prompt_parts: list[str | CachePoint] = [
-        "\n".join(covered_lines),
-        CachePoint(ttl="1h"),
-        "\n".join(dynamic_lines),
-    ]
-    return prompt_parts
-
-
 interviewer = Agent(
     INTERVIEWER_MODEL,
     deps_type=InterviewerDeps,
@@ -210,18 +309,23 @@ async def run_interviewer(
     deps: InterviewerDeps,
     respondent_text: str,
     vapi_messages: list[dict] | None = None,
+    prepared: PreparedInterviewerTurn | None = None,
 ) -> InterviewerOutput:
     """Pre-fetch context → one LLM call → return output.
 
     vapi_messages: OpenAI-formatted message array from Vapi (body["messages"]).
     When None (evals / play.py), falls back to reading recent_turns from the DB.
     """
-    prompt_parts = _build_prompt_parts(
-        deps.session, deps.call_id, deps.turn_number,
-        respondent_text=respondent_text,
-        vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
-    )
-    result = await interviewer.run(prompt_parts, deps=deps)
+    if prepared is None:
+        assert deps.session is not None
+        prepared = prepare_interviewer_turn(
+            deps.session,
+            deps.call_id,
+            deps.turn_number,
+            respondent_text=respondent_text,
+            vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
+        )
+    result = await interviewer.run(prepared.prompt_parts, deps=deps)
     return result.output
 
 
@@ -241,6 +345,8 @@ def _db_messages_fallback(session, call_id: str) -> list[dict]:
 async def run_interviewer_with_timeout(
     deps: InterviewerDeps,
     respondent_text: str,
+    vapi_messages: list[dict] | None = None,
+    prepared: PreparedInterviewerTurn | None = None,
     *,
     budget_s: float = INTERVIEWER_BUDGET_S,
 ) -> InterviewerOutput:
@@ -253,11 +359,17 @@ async def run_interviewer_with_timeout(
     result: InterviewerOutput | None = None
 
     with anyio.move_on_after(budget_s) as cancel_scope:
-        result = await run_interviewer(deps, respondent_text)
+        result = await run_interviewer(
+            deps,
+            respondent_text,
+            vapi_messages=vapi_messages,
+            prepared=prepared,
+        )
 
     if cancel_scope.cancelled_caught:
         logfire.warning("interviewer_timeout", call_id=deps.call_id, turn_number=deps.turn_number, budget_s=budget_s)
-        return _fallback(deps)
+        fallback_q = prepared.fallback_scripted_question if prepared else None
+        return _fallback(deps, fallback_scripted_question=fallback_q)
 
     assert result is not None
     return result
@@ -267,6 +379,7 @@ async def stream_interviewer_utterance(
     deps: InterviewerDeps,
     respondent_text: str,
     vapi_messages: list[dict] | None = None,
+    prepared: PreparedInterviewerTurn | None = None,
     *,
     budget_s: float = INTERVIEWER_BUDGET_S,
 ) -> AsyncGenerator[str | InterviewerOutput, None]:
@@ -275,17 +388,21 @@ async def stream_interviewer_utterance(
 
     On timeout yields the fallback utterance string then the fallback output object.
     """
-    prompt_parts = _build_prompt_parts(
-        deps.session, deps.call_id, deps.turn_number,
-        respondent_text=respondent_text,
-        vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
-    )
+    if prepared is None:
+        assert deps.session is not None
+        prepared = prepare_interviewer_turn(
+            deps.session,
+            deps.call_id,
+            deps.turn_number,
+            respondent_text=respondent_text,
+            vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
+        )
 
     final_output: InterviewerOutput | None = None
 
     with anyio.move_on_after(budget_s) as cancel_scope:
         prev = ""
-        async with interviewer.run_stream(prompt_parts, deps=deps) as streamed:
+        async with interviewer.run_stream(prepared.prompt_parts, deps=deps) as streamed:
             async for partial in streamed.stream_output(debounce_by=None):
                 current = partial.utterance or ""
                 if len(current) > len(prev):
@@ -300,7 +417,7 @@ async def stream_interviewer_utterance(
             turn_number=deps.turn_number,
             budget_s=budget_s,
         )
-        fb = _fallback(deps)
+        fb = _fallback(deps, fallback_scripted_question=prepared.fallback_scripted_question)
         yield fb.utterance
         yield fb
         return
@@ -308,10 +425,15 @@ async def stream_interviewer_utterance(
     yield final_output
 
 
-def _fallback(deps: InterviewerDeps) -> InterviewerOutput:
-    q = state.next_scripted(deps.session, deps.call_id)
+def _fallback(
+    deps: InterviewerDeps,
+    *,
+    fallback_scripted_question: str | None = None,
+) -> InterviewerOutput:
+    q = fallback_scripted_question
+    if q is None and deps.session is not None:
+        q = state.next_scripted(deps.session, deps.call_id)
     if q is not None:
-        state.mark_scripted_asked(deps.session, deps.call_id)
         return InterviewerOutput(
             utterance=q,
             action="scripted",

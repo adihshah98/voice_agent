@@ -41,15 +41,18 @@ async def test_stream_interviewer_utterance_uses_get_output(monkeypatch: pytest.
         def run_stream(self, prompt_parts, deps=None):
             return FakeRunStreamCtx()
 
-    monkeypatch.setattr(interviewer_module, "_build_prompt_parts", lambda *args, **kwargs: ["prompt"])
     monkeypatch.setattr(interviewer_module, "interviewer", FakeAgent())
 
     deps = SimpleNamespace(session=None, call_id="call-1", turn_number=1)
+    prepared = interviewer_module.PreparedInterviewerTurn(
+        prompt_parts=["prompt"],
+        fallback_scripted_question=None,
+    )
     out = []
     async for item in interviewer_module.stream_interviewer_utterance(
         deps,
         "respondent text",
-        vapi_messages=[{"role": "user", "content": "respondent text"}],
+        prepared=prepared,
     ):
         out.append(item)
 

@@ -24,10 +24,14 @@ Action = Literal[
 @dataclass
 class InterviewerDeps:
     """Deps for the interviewer agent. Dataclass (not BaseModel) so we can
-    carry a live SQLModel Session through RunContext."""
+    carry call metadata through RunContext.
+
+    session is optional because turn.py preloads DB context in a short-lived
+    session before awaiting the LLM call.
+    """
 
     call_id: str
-    session: Session
+    session: Session | None
     turn_number: int
 
 
@@ -71,18 +75,18 @@ class AnalysisUpdate(BaseModel):
         ),
     )
     new_probes: list[NewProbe] = Field(default_factory=list)
-
-
-class SubtopicCompression(BaseModel):
     covered_subtopics: list[str] = Field(
+        default_factory=list,
         description=(
-            "Short noun-phrase labels (3-6 words) for every specific subtopic already "
-            "addressed — explicit or organic. Name specific entities, not categories: "
+            "Short noun-phrase labels (3-6 words) for every specific subtopic addressed "
+            "in this conversation — explicit or organic. Include all prior subtopics from "
+            "ESTABLISHED CONTEXT plus any new ones from the NEW TRANSCRIPT. "
+            "Name specific entities, not categories: "
             "'Notion vs Google Docs product features' not 'competitor product comparison'; "
             "'Notion vs Google Docs pricing' is a separate entry from product features. "
             "Other examples: 'IT security SOC2 concerns', 'VP of Sales budget ownership', "
             "'day-to-day AE usage workflow'. Never collapse distinct things into one label."
-        )
+        ),
     )
 
 

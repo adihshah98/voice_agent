@@ -10,12 +10,19 @@ import pytest
 from voice_agent import server
 
 
+def _call_body(vapi_call_id: str, call_id: str, content: str, stream: bool = True) -> dict:
+    return {
+        "stream": stream,
+        "call": {
+            "id": vapi_call_id,
+            "assistant": {"metadata": {"call_id": call_id}},
+        },
+        "messages": [{"role": "user", "content": content}],
+    }
+
+
 @pytest.mark.asyncio
 async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_resolve_vapi_call_id(vapi_call_id: str, retries: int = 5) -> str | None:
-        assert vapi_call_id == "vapi-call-1"
-        return "call-123"
-
     async def fake_run_speech_turn_stream(
         engine,
         call_id: str,
@@ -28,18 +35,13 @@ async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.Monkey
         yield "hello"
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(server, "_resolve_vapi_call_id", fake_resolve_vapi_call_id)
     monkeypatch.setattr(server, "run_speech_turn_stream", fake_run_speech_turn_stream)
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/vapi/llm/chat/completions",
-            json={
-                "stream": True,
-                "call": {"id": "vapi-call-1"},
-                "messages": [{"role": "user", "content": "hello there"}],
-            },
+            json=_call_body("vapi-call-1", "call-123", "hello there"),
         )
 
     assert response.status_code == 200
@@ -50,10 +52,6 @@ async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_resolve_vapi_call_id(vapi_call_id: str, retries: int = 5) -> str | None:
-        assert vapi_call_id == "vapi-call-2"
-        return "call-456"
-
     async def fake_run_speech_turn_stream(
         engine,
         call_id: str,
@@ -67,18 +65,13 @@ async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyP
         yield "reply"
         yield {"action": "probe", "reasoning": "ok", "latency_ms": 123}
 
-    monkeypatch.setattr(server, "_resolve_vapi_call_id", fake_resolve_vapi_call_id)
     monkeypatch.setattr(server, "run_speech_turn_stream", fake_run_speech_turn_stream)
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/vapi/llm/chat/completions",
-            json={
-                "stream": True,
-                "call": {"id": "vapi-call-2"},
-                "messages": [{"role": "user", "content": "hi again"}],
-            },
+            json=_call_body("vapi-call-2", "call-456", "hi again"),
         )
 
     assert response.status_code == 200
@@ -87,4 +80,3 @@ async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyP
     assert '"content": "reply"' in response.text
     assert '"finish_reason": "stop"' in response.text
     assert "data: [DONE]" in response.text
-

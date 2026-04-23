@@ -14,7 +14,6 @@ import logfire
 from opentelemetry import trace
 from dotenv import load_dotenv
 from pydantic_ai import Agent
-from pydantic_ai.messages import CachePoint
 from pydantic_ai.models.anthropic import AnthropicModelSettings
 from sqlmodel import select
 
@@ -22,7 +21,7 @@ load_dotenv()
 
 from voice_agent import state
 from voice_agent.config import ANALYST_MODEL
-from voice_agent.models import AnalysisUpdate, AnalystDeps, SubtopicCompression
+from voice_agent.models import AnalysisUpdate, AnalystDeps
 
 
 ANALYST_PROMPT = """\
@@ -73,6 +72,15 @@ Your job:
    - Maximum 3 new probes per pass.
    - Never repeat a question already in EXISTING_PROBES.
 
+6. COVERED_SUBTOPICS — the complete running list of every specific subtopic addressed in
+   this conversation so far (explicit or organic). Start from EXISTING_COVERED_SUBTOPICS
+   in ESTABLISHED CONTEXT (carry all of them forward unchanged) and add any new ones from
+   the NEW TRANSCRIPT. Use short noun-phrase labels (3-6 words). Name specific entities,
+   not categories: 'Notion vs Google Docs product features' not 'competitor product comparison';
+   'Notion vs Google Docs pricing' is a separate entry. Examples: 'IT security SOC2 concerns',
+   'VP of Sales budget ownership', 'day-to-day AE usage workflow'.
+   Never collapse distinct things into one label.
+
 Be concise — bullet-point style for all lists except investor_signals (one tagged line each).
 """
 
@@ -99,6 +107,12 @@ def _build_prompt(session, call_id: str) -> tuple[str, int]:
         ]
         for sig in snapshot.investor_signals:
             lines.append(f"    {sig}")
+        lines.append("  Existing covered subtopics:")
+        if snapshot.covered_subtopics:
+            for topic in snapshot.covered_subtopics:
+                lines.append(f"    - {topic}")
+        else:
+            lines.append("    none")
         lines.append(f"  (covers turns 1–{snapshot.after_turn})")
         lines.append("")
         lines.append(f"NEW TRANSCRIPT (turns {snapshot.after_turn + 1}–{last_turn}):")
@@ -136,100 +150,14 @@ analyst = Agent(
     ),
 )
 
-SUBTOPIC_COMPRESSION_PROMPT = """\
-You are reviewing only NEW transcript turns from a customer interview.
-Produce only NEW short noun-phrase labels (3-6 words each) for specific subtopics
-addressed in this NEW transcript — whether asked explicitly or answered organically.
-
-If EXISTING_COVERED_SUBTOPICS are provided, treat them as already known memory:
-- Do not repeat them.
-- Output only net-new subtopics found in the NEW transcript.
-- If no new subtopics were introduced, return an empty list.
-
-Granularity rules:
-- Name specific entities, not categories. Use 'Notion vs Google Docs product features'
-  not 'competitor product comparison' — the latter would wrongly block 'Notion vs Quip'.
-- Split by dimension: 'Notion vs Google Docs product features' and
-  'Notion vs Google Docs pricing' are separate entries if both were discussed.
-- Other examples: 'IT security SOC2 concerns', 'VP of Sales budget ownership',
-  'day-to-day AE usage workflow'. Never collapse distinct things into one label.
-
-The goal: the interviewer can read this list and know exactly what has been covered,
-so that adjacent subtopics (different competitor, different dimension) remain askable.
-"""
-
-_compression_agent = Agent(
-    ANALYST_MODEL,
-    output_type=SubtopicCompression,
-    system_prompt=SUBTOPIC_COMPRESSION_PROMPT,
-    instrument=True,
-    model_settings=AnthropicModelSettings(
-        anthropic_cache_instructions='1h',
-    ),
-)
-
-SUBTOPIC_COMPRESSION_INTERVAL = 25
-
-
-async def _maybe_compress_subtopics(
-    session, call_id: str, after_turn: int, prior_snapshot: state.AnalystSnapshot | None
-) -> tuple[list[str], int]:
-    """Run subtopic compression if >= 25 turns have passed since last compression.
-
-    Returns (covered_subtopics, last_compression_turn) to store on the new snapshot.
-    Carries forward prior values unchanged if the interval hasn't elapsed.
-    """
-    prior_subtopics = prior_snapshot.covered_subtopics if prior_snapshot else []
-    last_compression = prior_snapshot.last_compression_turn if prior_snapshot else 0
-
-    if after_turn - last_compression < SUBTOPIC_COMPRESSION_INTERVAL:
-        return prior_subtopics, last_compression
-
-    delta_turns = state.turns_since(session, call_id, after_turn=last_compression)
-    if not delta_turns:
-        return prior_subtopics, last_compression
-
-    existing_lines = []
-    if prior_subtopics:
-        existing_lines.append("EXISTING_COVERED_SUBTOPICS (already confirmed memory):")
-        for topic in prior_subtopics:
-            existing_lines.append(f"  - {topic}")
-    else:
-        existing_lines.append("EXISTING_COVERED_SUBTOPICS: none")
-
-    new_lines = [f"NEW TRANSCRIPT (turns {last_compression + 1}–{after_turn}):"]
-    for t in delta_turns:
-        new_lines.append(f"  {t.speaker.upper()} [{t.turn_number}]: {t.text}")
-
-    prompt_parts: list[str | CachePoint] = [
-        "\n".join(existing_lines),
-        CachePoint(ttl="1h"),
-        "\n".join(new_lines),
-    ]
-
-    result = await _compression_agent.run(prompt_parts)
-    merged = list(prior_subtopics)
-    seen = set(prior_subtopics)
-    for topic in result.output.covered_subtopics:
-        if topic not in seen:
-            merged.append(topic)
-            seen.add(topic)
-
-    return merged, after_turn
-
 
 async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
     """Read transcript → one LLM call → persist AnalystSnapshot + Probes."""
     t0 = time.perf_counter()
 
-    prior_snapshot = state.latest_snapshot(deps.session, deps.call_id)
     prompt, after_turn = _build_prompt(deps.session, deps.call_id)
     result = await analyst.run(prompt, deps=deps)
     update: AnalysisUpdate = result.output
-
-    covered_subtopics, last_compression_turn = await _maybe_compress_subtopics(
-        deps.session, deps.call_id, after_turn, prior_snapshot
-    )
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -245,8 +173,7 @@ async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
             contradictions=update.contradictions,
             surprises=update.surprises,
             investor_signals=update.investor_signals,
-            covered_subtopics=covered_subtopics,
-            last_compression_turn=last_compression_turn,
+            covered_subtopics=update.covered_subtopics,
             latency_ms=latency_ms,
         )
     )
@@ -260,8 +187,6 @@ async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
                 generated_after_turn=after_turn,
             )
         )
-    deps.session.commit()
-
     span = trace.get_current_span()
     span.set_attribute("after_turn", after_turn)
     span.set_attribute("latency_ms", latency_ms)

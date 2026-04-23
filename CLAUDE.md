@@ -30,14 +30,14 @@ Pytest config in `pyproject.toml` sets `asyncio_mode = "auto"` and `testpaths = 
 
 ## Architecture
 
-Multi-agent voice research interviewer built on Vapi. **PLAN.md** is the authoritative design doc; read it when making non-trivial changes. Read-over-skim if you touch `interviewer.py`, `analyst.py`, or the webhook flow.
+Multi-agent voice research interviewer built on Vapi. **[docs/architecture.md](docs/architecture.md)** is the authoritative design doc; read it when making non-trivial changes. Read-over-skim if you touch `interviewer.py`, `analyst.py`, or the webhook flow. (`docs/PLAN.md` is the original design doc but has stale model names and some implementation details that differ from the actual code — treat `architecture.md` as ground truth.)
 
 ### The three agents and their latency contract
 
 Three PydanticAI agents, each with a different latency budget — this is the core design constraint:
 
-1. **Interviewer** ([voice_agent/agents/interviewer.py](voice_agent/agents/interviewer.py)) — Haiku 4.5, one LLM call per turn, hard 5 s deadline via `asyncio.wait_for`. **Not** a ReAct tool loop: all DB state is pre-fetched into a CONTEXT block (`_build_context`) and the model returns a single structured `InterviewerOutput`. Python then applies side effects (marking probe/scripted as asked) based on the output. If the deadline fires, `_fallback()` returns the next scripted question.
-2. **Analyst** ([voice_agent/agents/analyst.py](voice_agent/agents/analyst.py)) — Sonnet 4.6, fire-and-forget via `asyncio.create_task`. Runs **only after a `scripted` turn** (see [voice_agent/turn.py:67](voice_agent/turn.py#L67)) — not after every turn. Reads prior `AnalystSnapshot` as established context + only the new turns since, so prompt size stays bounded on long calls. Wrapped in `run_analyst_safely` — exceptions are swallowed so a crashing analyst never affects the live call.
+1. **Interviewer** ([voice_agent/agents/interviewer.py](voice_agent/agents/interviewer.py)) — Haiku 4.5, one LLM call per turn, hard 5 s deadline via `anyio.move_on_after`. **Not** a ReAct tool loop: all DB state is pre-fetched into a CONTEXT block and the model returns a single structured `InterviewerOutput`. Python then applies side effects (marking probe/scripted as asked) based on the output. If the deadline fires, `_fallback()` returns the next scripted question.
+2. **Analyst** ([voice_agent/agents/analyst.py](voice_agent/agents/analyst.py)) — Sonnet 4.6, fire-and-forget via `asyncio.create_task`. Triggered from the `conversation-update` webhook when `should_run_analyst()` returns True: either the scripted cursor advanced, or ≥25 turns elapsed since the last snapshot. Reads prior `AnalystSnapshot` as established context + only the new turns since, so prompt size stays bounded on long calls. Wrapped in `run_analyst_safely` — exceptions are swallowed so a crashing analyst never affects the live call.
 3. **Synthesis** ([voice_agent/agents/synthesis.py](voice_agent/agents/synthesis.py)) — Sonnet 4.6, post-call. Gated by `ENABLE_SYNTHESIS_REPORT` in [voice_agent/config.py](voice_agent/config.py) (currently **False** — keep that in mind when testing the end-of-call path).
 
 **Invariant: agents never call each other.** All coordination flows through SQLite tables in [voice_agent/state.py](voice_agent/state.py). Model IDs, timeouts, and the synthesis flag all live in [voice_agent/config.py](voice_agent/config.py) — swap a model there, nothing else changes.
@@ -46,14 +46,20 @@ Three PydanticAI agents, each with a different latency budget — this is the co
 
 The single entry point for a speech turn is `run_speech_turn` in [voice_agent/turn.py](voice_agent/turn.py). Both the Vapi custom-LLM webhook (`/vapi/llm/chat/completions` in [voice_agent/server.py](voice_agent/server.py)) and the local REPL (`scripts/play.py`) call it — so in-process REPL and production call share one code path. The custom-LLM endpoint returns OpenAI-shaped responses (with optional SSE streaming) because Vapi expects an OpenAI-compatible shape.
 
+**Turn rows are not written in `run_speech_turn`.** They are written by `_write_confirmed_turns()` in `server.py`, triggered by `conversation-update` webhook events — only after Vapi confirms the turn was actually spoken. This eliminates ghost turns from rapid-fire utterance boundaries.
+
 ### Vapi lifecycle
 
 Two endpoints, different roles:
 
 - `/vapi/llm/chat/completions` — per-turn inference (replaces OpenAI from Vapi's perspective).
-- `/vapi/webhook` — lifecycle events only: `status-update` (flips `Call.status` pending→active) and `end-of-call-report` (flips to ended, schedules synthesis).
+- `/vapi/webhook` — four event types:
+  - `status-update` — flips `Call.status` pending→active.
+  - `conversation-update` — writes confirmed turns to DB; triggers analyst if `should_run_analyst()`.
+  - `end-of-call-report` — flips status to ended; schedules synthesis if enabled.
+  - `speech-update` — logged only, no state change.
 
-Outbound dialing (`_dial_vapi`) writes the Vapi-assigned `vapi_call_id` back onto the `Call` row after the POST returns. See PLAN.md §"Correctness Edges" for the race condition this creates — first Vapi event is usually `ringing`, which is long enough to cover the write, but it's fragile.
+Outbound dialing (`_dial_vapi`) writes the Vapi-assigned `vapi_call_id` back onto the `Call` row after the POST returns. Known fragile: Vapi can fire `status-update: ringing` before that write commits. Works in practice (ringing fires ~hundreds of ms later) but is not atomic. See `docs/TODO.md`.
 
 ### Database (SQLModel/SQLite)
 
@@ -61,7 +67,7 @@ Single file `voice_agent.db`; schema is Postgres-compatible. Key reads used by t
 
 ### Tracing
 
-`init_tracing()` in [voice_agent/tracing.py](voice_agent/tracing.py) is idempotent and called from every entrypoint (server lifespan, play.py, evals). When `LOGFIRE_TOKEN` is unset it falls back to console-only output — evals explicitly pass `send_to_logfire=False`. Every meaningful span carries `call_id` + `turn_number` via `turn_span` / `agent_span` so Logfire can slice by call or turn. `log_interviewer_decision` emits the `interviewer_decision` event with action/utterance/reasoning/latency — this is the primary observability hook.
+`init_tracing()` in [voice_agent/tracing.py](voice_agent/tracing.py) is idempotent and called from every entrypoint (server lifespan, play.py, evals). When `LOGFIRE_TOKEN` is unset it falls back to console-only output — evals explicitly pass `send_to_logfire=False`. Every meaningful span carries `call_id` + `turn_number` via `agent_span` so Logfire can slice by call or turn.
 
 ### Evals
 
@@ -69,7 +75,7 @@ Three tiers under `evals/`, all using `pydantic_evals`:
 
 - **Tier 1** ([evals/test_interviewer.py](evals/test_interviewer.py)) — single-turn decision eval, seeds in-memory SQLite per case from `interviewer_turns.yaml`. Thresholds: ActionMatches ≥90%, SingleQuestion 100%, warmth ≥4/5, non-leading ≥90%.
 - **Tier 2** ([evals/test_analyst.py](evals/test_analyst.py)) — analyst probe quality against canned transcripts in `analyst_probes.yaml`.
-- **Tier 3** ([evals/test_trajectories.py](evals/test_trajectories.py)) — full conversation driven by `evals/simulator.py` respondent personas (`personas.yaml`) against the real interviewer + analyst.
+- **Tier 3** ([evals/test_trajectories.py](evals/test_trajectories.py)) — full conversation driven by `evals/simulator.py` respondent personas (`personas.yaml`) against the real interviewer + analyst. Marked `@pytest.mark.slow`; bypasses `ENABLE_SYNTHESIS_REPORT` gate.
 
 `evals/cases.py` loads YAML into typed `Case` inputs; `evals/evaluators.py` holds custom scorers and `LLMJudge` configs. In-memory SQLite needs `poolclass=StaticPool` — without it each session gets a fresh empty DB.
 

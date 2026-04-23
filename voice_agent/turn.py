@@ -9,7 +9,11 @@ from typing import Any
 import logfire
 
 from voice_agent import state
-from voice_agent.agents.interviewer import run_interviewer_with_timeout, stream_interviewer_utterance
+from voice_agent.agents.interviewer import (
+    prepare_interviewer_turn_concurrent,
+    run_interviewer_with_timeout,
+    stream_interviewer_utterance,
+)
 from voice_agent.models import InterviewerDeps, InterviewerOutput
 from voice_agent.tracing import agent_span
 
@@ -43,30 +47,37 @@ async def run_speech_turn(
         turn_number = state.next_turn_number(session, call_id)
     logfire.info("turn_started", call_id=call_id, turn_number=turn_number)
 
-    # --- Phase 1b: read-only session — fetch study state + run LLM ---
-    with state.session_scope(engine) as session:
-        deps = InterviewerDeps(
-            call_id=call_id,
-            session=session,
-            turn_number=turn_number,
-        )
+    # --- Phase 1b: read-only prep — parallel context reads in short sessions ---
+    prepared = await prepare_interviewer_turn_concurrent(
+        engine,
+        call_id,
+        turn_number,
+        respondent_text=respondent_text,
+        vapi_messages=vapi_messages,
+    )
 
-        with agent_span(
-            "interviewer",
-            call_id,
-            turn_number=turn_number,
-            respondent_text=respondent_text or None,
-        ) as span:
-            t0 = time.perf_counter()
-            reply = await run_interviewer_with_timeout(deps, respondent_text, vapi_messages=vapi_messages)
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            is_fallback = reply.reasoning.startswith("fallback:")
-            span.set_attribute("action", reply.action)
-            span.set_attribute("utterance", reply.utterance)
-            span.set_attribute("reasoning", reply.reasoning)
-            span.set_attribute("latency_ms", latency_ms)
-            span.set_attribute("fallback", is_fallback)
-            span.set_attribute("probe_source", "analyst" if reply.probe_id_used else "interviewer" if reply.action == "probe" else None)
+    # --- Phase 1c: run LLM with no open DB session ---
+    deps = InterviewerDeps(
+        call_id=call_id,
+        session=None,
+        turn_number=turn_number,
+    )
+    with agent_span(
+        "interviewer",
+        call_id,
+        turn_number=turn_number,
+        respondent_text=respondent_text or None,
+    ) as span:
+        t0 = time.perf_counter()
+        reply = await run_interviewer_with_timeout(deps, respondent_text, prepared=prepared)
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        is_fallback = reply.reasoning.startswith("fallback:")
+        span.set_attribute("action", reply.action)
+        span.set_attribute("utterance", reply.utterance)
+        span.set_attribute("reasoning", reply.reasoning)
+        span.set_attribute("latency_ms", latency_ms)
+        span.set_attribute("fallback", is_fallback)
+        span.set_attribute("probe_source", "analyst" if reply.probe_id_used else "interviewer" if reply.action == "probe" else None)
 
     # --- Phase 2: apply study side-effects only (no Turn writes) ---
     with logfire.span(
@@ -120,9 +131,20 @@ async def run_speech_turn_stream(
     t0 = time.perf_counter()
     first_token_ms: int | None = None
 
-    with state.session_scope(engine) as session:
-        deps = InterviewerDeps(call_id=call_id, session=session, turn_number=turn_number)
-        gen = stream_interviewer_utterance(deps, respondent_text, vapi_messages=vapi_messages)
+    prepared = await prepare_interviewer_turn_concurrent(
+        engine,
+        call_id,
+        turn_number,
+        respondent_text=respondent_text,
+        vapi_messages=vapi_messages,
+    )
+
+    deps = InterviewerDeps(call_id=call_id, session=None, turn_number=turn_number)
+    gen = stream_interviewer_utterance(
+        deps,
+        respondent_text,
+        prepared=prepared,
+    )
 
     reply: InterviewerOutput | None = None
     async for item in gen:

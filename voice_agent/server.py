@@ -82,33 +82,14 @@ async def _synthesis_task(call_id: str) -> None:
 async def _analyst_task(call_id: str) -> None:
     from voice_agent.agents.analyst import run_analyst_safely
     from voice_agent.models import AnalystDeps
-    session = Session(engine)
     try:
         with agent_span("analyst", call_id):
-            deps = AnalystDeps(call_id=call_id, session=session)
-            await run_analyst_safely(deps)
+            with state.session_scope(engine) as session:
+                deps = AnalystDeps(call_id=call_id, session=session)
+                await run_analyst_safely(deps)
     except Exception:
         logfire.exception("analyst_task_error", call_id=call_id)
-    finally:
-        session.close()
 
-
-async def _resolve_vapi_call_id(vapi_call_id: str, retries: int = 5) -> str | None:
-    """Resolve vapi_call_id → internal call_id with exponential backoff.
-
-    Vapi can fire the first webhook event before _dial_vapi has committed
-    vapi_call_id to the DB. Retrying covers that window without any extra infra.
-    Waits: 100ms, 200ms, 400ms, 800ms, 1600ms → 3.1s worst case.
-    """
-    for i in range(retries):
-        with state.session_scope(engine) as session:
-            call = session.exec(
-                select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
-            ).first()
-            if call:
-                return call.id
-        await asyncio.sleep(0.1 * (2 ** i))
-    return None
 
 
 def _write_confirmed_turns(call_id: str, messages: list[dict]) -> int:
@@ -153,39 +134,39 @@ def _write_confirmed_turns(call_id: str, messages: list[dict]) -> int:
 # --- Webhook ----------------------------------------------------------------
 
 
+def _call_id_from_event(msg: dict) -> str | None:
+    """Extract our internal call_id from Vapi's metadata field."""
+    return msg.get("call", {}).get("assistant", {}).get("metadata", {}).get("call_id")
+
+
 @app.post("/vapi/webhook")
 async def vapi_webhook(request: Request) -> dict[str, Any]:
     body = await request.json()
     msg = body.get("message", {})
     event_type = msg.get("type")
     vapi_call_id = msg.get("call", {}).get("id")
+    call_id = _call_id_from_event(msg)
 
-    with logfire.span("vapi_event", type=event_type, vapi_call_id=vapi_call_id) as event_span:
+    with logfire.span("vapi_event", type=event_type, call_id=call_id, vapi_call_id=vapi_call_id) as event_span:
 
         if event_type == "status-update":
             status = msg.get("status")
             event_span.set_attribute("status", status)
-            if status == "in-progress" and vapi_call_id:
+            if status == "in-progress" and call_id:
                 with state.session_scope(engine) as session:
-                    call = session.exec(
-                        select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
-                    ).first()
+                    call = session.get(state.Call, call_id)
                     if call and call.status == "pending":
                         call.status = "active"
                         session.add(call)
-                        event_span.set_attribute("call_id", call.id)
-                        logfire.info("call_activated", call_id=call.id, vapi_call_id=vapi_call_id)
+                        logfire.info("call_activated", call_id=call_id, vapi_call_id=vapi_call_id)
             return {}
 
         if event_type == "end-of-call-report":
-            if not vapi_call_id:
-                logfire.warning("end_of_call_missing_vapi_id")
+            if not call_id:
+                logfire.warning("end_of_call_missing_call_id", vapi_call_id=vapi_call_id)
                 return {}
-            call_id: str | None = None
             with state.session_scope(engine) as session:
-                call = session.exec(
-                    select(state.Call).where(state.Call.vapi_call_id == vapi_call_id)
-                ).first()
+                call = session.get(state.Call, call_id)
                 if call:
                     # Guard is a no-op if /calls/{id}/end already fired — both paths are valid.
                     if call.status == "ended":
@@ -194,39 +175,35 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
                     call.end_reason = msg.get("endedReason")
                     call.ended_at = datetime.now(timezone.utc)
                     session.add(call)
-                    call_id = call.id
-                    event_span.set_attribute("call_id", call_id)
                     event_span.set_attribute("ended_reason", msg.get("endedReason"))
                 else:
-                    logfire.warning("end_of_call_unknown_vapi_id", vapi_call_id=vapi_call_id)
-            if call_id:
-                with state.session_scope(engine) as session:
-                    probes_asked, probes_total = state.probe_utilization(session, call_id)
-                logfire.info(
-                    "call_ended",
-                    call_id=call_id,
-                    ended_reason=msg.get("endedReason"),
-                    probes_asked=probes_asked,
-                    probes_total=probes_total,
-                    probe_utilization_pct=round(100 * probes_asked / probes_total) if probes_total else None,
-                )
-                if ENABLE_SYNTHESIS_REPORT:
-                    asyncio.create_task(_synthesis_task(call_id))
-                else:
-                    logfire.info("synthesis_skipped", call_id=call_id, reason="ENABLE_SYNTHESIS_REPORT=false")
+                    logfire.warning("end_of_call_unknown_call_id", call_id=call_id)
+                    return {}
+            with state.session_scope(engine) as session:
+                probes_asked, probes_total = state.probe_utilization(session, call_id)
+            logfire.info(
+                "call_ended",
+                call_id=call_id,
+                ended_reason=msg.get("endedReason"),
+                probes_asked=probes_asked,
+                probes_total=probes_total,
+                probe_utilization_pct=round(100 * probes_asked / probes_total) if probes_total else None,
+            )
+            if ENABLE_SYNTHESIS_REPORT:
+                asyncio.create_task(_synthesis_task(call_id))
+            else:
+                logfire.info("synthesis_skipped", call_id=call_id, reason="ENABLE_SYNTHESIS_REPORT=false")
             return {}
 
         if event_type == "speech-update":
-            status = msg.get("status")
-            role = msg.get("role")
-            turn = msg.get("turn")
             logfire.info(
                 "vapi_speech_update",
+                call_id=call_id,
                 vapi_call_id=vapi_call_id,
-                status=status,
-                role=role,
-                turn=turn,
-                tts_started=(role == "assistant" and status == "started"),
+                status=msg.get("status"),
+                role=msg.get("role"),
+                turn=msg.get("turn"),
+                tts_started=(msg.get("role") == "assistant" and msg.get("status") == "started"),
             )
             return {}
 
@@ -239,21 +216,18 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
             )
             logfire.info(
                 "vapi_conversation_update",
+                call_id=call_id,
                 vapi_call_id=vapi_call_id,
                 message_count=len(messages),
                 last_user_utterance=last_user,
                 last_role=last_role,
             )
-            # Write confirmed turns and trigger analyst after a complete exchange
-            # (last_role == "bot" means Vapi just finished speaking a response).
-            if vapi_call_id and last_role == "bot":
-                call_id_inner = await _resolve_vapi_call_id(vapi_call_id)
-                if call_id_inner:
-                    _write_confirmed_turns(call_id_inner, messages)
-                    with state.session_scope(engine) as _s:
-                        should_run = state.scripted_cursor_advanced(_s, call_id_inner)
-                    if should_run:
-                        asyncio.create_task(_analyst_task(call_id_inner))
+            if call_id and last_role == "bot":
+                _write_confirmed_turns(call_id, messages)
+                with state.session_scope(engine) as _s:
+                    should_run = state.should_run_analyst(_s, call_id)
+                if should_run:
+                    asyncio.create_task(_analyst_task(call_id))
             return {}
 
         logfire.debug("vapi_event_ignored", type=event_type, payload=msg)
@@ -330,6 +304,13 @@ async def get_report(call_id: str) -> JSONResponse:
             "contradictions": report.contradictions,
             "key_quotes": report.key_quotes,
             "follow_up_questions": report.follow_up_questions,
+            "pmf_score": report.pmf_score,
+            "pmf_score_rationale": report.pmf_score_rationale,
+            "competitive_signals": report.competitive_signals,
+            "revenue_signals": report.revenue_signals,
+            "ai_adoption_signals": report.ai_adoption_signals,
+            "red_flags": report.red_flags,
+            "investment_thesis_bullets": report.investment_thesis_bullets,
         })
 
 
@@ -362,6 +343,7 @@ async def vapi_llm(request: Request):
 
     body = await request.json()
     vapi_call_id = body.get("call", {}).get("id")
+    call_id: str | None = body.get("call", {}).get("assistant", {}).get("metadata", {}).get("call_id")
     messages = body.get("messages", [])
     stream = bool(body.get("stream", False))
 
@@ -373,7 +355,6 @@ async def vapi_llm(request: Request):
         else ""
     )
 
-    call_id = await _resolve_vapi_call_id(vapi_call_id)
     if call_id is None:
         logfire.warning(
             "vapi_llm_unknown_call",
@@ -571,6 +552,7 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
             "transcriber": {"provider": "deepgram", "model": "nova-2", "language": "en"},
             "firstMessage": "Hey! Thank you for getting on the call — just want to check if you can hear me before we get started.",
             "firstMessageMode": "assistant-speaks-first",
+            "metadata": {"call_id": call_id},
         },
     }
 
@@ -586,9 +568,6 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
         raise HTTPException(status_code=502, detail=f"Vapi error {resp.status_code}: {resp.text}")
 
     vapi_call_id = resp.json().get("id")
-
-    # Write vapi_call_id immediately so the first Vapi webhook event (which can
-    # arrive within milliseconds of this POST returning) can resolve the call.
     with state.session_scope(engine) as session:
         call = session.get(state.Call, call_id)
         if call and vapi_call_id:

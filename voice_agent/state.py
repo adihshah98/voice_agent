@@ -116,10 +116,7 @@ class AnalystSnapshot(SQLModel, table=True):
     contradictions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     surprises: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     investor_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    # Short topic phrases covering ground already covered in the conversation,
-    # including organically-answered topics. Compressed every 25 turns by the analyst.
     covered_subtopics: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    last_compression_turn: int = Field(default=0)
     latency_ms: Optional[int] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
@@ -150,19 +147,6 @@ class SynthesisReport(SQLModel, table=True):
     call: Call = Relationship(
         sa_relationship=relationship("Call", back_populates="synthesis_report")
     )
-
-
-class EvalRun(SQLModel, table=True):
-    __tablename__ = "eval_runs"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    commit_sha: Optional[str] = None
-    dataset: str
-    case_name: str
-    scorer: str
-    score: float
-    logfire_trace_id: Optional[str] = None
-    created_at: datetime = Field(default_factory=_utcnow)
 
 
 # --- DB helpers -------------------------------------------------------------
@@ -275,13 +259,18 @@ def latest_snapshot(session: Session, call_id: str) -> Optional["AnalystSnapshot
     return session.exec(stmt).first()
 
 
-def scripted_cursor_advanced(session: Session, call_id: str) -> bool:
-    """True when the scripted cursor has moved past the last analyst snapshot."""
+ANALYST_TURN_INTERVAL = 25
+
+
+def should_run_analyst(session: Session, call_id: str) -> bool:
+    """True when a scripted question was just answered OR >= 25 turns have passed since last run."""
     call = session.get(Call, call_id)
     if call is None:
         return False
     snapshot = latest_snapshot(session, call_id)
-    return call.scripted_cursor > (snapshot.after_scripted_cursor if snapshot else 0)
+    scripted_advanced = call.scripted_cursor > (snapshot.after_scripted_cursor if snapshot else 0)
+    turns_elapsed = call.turn_count - (snapshot.after_turn if snapshot else 0) >= ANALYST_TURN_INTERVAL
+    return scripted_advanced or turns_elapsed
 
 
 def turns_since(session: Session, call_id: str, after_turn: int) -> list[Turn]:
