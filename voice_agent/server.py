@@ -188,7 +188,16 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
                 else:
                     logfire.warning("end_of_call_unknown_vapi_id", vapi_call_id=vapi_call_id)
             if call_id:
-                logfire.info("call_ended", call_id=call_id, ended_reason=msg.get("endedReason"))
+                with state.session_scope(engine) as session:
+                    probes_asked, probes_total = state.probe_utilization(session, call_id)
+                logfire.info(
+                    "call_ended",
+                    call_id=call_id,
+                    ended_reason=msg.get("endedReason"),
+                    probes_asked=probes_asked,
+                    probes_total=probes_total,
+                    probe_utilization_pct=round(100 * probes_asked / probes_total) if probes_total else None,
+                )
                 if ENABLE_SYNTHESIS_REPORT:
                     asyncio.create_task(_synthesis_task(call_id))
                 else:
@@ -205,7 +214,6 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
                 status=status,
                 role=role,
                 turn=turn,
-                # assistant+started = Vapi is playing this turn's LLM response
                 tts_started=(role == "assistant" and status == "started"),
             )
             return {}
@@ -230,7 +238,10 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
                 call_id_inner = _vapi_call_id_to_call_id(vapi_call_id)
                 if call_id_inner:
                     _write_confirmed_turns(call_id_inner, messages)
-                    asyncio.create_task(_analyst_task(call_id_inner))
+                    with state.session_scope(engine) as _s:
+                        should_run = state.scripted_cursor_advanced(_s, call_id_inner)
+                    if should_run:
+                        asyncio.create_task(_analyst_task(call_id_inner))
             return {}
 
         logfire.debug("vapi_event_ignored", type=event_type, payload=msg)

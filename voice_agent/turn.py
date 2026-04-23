@@ -59,10 +59,13 @@ async def run_speech_turn(
             t0 = time.perf_counter()
             reply = await run_interviewer_with_timeout(deps, respondent_text, vapi_messages=vapi_messages)
             latency_ms = int((time.perf_counter() - t0) * 1000)
+            is_fallback = reply.reasoning.startswith("fallback:")
             span.set_attribute("action", reply.action)
             span.set_attribute("utterance", reply.utterance)
             span.set_attribute("reasoning", reply.reasoning)
             span.set_attribute("latency_ms", latency_ms)
+            span.set_attribute("fallback", is_fallback)
+            span.set_attribute("probe_source", "analyst" if reply.probe_id_used else "interviewer" if reply.action == "probe" else None)
 
     # --- Phase 2: apply study side-effects only (no Turn writes) ---
     with logfire.span(
@@ -76,6 +79,17 @@ async def run_speech_turn(
             if reply.action in ("scripted", "skip_scripted"):
                 state.mark_scripted_asked(session, call_id)
             if reply.probe_id_used is not None:
+                probe = session.get(state.Probe, reply.probe_id_used)
+                if probe is not None:
+                    lag = turn_number - (probe.generated_after_turn or 0)
+                    logfire.info(
+                        "probe_used",
+                        call_id=call_id,
+                        turn_number=turn_number,
+                        probe_id=reply.probe_id_used,
+                        probe_priority=probe.priority,
+                        analyst_lag_turns=lag,
+                    )
                 state.mark_probe_asked(session, reply.probe_id_used)
 
     return {

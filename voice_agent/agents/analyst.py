@@ -20,7 +20,7 @@ load_dotenv()
 
 from voice_agent import state
 from voice_agent.config import ANALYST_MODEL
-from voice_agent.models import AnalysisUpdate, AnalystDeps
+from voice_agent.models import AnalysisUpdate, AnalystDeps, SubtopicCompression
 
 
 ANALYST_PROMPT = """\
@@ -131,25 +131,93 @@ analyst = Agent(
     instrument=True,
 )
 
+SUBTOPIC_COMPRESSION_PROMPT = """\
+You are reviewing a customer interview transcript. Produce a cumulative list of short
+noun-phrase labels (3-6 words each) for every specific subtopic addressed — whether
+asked explicitly or answered organically by the respondent.
+
+If EXISTING_COVERED_SUBTOPICS are provided, keep every entry from that list and only
+add new subtopics from the transcript. Never remove or merge existing entries.
+
+Granularity rules:
+- Name specific entities, not categories. Use 'Notion vs Google Docs product features'
+  not 'competitor product comparison' — the latter would wrongly block 'Notion vs Quip'.
+- Split by dimension: 'Notion vs Google Docs product features' and
+  'Notion vs Google Docs pricing' are separate entries if both were discussed.
+- Other examples: 'IT security SOC2 concerns', 'VP of Sales budget ownership',
+  'day-to-day AE usage workflow'. Never collapse distinct things into one label.
+
+The goal: the interviewer can read this list and know exactly what has been covered,
+so that adjacent subtopics (different competitor, different dimension) remain askable.
+"""
+
+_compression_agent = Agent(
+    ANALYST_MODEL,
+    output_type=SubtopicCompression,
+    system_prompt=SUBTOPIC_COMPRESSION_PROMPT,
+    instrument=True,
+)
+
+SUBTOPIC_COMPRESSION_INTERVAL = 25
+
+
+async def _maybe_compress_subtopics(
+    session, call_id: str, after_turn: int, prior_snapshot: state.AnalystSnapshot | None
+) -> tuple[list[str], int]:
+    """Run subtopic compression if >= 25 turns have passed since last compression.
+
+    Returns (covered_subtopics, last_compression_turn) to store on the new snapshot.
+    Carries forward prior values unchanged if the interval hasn't elapsed.
+    """
+    prior_subtopics = prior_snapshot.covered_subtopics if prior_snapshot else []
+    last_compression = prior_snapshot.last_compression_turn if prior_snapshot else 0
+
+    if after_turn - last_compression < SUBTOPIC_COMPRESSION_INTERVAL:
+        return prior_subtopics, last_compression
+
+    all_turns = state.recent_turns(session, call_id, n=200)
+    lines = ["TRANSCRIPT:"]
+    for t in all_turns:
+        lines.append(f"  {t.speaker.upper()} [{t.turn_number}]: {t.text}")
+
+    if prior_subtopics:
+        lines.append("\nEXISTING_COVERED_SUBTOPICS (already confirmed — keep all of these, only add new ones):")
+        for topic in prior_subtopics:
+            lines.append(f"  - {topic}")
+
+    result = await _compression_agent.run("\n".join(lines))
+    return result.output.covered_subtopics, after_turn
+
 
 async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
     """Read transcript → one LLM call → persist AnalystSnapshot + Probes."""
     t0 = time.perf_counter()
 
+    prior_snapshot = state.latest_snapshot(deps.session, deps.call_id)
     prompt, after_turn = _build_prompt(deps.session, deps.call_id)
     result = await analyst.run(prompt, deps=deps)
     update: AnalysisUpdate = result.output
 
+    covered_subtopics, last_compression_turn = await _maybe_compress_subtopics(
+        deps.session, deps.call_id, after_turn, prior_snapshot
+    )
+
     latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    call = deps.session.get(state.Call, deps.call_id)
+    scripted_cursor = call.scripted_cursor if call else 0
 
     deps.session.add(
         state.AnalystSnapshot(
             call_id=deps.call_id,
             after_turn=after_turn,
+            after_scripted_cursor=scripted_cursor,
             themes=update.themes,
             contradictions=update.contradictions,
             surprises=update.surprises,
             investor_signals=update.investor_signals,
+            covered_subtopics=covered_subtopics,
+            last_compression_turn=last_compression_turn,
             latency_ms=latency_ms,
         )
     )

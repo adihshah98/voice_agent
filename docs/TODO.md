@@ -1,11 +1,5 @@
 ## My questions/Future improvements
 
-- Voice
-  - Immediate
-    - Vapi - how to know if it's an update or the final transcript (for logging) - Log which one was finally sent to customer vs redone? - 
-    - Can probs send lesser info in context?
-    - Should know if probe is coming from analyst or interviewe
-    - Callig. analyst less frequent;y?
 - Interview Pre-Context
   - Tell it it is diligencing which product
   - Tell it which direction to go, where not to spend too much time
@@ -48,6 +42,7 @@
   - Vesioned prompts/datasets/eval runs
   - Live DB + Alembic
   - Caching & Latency
+    - Add *tts*active to Redis
   - Prompt Caching
   - Model Pinning & Rollback
   - Secrets Management

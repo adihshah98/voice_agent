@@ -38,14 +38,16 @@ CONTEXT fields:
 - PENDING_PROBES: up to 3 analyst suggestions, each tagged with [id, priority, turns_ago].
   Priority 1=urgent, 2=worthwhile, 3=nice-to-have. All are fresh (turns_ago ≤ 8).
   When you use one, set action=probe and probe_id_used to its exact id.
-- COVERED_TOPICS: every question you have already asked — never revisit these
+- COVERED_SUBTOPICS: specific subtopic labels already covered (explicit or organic) — labels name exact entities and dimensions (e.g. 'Notion vs Google Docs product features'). A covered label does NOT block other entities or dimensions ('Notion vs Quip' or 'Notion vs Google Docs pricing' remain open)
 - RECENT_TURNS: last several turns of conversation
 
 Decision framework — use your judgment in this order:
 
-0. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_TOPICS.
-   If the topic you're about to ask about was already addressed, skip it entirely and
-   move to the next step, unless the answer was incomplete or evasive.
+0. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_SUBTOPICS.
+   If the specific subtopic you're about to ask about was already addressed, skip it and
+   move to the next step, unless the answer was incomplete or evasive. A broad topic
+   being covered does not block adjacent subtopics (e.g. "competitor product features"
+   covered does not block "competitor pricing structure").
 
 1. OFF-TOPIC: If the respondent went on a personal tangent unrelated to the study,
    acknowledge briefly and steer back with one open question. Use `off_topic`.
@@ -68,7 +70,7 @@ Decision framework — use your judgment in this order:
    EXCEPTION — if the respondent has already answered NEXT_SCRIPTED earlier in the
    conversation (check COVERED_TOPICS and RECENT_TURNS), skip it silently: set
    action=`skip_scripted` and move on to a probe or the following scripted question.
-   Do NOT ask a question you already have the answer to.
+   Do NOT ask about a subtopic already in COVERED_SUBTOPICS or RECENT_TURNS.
 
 5. CLARIFY: Only if the answer was genuinely ambiguous before you can move on.
    Do not use for clear, on-topic answers. Use action=`clarify`.
@@ -142,6 +144,7 @@ def _build_context(
     next_q = state.next_scripted(session, call_id)
     remaining = state.scripted_remaining(session, call_id)
     probes = state.top_probes(session, call_id, n=3)
+    snapshot = state.latest_snapshot(session, call_id)
 
     lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {remaining}"]
     lines.append(f"NEXT_SCRIPTED: {next_q}" if next_q else "NEXT_SCRIPTED: none")
@@ -161,20 +164,17 @@ def _build_context(
     else:
         lines.append("PENDING_PROBES: none")
 
-    # Build COVERED_TOPICS and RECENT_TURNS from Vapi's confirmed message history.
-    # Skip the system prompt (index 0); alternate assistant/user from there.
     convo = [m for m in vapi_messages if m.get("role") in ("assistant", "user")]
+    recent = convo[-30:]
 
-    covered = [
-        m["content"] for m in convo
-        if m.get("role") == "assistant" and m.get("content", "").strip().endswith("?")
-    ]
-    if covered:
-        lines.append("COVERED_TOPICS (do NOT revisit these):")
-        for q in covered:
-            lines.append(f"  - {q}")
+    # COVERED_SUBTOPICS: analyst-compressed topic phrases for ground already covered,
+    # including topics answered organically. Only includes turns that have scrolled out
+    # of the RECENT_TURNS window so there's no redundancy.
+    if snapshot and snapshot.covered_subtopics:
+        lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
+        for topic in snapshot.covered_subtopics:
+            lines.append(f"  - {topic}")
 
-    recent = convo[-14:]
     if recent:
         lines.append("RECENT_TURNS:")
         for m in recent:

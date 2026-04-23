@@ -110,10 +110,15 @@ class AnalystSnapshot(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     call_id: str = Field(foreign_key="calls.id", index=True)
     after_turn: int
+    after_scripted_cursor: int = Field(default=0)
     themes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     contradictions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     surprises: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     investor_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # Short topic phrases covering ground already covered in the conversation,
+    # including organically-answered topics. Compressed every 25 turns by the analyst.
+    covered_subtopics: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    last_compression_turn: int = Field(default=0)
     latency_ms: Optional[int] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
@@ -236,6 +241,12 @@ def top_probes(session: Session, call_id: str, n: int = 3) -> list[Probe]:
     return list(session.exec(stmt))
 
 
+def probe_utilization(session: Session, call_id: str) -> tuple[int, int]:
+    """Return (asked, total) probe counts for the call."""
+    probes = list(session.exec(select(Probe).where(Probe.call_id == call_id)))
+    return sum(1 for p in probes if p.asked), len(probes)
+
+
 def mark_probe_asked(session: Session, probe_id: int) -> None:
     probe = session.get(Probe, probe_id)
     if probe is None:
@@ -253,6 +264,15 @@ def latest_snapshot(session: Session, call_id: str) -> Optional["AnalystSnapshot
         .limit(1)
     )
     return session.exec(stmt).first()
+
+
+def scripted_cursor_advanced(session: Session, call_id: str) -> bool:
+    """True when the scripted cursor has moved past the last analyst snapshot."""
+    call = session.get(Call, call_id)
+    if call is None:
+        return False
+    snapshot = latest_snapshot(session, call_id)
+    return call.scripted_cursor > (snapshot.after_scripted_cursor if snapshot else 0)
 
 
 def turns_since(session: Session, call_id: str, after_turn: int) -> list[Turn]:
