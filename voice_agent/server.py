@@ -10,7 +10,10 @@ Local simulation: scripts/play.py drives turns in-process (no HTTP needed).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -19,7 +22,7 @@ from typing import Any
 import httpx
 import logfire
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -27,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 from voice_agent import state
 from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely as _synthesis_safely
-from voice_agent.config import ENABLE_SYNTHESIS_REPORT, settings
+from voice_agent.config import ENABLE_SYNTHESIS_REPORT, VAPI_TIMESTAMP_TOLERANCE_S, settings
 from voice_agent.tracing import agent_span, init_tracing
 from voice_agent.turn import TurnPipeline
 
@@ -71,10 +74,21 @@ def _end_call_on_error(call_id: str) -> None:
         logfire.exception("end_call_on_error_failed", call_id=call_id)
 
 
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    call_id = getattr(request.state, "call_id", None)
+    ctx = dict(status_code=exc.status_code, detail=exc.detail, method=request.method, path=request.url.path, call_id=call_id)
+    if exc.status_code >= 500:
+        logfire.error("http_error", **ctx)
+    elif exc.status_code >= 400:
+        logfire.warning("http_error", **ctx)
+    return await http_exception_handler(request, exc)
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     if isinstance(exc, HTTPException):
-        return await http_exception_handler(request, exc)
+        return await _http_exception_handler(request, exc)
     if isinstance(exc, RequestValidationError):
         call_id = getattr(request.state, "call_id", None)
         if call_id:
@@ -113,6 +127,73 @@ async def _analyst_task(call_id: str) -> None:
 
 
 
+# --- Vapi signature verification --------------------------------------------
+
+
+async def _require_vapi_signature(request: Request) -> None:
+    """Verify Vapi HMAC signature. No-op when VAPI_WEBHOOK_SECRET is unset (dev mode).
+
+    Vapi sends the signature as "v1{hex}" in the configured header. The HMAC payload is
+    "{timestamp}.{body}" when VAPI_TIMESTAMP_HEADER is set, otherwise just the raw body.
+    Timestamps outside the tolerance window are rejected to prevent replay attacks.
+    """
+    secret = settings.vapi_webhook_secret
+    if not secret:
+        return
+
+    sig = request.headers.get(settings.vapi_signature_header, "")
+    if not sig:
+        logfire.warning("vapi_signature_missing", path=request.url.path)
+        raise HTTPException(status_code=403, detail="Missing signature header")
+
+    body = await request.body()
+
+    if settings.vapi_timestamp_header:
+        ts = request.headers.get(settings.vapi_timestamp_header, "")
+        if not ts:
+            logfire.warning("vapi_timestamp_missing", path=request.url.path)
+            raise HTTPException(status_code=403, detail="Missing timestamp header")
+        try:
+            ts_s = int(ts) / 1000
+            age_s = time.time() - ts_s
+            if abs(age_s) > VAPI_TIMESTAMP_TOLERANCE_S:
+                logfire.warning(
+                    "vapi_timestamp_stale",
+                    path=request.url.path,
+                    ts_raw=ts,
+                    ts_s=round(ts_s, 3),
+                    server_time_s=round(time.time(), 3),
+                    age_s=round(age_s, 3),
+                    tolerance_s=VAPI_TIMESTAMP_TOLERANCE_S,
+                )
+                raise HTTPException(status_code=403, detail="Request timestamp too old")
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Invalid timestamp")
+        payload = f"{ts}.{body.decode()}".encode()
+    else:
+        payload = body
+
+    # Vapi prefixes the hex digest with "v1"
+    sig_hex = sig.removeprefix("v1")
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig_hex):
+        logfire.warning("vapi_signature_invalid", path=request.url.path)
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+
+# --- Static secret for custom LLM endpoint ----------------------------------
+
+
+async def _require_llm_secret(request: Request) -> None:
+    """Verify the static secret Vapi sends via model.headers. No-op when LLM_SECRET_TOKEN is unset (dev)."""
+    secret = settings.llm_secret_token
+    if not secret:
+        return
+    if not hmac.compare_digest(request.headers.get("X-Vapi-Secret", ""), secret):
+        logfire.warning("llm_secret_invalid", path=request.url.path)
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+
 # --- Webhook ----------------------------------------------------------------
 
 
@@ -122,7 +203,7 @@ def _call_id_from_event(msg: dict) -> str | None:
 
 
 @app.post("/vapi/webhook")
-async def vapi_webhook(request: Request) -> dict[str, Any]:
+async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signature)) -> dict[str, Any]:
     body = await request.json()
     msg = body.get("message", {})
     event_type = msg.get("type")
@@ -330,7 +411,7 @@ class VapiLLMBody(BaseModel):
 
 
 @app.post("/vapi/llm/chat/completions")
-async def vapi_llm(request: Request, body: VapiLLMBody):
+async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_require_llm_secret)):
     """Custom LLM endpoint called by Vapi for every turn.
 
     Vapi sends an OpenAI-compatible chat completion request, usually with
@@ -473,8 +554,12 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
                 "provider": "custom-llm",
                 "url": f"{settings.webhook_url}/vapi/llm/chat/completions",
                 "model": "interviewer",
+                **({"headers": {"X-Vapi-Secret": settings.llm_secret_token}} if settings.llm_secret_token else {}),
             },
-            "serverUrl": f"{settings.webhook_url}/vapi/webhook",
+            "server": {
+                "url": f"{settings.webhook_url}/vapi/webhook",
+                **({"credentialId": settings.vapi_server_credential_id} if settings.vapi_server_credential_id else {}),
+            },
             "voice": _vapi_assistant_voice(),
             "transcriber": {"provider": "deepgram", "model": "nova-2", "language": "en"},
             "firstMessage": "Hey! Thank you for getting on the call — just want to check if you can hear me before we get started.",

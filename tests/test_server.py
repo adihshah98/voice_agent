@@ -24,6 +24,8 @@ def _call_body(vapi_call_id: str, call_id: str, content: str, stream: bool = Tru
 
 @pytest.mark.asyncio
 async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
+
     class FakePipeline:
         def __init__(self, engine, call_id, vapi_messages=None):
             assert call_id == "call-123"
@@ -53,6 +55,8 @@ async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
+
     class FakePipeline:
         def __init__(self, engine, call_id, vapi_messages=None):
             assert call_id == "call-456"

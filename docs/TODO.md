@@ -7,15 +7,15 @@
 
 ## My questions/Future improvements
 
-- Read through codebase to recap & understand everything
 - Cleanups
-  - Is this talkking via DB the best practice or should be agent to agent?
   - **No Vapi webhook signature validation** — `/vapi/webhook` and `/vapi/llm/chat/completions` accept any POST. Vapi sends an `x-vapi-signature` HMAC header. Without verifying it, anyone can drive the agent. This is the most serious gap.
+  - Should we be logging more stuff so if it fails, you can see it. Also log instead of trace?
   - `asyncio.create_task` **without task reference** — [server.py:193](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L193) and [server.py:230](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L230) fire tasks but hold no reference. CPython may GC the task before it finishes, and any exception escaping the outer `try/except` (e.g., from `agent_span` itself) disappears silently. Standard fix is a module-level `_background_tasks: set[asyncio.Task]` and adding a `task.add_done_callback(_background_tasks.discard)`
   - `assert` **in hot path** — [turn.py:164](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/turn.py#L164): `assert reply is not None`. Asserts are disabled with `-O` and produce an ugly `AssertionError` in prod rather than a handled failure. The stream generator does always yield a final output, but this should be a proper guard.
   - `_synthesis_task` **still uses bare** `Session` — [server.py:71](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L71). We fixed `_analyst_task` to use `session_scope` last session; `_synthesis_task` is still inconsistent — bare session, no rollback on failure.
   - Are we logging/traces enough/too much/best way?
   - vapi_assistant_voice - fix when we do the TTS stuff. Write now config code is a bit messy/split across Vapi & 11Labs
+  - Is this talkking via DB the best practice or should be agent to agent?
 - Voice Nuances/Vapi Config
   - Barge in etc.
   - Gate LLM calls till final-transcript (more chatlike)

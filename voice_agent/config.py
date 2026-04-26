@@ -23,7 +23,12 @@ class Settings(BaseSettings):
     # Vapi (all optional — empty means local simulation only)
     vapi_api_key: str = ""
     vapi_phone_number_id: str = ""
+    vapi_webhook_secret: str = ""             # HMAC secret key from Vapi dashboard credential; empty = skip check (dev)
+    vapi_server_credential_id: str = ""       # HMAC credential ID — attached to server (webhook) URL on dial
+    vapi_signature_header: str = "x-signature"   # must match "Signature Header" in Vapi HMAC credential
+    vapi_timestamp_header: str = "x-timestamp"   # must match "Timestamp Header"; empty = omit timestamp from payload
     webhook_url: str = ""
+    llm_secret_token: str = ""   # static secret sent by Vapi in X-Vapi-Secret header; empty = skip check (dev)
 
     # Voice
     vapi_voice_provider: str = "11labs"
@@ -62,3 +67,6 @@ ENABLE_SYNTHESIS_REPORT: bool = False
 # Interviewer hard deadline (seconds). Haiku + structured output can exceed ~2.5 s under variance;
 # 5 s reduces premature scripted fallbacks while still bounding hangs.
 INTERVIEWER_BUDGET_S: float = 5.0
+
+# Vapi HMAC replay-attack window — reject requests whose timestamp is older than this.
+VAPI_TIMESTAMP_TOLERANCE_S: int = 300  # 5 minutes
