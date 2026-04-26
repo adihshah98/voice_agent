@@ -148,10 +148,11 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
         db_turn_number += 1
 
         # --- Analyst pass (awaited for offline eval — no latency constraint) ---
+        await run_analyst_safely(AnalystDeps(call_id=call_id, engine=engine))
         with state.session_scope(engine) as s:
-            update = await run_analyst_safely(AnalystDeps(call_id=call_id, session=s))
-        if update and update.contradictions:
-            analyst_found_contradiction = True
+            snapshot = state.latest_snapshot(s, call_id)
+            if snapshot and snapshot.contradictions:
+                analyst_found_contradiction = True
 
         # --- Interviewer turn ---
         with state.session_scope(engine) as s:

@@ -32,7 +32,7 @@ from sqlmodel import create_engine
 load_dotenv()
 
 from voice_agent import state
-from voice_agent.agents.analyst import run_analyst
+from voice_agent.agents.analyst import load_latest_analysis, run_analyst
 from evals.cases import AnalystCaseInputs, load_analyst_cases
 from evals.evaluators import (
     HasProbes,
@@ -86,9 +86,8 @@ def _seed_engine(inputs: AnalystCaseInputs):
 
 async def run_analyst_on_case(inputs: AnalystCaseInputs) -> AnalysisUpdate:
     engine, call_id = _seed_engine(inputs)
-    with state.session_scope(engine) as session:
-        deps = AnalystDeps(call_id=call_id, session=session)
-        return await run_analyst(deps)
+    await run_analyst(AnalystDeps(call_id=call_id, engine=engine))
+    return load_latest_analysis(engine, call_id)
 
 
 @pytest.mark.asyncio

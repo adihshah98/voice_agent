@@ -68,6 +68,8 @@ def test_next_turn_number_returns_int(engine, seeded_call):
         n = next_turn_number(s, seeded_call)
         assert n == 1
         assert type(n) is int
+        # Writing a Turn row advances the counter.
+        s.add(Turn(call_id=seeded_call, turn_number=1, speaker="respondent", text="hi"))
         assert next_turn_number(s, seeded_call) == 2
 
 

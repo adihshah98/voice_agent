@@ -20,7 +20,7 @@ from sqlmodel import select
 load_dotenv()
 
 from voice_agent import state
-from voice_agent.config import ANALYST_MODEL
+from voice_agent.config import ANALYST_MODEL, settings
 from voice_agent.models import AnalysisUpdate, AnalystDeps
 
 
@@ -85,12 +85,22 @@ Be concise — bullet-point style for all lists except investor_signals (one tag
 """
 
 
+_MAX_EXISTING_PROBES = 15
+
+
+def _format_turn(t) -> str:
+    return f"{t.speaker.upper()} [{t.turn_number}]: {t.text}"
+
+
 def _build_prompt(session, call_id: str) -> tuple[str, int]:
     """Return (prompt_text, last_turn_number).
 
     If a prior AnalystSnapshot exists, feeds it as established context and only
     appends turns since that snapshot — keeps the prompt within context limits
     regardless of interview length.
+
+    EXISTING_PROBES are capped to the most recent _MAX_EXISTING_PROBES entries to
+    keep the prompt from growing unboundedly on long calls.
     """
     snapshot = state.latest_snapshot(session, call_id)
 
@@ -104,30 +114,31 @@ def _build_prompt(session, call_id: str) -> tuple[str, int]:
             f"  Contradictions: {'; '.join(snapshot.contradictions) if snapshot.contradictions else 'none'}",
             f"  Surprises: {'; '.join(snapshot.surprises) if snapshot.surprises else 'none'}",
             "  Investor signals:",
+            *[f"    {sig}" for sig in snapshot.investor_signals],
+            "  Existing covered subtopics:",
+            *(
+                [f"    - {topic}" for topic in snapshot.covered_subtopics]
+                if snapshot.covered_subtopics
+                else ["    none"]
+            ),
+            f"  (covers turns 1–{snapshot.after_turn})",
+            "",
+            f"NEW TRANSCRIPT (turns {snapshot.after_turn + 1}–{last_turn}):",
+            *[f"  {_format_turn(t)}" for t in new_turns],
         ]
-        for sig in snapshot.investor_signals:
-            lines.append(f"    {sig}")
-        lines.append("  Existing covered subtopics:")
-        if snapshot.covered_subtopics:
-            for topic in snapshot.covered_subtopics:
-                lines.append(f"    - {topic}")
-        else:
-            lines.append("    none")
-        lines.append(f"  (covers turns 1–{snapshot.after_turn})")
-        lines.append("")
-        lines.append(f"NEW TRANSCRIPT (turns {snapshot.after_turn + 1}–{last_turn}):")
-        for t in new_turns:
-            lines.append(f"  {t.speaker.upper()} [{t.turn_number}]: {t.text}")
     else:
         new_turns = state.recent_turns(session, call_id, n=200)
         if not new_turns:
             return "(no turns yet)", 0
         last_turn = new_turns[-1].turn_number
-        lines = ["TRANSCRIPT:"]
-        for t in new_turns:
-            lines.append(f"{t.speaker.upper()} [{t.turn_number}]: {t.text}")
+        lines = ["TRANSCRIPT:", *[_format_turn(t) for t in new_turns]]
 
-    existing_stmt = select(state.Probe).where(state.Probe.call_id == call_id)
+    existing_stmt = (
+        select(state.Probe)
+        .where(state.Probe.call_id == call_id)
+        .order_by(state.Probe.created_at.desc())
+        .limit(_MAX_EXISTING_PROBES)
+    )
     existing = [p.question for p in session.exec(existing_stmt)]
 
     prompt = "\n".join(lines)
@@ -151,42 +162,46 @@ analyst = Agent(
 )
 
 
-async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
+async def run_analyst(deps: AnalystDeps) -> None:
     """Read transcript → one LLM call → persist AnalystSnapshot + Probes."""
     t0 = time.perf_counter()
 
-    prompt, after_turn = _build_prompt(deps.session, deps.call_id)
+    with state.session_scope(deps.engine) as session:
+        prompt, after_turn = _build_prompt(session, deps.call_id)
+
     result = await analyst.run(prompt, deps=deps)
     update: AnalysisUpdate = result.output
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
-    call = deps.session.get(state.Call, deps.call_id)
-    scripted_cursor = call.scripted_cursor if call else 0
-
-    deps.session.add(
-        state.AnalystSnapshot(
-            call_id=deps.call_id,
-            after_turn=after_turn,
-            after_scripted_cursor=scripted_cursor,
-            themes=update.themes,
-            contradictions=update.contradictions,
-            surprises=update.surprises,
-            investor_signals=update.investor_signals,
-            covered_subtopics=update.covered_subtopics,
-            latency_ms=latency_ms,
-        )
-    )
-    for np in update.new_probes:
-        deps.session.add(
-            state.Probe(
+    with state.session_scope(deps.engine) as session:
+        call = session.get(state.Call, deps.call_id)
+        scripted_cursor = call.scripted_cursor if call else 0
+        session.add(
+            state.AnalystSnapshot(
                 call_id=deps.call_id,
-                question=np.question,
-                priority=np.priority,
-                rationale=np.rationale,
-                generated_after_turn=after_turn,
+                after_turn=after_turn,
+                after_scripted_cursor=scripted_cursor,
+                themes=update.themes,
+                contradictions=update.contradictions,
+                surprises=update.surprises,
+                investor_signals=update.investor_signals,
+                covered_subtopics=update.covered_subtopics,
+                latency_ms=latency_ms,
             )
         )
+        for np in update.new_probes:
+            session.add(
+                state.Probe(
+                    call_id=deps.call_id,
+                    question=np.question,
+                    priority=np.priority,
+                    rationale=np.rationale,
+                    generated_after_turn=after_turn,
+                )
+            )
+
+    usage = result.usage()
     span = trace.get_current_span()
     span.set_attribute("after_turn", after_turn)
     span.set_attribute("latency_ms", latency_ms)
@@ -194,18 +209,42 @@ async def run_analyst(deps: AnalystDeps) -> AnalysisUpdate:
     span.set_attribute("contradictions_count", len(update.contradictions))
     span.set_attribute("surprises_count", len(update.surprises))
     span.set_attribute("investor_signals_count", len(update.investor_signals))
+    span.set_attribute("covered_subtopics_count", len(update.covered_subtopics))
     span.set_attribute("new_probes_count", len(update.new_probes))
+    span.set_attribute("tokens_input", usage.request_tokens or 0)
+    span.set_attribute("tokens_output", usage.response_tokens or 0)
+    span.set_attribute("tokens_cache_read", usage.cache_read_tokens or 0)
+    span.set_attribute("tokens_cache_write", usage.cache_write_tokens or 0)
 
-    return update
 
-
-async def run_analyst_safely(deps: AnalystDeps) -> AnalysisUpdate | None:
+async def run_analyst_safely(deps: AnalystDeps) -> None:
     """Swallow exceptions so a crashing analyst never affects the live call."""
     try:
-        return await run_analyst(deps)
+        await run_analyst(deps)
     except Exception:
         logfire.exception("analyst_error", call_id=deps.call_id)
-        return None
+
+
+def load_latest_analysis(engine, call_id: str) -> AnalysisUpdate | None:
+    """Reconstruct AnalysisUpdate from the most recent snapshot + its probe rows."""
+    from voice_agent.models import NewProbe
+    with state.session_scope(engine) as session:
+        snapshot = state.latest_snapshot(session, call_id)
+        if snapshot is None:
+            return None
+        probes = session.exec(
+            select(state.Probe)
+            .where(state.Probe.call_id == call_id)
+            .where(state.Probe.generated_after_turn == snapshot.after_turn)
+        ).all()
+        return AnalysisUpdate(
+            themes=snapshot.themes,
+            contradictions=snapshot.contradictions,
+            surprises=snapshot.surprises,
+            investor_signals=snapshot.investor_signals,
+            covered_subtopics=snapshot.covered_subtopics,
+            new_probes=[NewProbe(question=p.question, priority=p.priority, rationale=p.rationale or "") for p in probes],
+        )
 
 
 # --- Smoke test: feed a canned transcript, confirm DB writes ---------------
@@ -257,7 +296,7 @@ async def _smoke_test() -> None:
 
     init_tracing(send_to_logfire=False)
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not settings.anthropic_api_key:
         print("ANTHROPIC_API_KEY not set — aborting.", file=sys.stderr)
         sys.exit(2)
 
@@ -274,9 +313,9 @@ async def _smoke_test() -> None:
 
     print("Seeded canned transcript. Running analyst...\n")
 
-    with state.session_scope(engine) as session:
-        deps = AnalystDeps(call_id=call_id, session=session)
-        update = await run_analyst(deps)
+    await run_analyst(AnalystDeps(call_id=call_id, engine=engine))
+    update = load_latest_analysis(engine, call_id)
+    assert update is not None
 
     print("=== AnalysisUpdate ===")
     print(f"Themes ({len(update.themes)}):")

@@ -8,6 +8,14 @@
 ## My questions/Future improvements
 
 - Read through codebase to recap & understand everything
+- Cleanups
+  - Is this talkking via DB the best practice or should be agent to agent?
+  - **No Vapi webhook signature validation** — `/vapi/webhook` and `/vapi/llm/chat/completions` accept any POST. Vapi sends an `x-vapi-signature` HMAC header. Without verifying it, anyone can drive the agent. This is the most serious gap.
+  - `asyncio.create_task` **without task reference** — [server.py:193](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L193) and [server.py:230](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L230) fire tasks but hold no reference. CPython may GC the task before it finishes, and any exception escaping the outer `try/except` (e.g., from `agent_span` itself) disappears silently. Standard fix is a module-level `_background_tasks: set[asyncio.Task]` and adding a `task.add_done_callback(_background_tasks.discard)`
+  - `assert` **in hot path** — [turn.py:164](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/turn.py#L164): `assert reply is not None`. Asserts are disabled with `-O` and produce an ugly `AssertionError` in prod rather than a handled failure. The stream generator does always yield a final output, but this should be a proper guard.
+  - `_synthesis_task` **still uses bare** `Session` — [server.py:71](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L71). We fixed `_analyst_task` to use `session_scope` last session; `_synthesis_task` is still inconsistent — bare session, no rollback on failure.
+  - Are we logging/traces enough/too much/best way?
+  - vapi_assistant_voice - fix when we do the TTS stuff. Write now config code is a bit messy/split across Vapi & 11Labs
 - Voice Nuances/Vapi Config
   - Barge in etc.
   - Gate LLM calls till final-transcript (more chatlike)
@@ -26,10 +34,12 @@
     - If not customization, uses the default
 - Synthesis Report
   - Reinstate synthesis report once this works
+  - Maybe use async queues for this (learn to use async queues either way)
 - Conversation Trajectory
   - Make sure it asks everything
   - Make sure it probes at the correct depth
-  - Make sure it doesn't ask again/get stuck in loops
+  - Make sure it wraps up with everything covered in a set time
+  - Make sure it doesn't ask again/get stuck in loops/rabbitholes
   - Make sure it deals with non-happy path behavior
 - Eval Infra
   - Live Observability
@@ -38,15 +48,18 @@
   - Evals
     - E2E Evals
       - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
+      - Eventually do something about the non-Vapi path (used only for evals) functions like run_speech_run in turn.py, db_messages_fallback, prepare_interviewer_turn
+      - REPL Path is already diverging from prod
+      - In the hot path (`turn.py`), the session is closed *before* `interviewer.run()` is awaited (hence `Session | None` — the docstring explains this). So `deps.session` is `None` during the actual LLM call in production; it's only non-None in the REPL and evals. run_interviewer & run_interviewer_with_timeout are only called by evals
     - Online Evals
+  - Alerts
+    - Alerts created, but no channel added yet
+  - Vesioned prompts/datasets/eval runs
 - Infra - Prod Level
   - Webhook correctness (auth/idempotency)
-  - See where traces go & have a good observabilty process/dashnoard
-  - Vesioned prompts/datasets/eval runs
   - Live DB + Alembic
   - Caching & Latency
     - Add *tts*active to Redis
-  - Prompt Caching
   - Model Pinning & Rollback
   - Secrets Management
   - Dependency Mgmt on pyproject.timl and remove requirements.txt
@@ -54,11 +67,11 @@
   - The analyst is triggered by polling `should_run_analyst()` on every `conversation-update`. Fine for one call, but with N concurrent calls you get lock contention and polling overhead. Production systems use a task queue (Celery + Redis, SQS, etc.) — the webhook handler enqueues a job instead of calling `asyncio.create_task` inline.
   - The analyst competes with the real-time interviewer for the event loop. A slow Sonnet call during a burst can delay turn responses. In production you'd want the analyst as a separate worker service — the invariant holds, you just move the writes to a different process.
   - SQS Queues
-  - Secrets manager 
   - Render Deployment + CI/CD
   - Multi-tenant auth
   - Rate limiting
   - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
 - Advanced
   - Barge-in / interruption handling beyond Vapi's capabilities - Using Livekit
+  - Memory/Improving agents with usage
 

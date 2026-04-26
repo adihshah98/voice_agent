@@ -34,7 +34,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 load_dotenv()
 
-_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+from voice_agent.config import ENABLE_SYNTHESIS_REPORT, settings
+
+_level_name = settings.log_level.upper()
 _root_level = getattr(logging, _level_name, logging.INFO)
 if not logging.getLogger().handlers:
     logging.basicConfig(
@@ -47,12 +49,10 @@ from sqlmodel import Session, select
 
 from voice_agent import state
 from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely
-from voice_agent.config import ENABLE_SYNTHESIS_REPORT
 from voice_agent.tracing import agent_span, init_tracing
 from voice_agent.turn import run_speech_turn
 
 BASE_URL = "http://localhost:8000"
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///voice_agent.db")
 
 
 def _investor_questions_path() -> Path:
@@ -181,32 +181,9 @@ def print_report(report: dict) -> None:
 # --- REPL -------------------------------------------------------------------
 
 
-def _write_turns_local(engine, call_id: str, respondent_text: str | None, interviewer_text: str) -> None:
-    """Write one exchange to the DB for analyst/synthesis use in local mode.
-
-    In production, turns are written from conversation-update webhooks.
-    In local REPL mode there is no Vapi, so we write them here directly.
-    """
-    with state.session_scope(engine) as session:
-        from sqlmodel import func
-        existing = session.exec(
-            select(func.count()).where(state.Turn.call_id == call_id)
-        ).one()
-        turn_num = existing + 1
-        if respondent_text:
-            session.add(state.Turn(
-                call_id=call_id, turn_number=turn_num,
-                speaker="respondent", text=respondent_text,
-            ))
-            turn_num += 1
-        session.add(state.Turn(
-            call_id=call_id, turn_number=turn_num,
-            speaker="interviewer", text=interviewer_text,
-        ))
-
 
 async def run_local_repl(questions: list[str]) -> None:
-    engine = state.make_engine(DATABASE_URL)
+    engine = state.make_engine(settings.database_url)
     state.init_db(engine)
     init_tracing(engine=engine)
 
@@ -219,9 +196,8 @@ async def run_local_repl(questions: list[str]) -> None:
     # messages mirrors what Vapi would send as body["messages"] — built locally
     messages: list[dict] = []
 
-    opening = await run_speech_turn(engine, call_id, "", vapi_messages=messages)
+    opening = await run_speech_turn(engine, call_id, vapi_messages=messages)
     messages.append({"role": "assistant", "content": opening["message"]})
-    _write_turns_local(engine, call_id, None, opening["message"])
     print(f"\ninterviewer> {opening['message']}")
     print(f"  [ACTION: {opening['action']}]")
     print(f"  [WHY: {opening['reasoning']}]")
@@ -240,9 +216,8 @@ async def run_local_repl(questions: list[str]) -> None:
             continue
 
         messages.append({"role": "user", "content": user_input})
-        result = await run_speech_turn(engine, call_id, user_input, vapi_messages=messages)
+        result = await run_speech_turn(engine, call_id, vapi_messages=messages)
         messages.append({"role": "assistant", "content": result["message"]})
-        _write_turns_local(engine, call_id, user_input, result["message"])
 
         print(f"\ninterviewer> {result['message']}")
         print(f"  [ACTION: {result['action']}]")

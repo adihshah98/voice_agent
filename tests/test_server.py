@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from voice_agent import server
+from voice_agent.turn import StreamTurnResult
 
 
 def _call_body(vapi_call_id: str, call_id: str, content: str, stream: bool = True) -> dict:
@@ -23,19 +24,19 @@ def _call_body(vapi_call_id: str, call_id: str, content: str, stream: bool = Tru
 
 @pytest.mark.asyncio
 async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_run_speech_turn_stream(
-        engine,
-        call_id: str,
-        respondent_text: str,
-        vapi_messages: list[dict] | None = None,
-    ):
-        assert call_id == "call-123"
-        assert respondent_text == "hello there"
-        assert vapi_messages is not None
-        yield "hello"
-        raise asyncio.CancelledError()
+    class FakePipeline:
+        def __init__(self, engine, call_id, vapi_messages=None):
+            assert call_id == "call-123"
+            assert vapi_messages is not None
 
-    monkeypatch.setattr(server, "run_speech_turn_stream", fake_run_speech_turn_stream)
+        async def stream_tokens(self):
+            yield "hello"
+            raise asyncio.CancelledError()
+
+        async def commit(self):
+            raise AssertionError("commit() should not be called after CancelledError")
+
+    monkeypatch.setattr(server, "TurnPipeline", FakePipeline)
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -52,20 +53,26 @@ async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_run_speech_turn_stream(
-        engine,
-        call_id: str,
-        respondent_text: str,
-        vapi_messages: list[dict] | None = None,
-    ):
-        assert call_id == "call-456"
-        assert respondent_text == "hi again"
-        assert vapi_messages is not None
-        yield "partial "
-        yield "reply"
-        yield {"action": "probe", "reasoning": "ok", "latency_ms": 123}
+    class FakePipeline:
+        def __init__(self, engine, call_id, vapi_messages=None):
+            assert call_id == "call-456"
+            assert vapi_messages is not None
 
-    monkeypatch.setattr(server, "run_speech_turn_stream", fake_run_speech_turn_stream)
+        async def stream_tokens(self):
+            yield "partial "
+            yield "reply"
+
+        async def commit(self):
+            return StreamTurnResult(
+                action="probe",
+                reasoning="ok",
+                llm_latency_ms=123,
+                ttft_ms=None,
+                persist_ms=5,
+                should_run_analyst=False,
+            )
+
+    monkeypatch.setattr(server, "TurnPipeline", FakePipeline)
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

@@ -11,6 +11,7 @@ based on the structured output, so the model never needs to call a tool.
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
@@ -21,8 +22,12 @@ from pydantic_ai.messages import CachePoint
 from pydantic_ai.models.anthropic import AnthropicModelSettings
 
 from voice_agent import state
-from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_MODEL
+from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_MODEL, settings
 from voice_agent.models import InterviewerDeps, InterviewerOutput
+
+
+CONTEXT_WINDOW_TURNS = 50  # recent turns injected into the LLM context block
+PROBE_STALENESS_TURNS = 15    # probes older than this many turns are dropped from context
 
 
 @dataclass
@@ -53,8 +58,7 @@ def _build_prompt_parts_from_reads(
     else:
         covered_lines.append("COVERED_SUBTOPICS: none")
 
-    convo = [m for m in vapi_messages if m.get("role") in ("assistant", "user")]
-    recent = convo[-30:]
+    recent = [m for m in vapi_messages if m.get("role") in ("assistant", "user")][-CONTEXT_WINDOW_TURNS:]
     dynamic_lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {reads.scripted_remaining}"]
     dynamic_lines.append(
         f"NEXT_SCRIPTED: {reads.next_scripted_question}"
@@ -62,13 +66,9 @@ def _build_prompt_parts_from_reads(
         else "NEXT_SCRIPTED: none"
     )
 
-    active_probes = [
-        p for p in reads.probes
-        if (current_turn - (p.generated_after_turn or 0)) <= 8
-    ]
-    if active_probes:
+    if reads.probes:
         dynamic_lines.append("PENDING_PROBES (analyst suggestions, in priority order):")
-        for probe in active_probes:
+        for probe in reads.probes:
             turns_ago = current_turn - (probe.generated_after_turn or 0)
             line = f'  [id={probe.id}, priority={probe.priority}, turns_ago={turns_ago}] "{probe.question}"'
             if probe.rationale:
@@ -105,7 +105,7 @@ def prepare_interviewer_turn(
     reads = InterviewerContextReads(
         next_scripted_question=state.next_scripted(session, call_id),
         scripted_remaining=state.scripted_remaining(session, call_id),
-        probes=state.top_probes(session, call_id, n=3),
+        probes=state.top_probes(session, call_id, n=3, min_turn=current_turn - PROBE_STALENESS_TURNS),
         snapshot=state.latest_snapshot(session, call_id),
     )
     prompt_parts = _build_prompt_parts_from_reads(
@@ -128,45 +128,18 @@ async def prepare_interviewer_turn_concurrent(
     vapi_messages: list[dict] | None,
 ) -> PreparedInterviewerTurn:
     """Read context with parallel short sessions (best for pooled Postgres)."""
-    next_q: str | None = None
-    remaining: int | None = None
-    probes: list[state.Probe] | None = None
-    snapshot: state.AnalystSnapshot | None = None
-    messages: list[dict] | None = vapi_messages
 
-    async def load_next_q() -> None:
-        nonlocal next_q
+    async def _read(fn, *args):
         with state.session_scope(engine) as session:
-            next_q = await anyio.to_thread.run_sync(state.next_scripted, session, call_id)
+            return await anyio.to_thread.run_sync(functools.partial(fn, session, *args))
 
-    async def load_remaining() -> None:
-        nonlocal remaining
-        with state.session_scope(engine) as session:
-            remaining = await anyio.to_thread.run_sync(state.scripted_remaining, session, call_id)
-
-    async def load_probes() -> None:
-        nonlocal probes
-        with state.session_scope(engine) as session:
-            probes = await anyio.to_thread.run_sync(state.top_probes, session, call_id, 3)
-
-    async def load_snapshot() -> None:
-        nonlocal snapshot
-        with state.session_scope(engine) as session:
-            snapshot = await anyio.to_thread.run_sync(state.latest_snapshot, session, call_id)
-
-    async def load_messages() -> None:
-        nonlocal messages
-        if messages is not None:
-            return
-        with state.session_scope(engine) as session:
-            messages = await anyio.to_thread.run_sync(_db_messages_fallback, session, call_id)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(load_next_q)
-        tg.start_soon(load_remaining)
-        tg.start_soon(load_probes)
-        tg.start_soon(load_snapshot)
-        tg.start_soon(load_messages)
+    next_q, remaining, probes, snapshot = await asyncio.gather(
+        _read(state.next_scripted, call_id),
+        _read(state.scripted_remaining, call_id),
+        _read(state.top_probes, call_id, 3, current_turn - PROBE_STALENESS_TURNS),
+        _read(state.latest_snapshot, call_id),
+    )
+    messages = vapi_messages or await _read(_db_messages_fallback, call_id)
 
     reads = InterviewerContextReads(
         next_scripted_question=next_q,
@@ -178,7 +151,7 @@ async def prepare_interviewer_turn_concurrent(
         reads,
         current_turn,
         respondent_text=respondent_text,
-        vapi_messages=messages or [],
+        vapi_messages=messages,
     )
     return PreparedInterviewerTurn(
         prompt_parts=prompt_parts,
@@ -342,87 +315,60 @@ def _db_messages_fallback(session, call_id: str) -> list[dict]:
     return messages
 
 
-async def run_interviewer_with_timeout(
-    deps: InterviewerDeps,
-    respondent_text: str,
-    vapi_messages: list[dict] | None = None,
-    prepared: PreparedInterviewerTurn | None = None,
-    *,
-    budget_s: float = INTERVIEWER_BUDGET_S,
-) -> InterviewerOutput:
-    """Hard deadline wrapper. Returns a scripted fallback on timeout.
+class InterviewerStream:
+    """Streaming interviewer turn. Consume tokens() fully, then read output.
 
     Uses anyio.move_on_after instead of asyncio.wait_for — PydanticAI uses
     anyio task groups internally, and asyncio cancellation injects a cancel
     that races with anyio's stream teardown, producing ClosedResourceError.
     """
-    result: InterviewerOutput | None = None
 
-    with anyio.move_on_after(budget_s) as cancel_scope:
-        result = await run_interviewer(
-            deps,
-            respondent_text,
-            vapi_messages=vapi_messages,
-            prepared=prepared,
-        )
+    def __init__(
+        self,
+        deps: InterviewerDeps,
+        prepared: PreparedInterviewerTurn,
+        *,
+        budget_s: float = INTERVIEWER_BUDGET_S,
+    ) -> None:
+        self._deps = deps
+        self._prepared = prepared
+        self._budget_s = budget_s
+        self._output: InterviewerOutput | None = None
 
-    if cancel_scope.cancelled_caught:
-        logfire.warning("interviewer_timeout", call_id=deps.call_id, turn_number=deps.turn_number, budget_s=budget_s)
-        fallback_q = prepared.fallback_scripted_question if prepared else None
-        return _fallback(deps, fallback_scripted_question=fallback_q)
+    @property
+    def output(self) -> InterviewerOutput:
+        assert self._output is not None, "tokens() must be fully consumed before reading output"
+        return self._output
 
-    assert result is not None
-    return result
+    async def tokens(self) -> AsyncGenerator[str, None]:
+        """Yield text deltas as the utterance streams in."""
+        deps = self._deps
+        prepared = self._prepared
+        final_output: InterviewerOutput | None = None
 
+        with anyio.move_on_after(self._budget_s) as cancel_scope:
+            prev = ""
+            async with interviewer.run_stream(prepared.prompt_parts, deps=deps) as streamed:
+                async for partial in streamed.stream_output(debounce_by=None):
+                    current = partial.utterance or ""
+                    if len(current) > len(prev):
+                        yield current[len(prev):]
+                        prev = current
+                final_output = await streamed.get_output()
 
-async def stream_interviewer_utterance(
-    deps: InterviewerDeps,
-    respondent_text: str,
-    vapi_messages: list[dict] | None = None,
-    prepared: PreparedInterviewerTurn | None = None,
-    *,
-    budget_s: float = INTERVIEWER_BUDGET_S,
-) -> AsyncGenerator[str | InterviewerOutput, None]:
-    """Async generator: yields str deltas as the utterance arrives, then the
-    final InterviewerOutput as the last item for the caller to apply side effects.
+        if cancel_scope.cancelled_caught:
+            logfire.warning(
+                "interviewer_timeout",
+                call_id=deps.call_id,
+                turn_number=deps.turn_number,
+                budget_s=self._budget_s,
+            )
+            fb = _fallback(deps, fallback_scripted_question=prepared.fallback_scripted_question)
+            self._output = fb
+            yield fb.utterance
+            return
 
-    On timeout yields the fallback utterance string then the fallback output object.
-    """
-    if prepared is None:
-        assert deps.session is not None
-        prepared = prepare_interviewer_turn(
-            deps.session,
-            deps.call_id,
-            deps.turn_number,
-            respondent_text=respondent_text,
-            vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
-        )
-
-    final_output: InterviewerOutput | None = None
-
-    with anyio.move_on_after(budget_s) as cancel_scope:
-        prev = ""
-        async with interviewer.run_stream(prepared.prompt_parts, deps=deps) as streamed:
-            async for partial in streamed.stream_output(debounce_by=None):
-                current = partial.utterance or ""
-                if len(current) > len(prev):
-                    yield current[len(prev):]
-                    prev = current
-            final_output = await streamed.get_output()
-
-    if cancel_scope.cancelled_caught:
-        logfire.warning(
-            "interviewer_timeout",
-            call_id=deps.call_id,
-            turn_number=deps.turn_number,
-            budget_s=budget_s,
-        )
-        fb = _fallback(deps, fallback_scripted_question=prepared.fallback_scripted_question)
-        yield fb.utterance
-        yield fb
-        return
-
-    yield final_output
+        self._output = final_output
 
 
 def _fallback(
@@ -438,11 +384,13 @@ def _fallback(
             utterance=q,
             action="scripted",
             reasoning="fallback: agent exceeded budget; returning next scripted question",
+            is_fallback=True,
         )
     return InterviewerOutput(
         utterance="Thanks so much for your time — I think that's everything I needed.",
         action="wrap_up",
         reasoning="fallback: agent exceeded budget and no scripted questions remain",
+        is_fallback=True,
     )
 
 
@@ -509,7 +457,7 @@ def _repl() -> None:
     from tracing import agent_span, init_tracing
 
     init_tracing(send_to_logfire=False)
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not settings.anthropic_api_key:
         print("ANTHROPIC_API_KEY not set (check .env) — aborting REPL.", file=sys.stderr)
         sys.exit(2)
     engine, call_id = _seed_demo_db()
@@ -532,7 +480,7 @@ def _repl() -> None:
             )
             with agent_span("interviewer", call_id, turn_number=turn_number, respondent_text=line) as span:
                 t0 = time.perf_counter()
-                out = asyncio.run(run_interviewer_with_timeout(deps, line))
+                out = asyncio.run(run_interviewer(deps, line))
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 span.set_attribute("action", out.action)
                 span.set_attribute("utterance", out.utterance)

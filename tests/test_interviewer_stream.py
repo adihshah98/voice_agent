@@ -14,7 +14,7 @@ from voice_agent.models import InterviewerOutput
 
 
 @pytest.mark.asyncio
-async def test_stream_interviewer_utterance_uses_get_output(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_interviewer_stream_tokens_and_output(monkeypatch: pytest.MonkeyPatch) -> None:
     final = InterviewerOutput(
         utterance="What happened next?",
         action="probe",
@@ -48,13 +48,9 @@ async def test_stream_interviewer_utterance_uses_get_output(monkeypatch: pytest.
         prompt_parts=["prompt"],
         fallback_scripted_question=None,
     )
-    out = []
-    async for item in interviewer_module.stream_interviewer_utterance(
-        deps,
-        "respondent text",
-        prepared=prepared,
-    ):
-        out.append(item)
 
-    assert out == ["What ", "happened", " next?", final]
+    stream = interviewer_module.InterviewerStream(deps, prepared)
+    tokens = [tok async for tok in stream.tokens()]
 
+    assert tokens == ["What ", "happened", " next?"]
+    assert stream.output == final

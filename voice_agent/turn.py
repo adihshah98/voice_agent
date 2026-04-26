@@ -4,197 +4,155 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import Any
 
 import logfire
-
+from sqlmodel import select
 from voice_agent import state
 from voice_agent.agents.interviewer import (
+    InterviewerStream,
     prepare_interviewer_turn_concurrent,
-    run_interviewer_with_timeout,
-    stream_interviewer_utterance,
 )
 from voice_agent.models import InterviewerDeps, InterviewerOutput
-from voice_agent.tracing import agent_span
+
+
+@dataclass
+class StreamTurnResult:
+    action: str
+    reasoning: str
+    llm_latency_ms: int
+    ttft_ms: int | None
+    persist_ms: int
+    should_run_analyst: bool
 
 
 async def run_speech_turn(
     engine,
     call_id: str,
-    respondent_text: str,
     vapi_messages: list[dict] | None = None,
 ) -> dict[str, Any]:
-    """Process one respondent turn through the interviewer agent.
-
-    Returns {message, action, reasoning}.
-
-    vapi_messages: the OpenAI-formatted messages[] Vapi sends with each LLM
-    request. When provided, conversation history comes from Vapi (source of
-    truth for what was actually spoken). When None (play.py / evals), the
-    interviewer falls back to reading recent_turns from the DB.
-
-    Turn rows are NOT written here. Confirmed turns are written by the server
-    from conversation-update webhook events, which fire only after Vapi has
-    played the response — eliminating provisional/ghost turns from rapid-fire
-    utterance boundaries.
-
-    Two short sessions bracket the LLM call so SQLite is never write-locked
-    during the 5 s interviewer budget.
-    """
-    # --- Phase 1a: increment turn counter before the LLM call so the write
-    #     lock is released immediately. ---
-    with state.session_scope(engine) as session:
-        turn_number = state.next_turn_number(session, call_id)
-    logfire.info("turn_started", call_id=call_id, turn_number=turn_number)
-
-    # --- Phase 1b: read-only prep — parallel context reads in short sessions ---
-    prepared = await prepare_interviewer_turn_concurrent(
-        engine,
-        call_id,
-        turn_number,
-        respondent_text=respondent_text,
-        vapi_messages=vapi_messages,
-    )
-
-    # --- Phase 1c: run LLM with no open DB session ---
-    deps = InterviewerDeps(
-        call_id=call_id,
-        session=None,
-        turn_number=turn_number,
-    )
-    with agent_span(
-        "interviewer",
-        call_id,
-        turn_number=turn_number,
-        respondent_text=respondent_text or None,
-    ) as span:
-        t0 = time.perf_counter()
-        reply = await run_interviewer_with_timeout(deps, respondent_text, prepared=prepared)
-        latency_ms = int((time.perf_counter() - t0) * 1000)
-        is_fallback = reply.reasoning.startswith("fallback:")
-        span.set_attribute("action", reply.action)
-        span.set_attribute("utterance", reply.utterance)
-        span.set_attribute("reasoning", reply.reasoning)
-        span.set_attribute("latency_ms", latency_ms)
-        span.set_attribute("fallback", is_fallback)
-        span.set_attribute("probe_source", "analyst" if reply.probe_id_used else "interviewer" if reply.action == "probe" else None)
-
-    # --- Phase 2: apply study side-effects only (no Turn writes) ---
-    with logfire.span(
-        "turn_persist",
-        call_id=call_id,
-        turn_number=turn_number,
-        action=reply.action,
-        probe_id_used=reply.probe_id_used,
-    ):
-        with state.session_scope(engine) as session:
-            if reply.action in ("scripted", "skip_scripted"):
-                state.mark_scripted_asked(session, call_id)
-            if reply.probe_id_used is not None:
-                probe = session.get(state.Probe, reply.probe_id_used)
-                if probe is not None:
-                    lag = turn_number - (probe.generated_after_turn or 0)
-                    logfire.info(
-                        "probe_used",
-                        call_id=call_id,
-                        turn_number=turn_number,
-                        probe_id=reply.probe_id_used,
-                        probe_priority=probe.priority,
-                        analyst_lag_turns=lag,
-                    )
-                state.mark_probe_asked(session, reply.probe_id_used)
-
+    """Non-streaming turn for play.py and evals — drives TurnPipeline and buffers tokens."""
+    pipeline = TurnPipeline(engine, call_id, vapi_messages=vapi_messages)
+    message = "".join([tok async for tok in pipeline.stream_tokens()])
+    result = await pipeline.commit()
     return {
-        "message": reply.utterance,
-        "action": reply.action,
-        "reasoning": reply.reasoning,
-        "latency_ms": latency_ms,
+        "message": message,
+        "action": result.action,
+        "reasoning": result.reasoning,
+        "llm_latency_ms": result.llm_latency_ms,
+        "should_run_analyst": result.should_run_analyst,
     }
 
 
-async def run_speech_turn_stream(
-    engine,
-    call_id: str,
-    respondent_text: str,
-    vapi_messages: list[dict] | None = None,
-) -> AsyncGenerator[str | dict[str, Any], None]:
-    """Streaming variant of run_speech_turn for the SSE path.
+class TurnPipeline:
+    """Two-phase streaming turn: stream tokens first, then commit side effects.
 
-    Async generator: yields str text chunks as they arrive from the LLM,
-    then yields a single dict as the last item once side effects are applied.
-    The caller distinguishes by isinstance.
+    Usage:
+        pipeline = TurnPipeline(engine, call_id, vapi_messages)
+        async for token in pipeline.stream_tokens():
+            ...send token to client...
+        result = await pipeline.commit()
     """
-    with state.session_scope(engine) as session:
-        turn_number = state.next_turn_number(session, call_id)
-    logfire.info("turn_started", call_id=call_id, turn_number=turn_number)
 
-    t0 = time.perf_counter()
-    first_token_ms: int | None = None
+    def __init__(self, engine: Any, call_id: str, vapi_messages: list[dict] | None = None) -> None:
+        self._engine = engine
+        self._call_id = call_id
+        self._vapi_messages = vapi_messages
+        self._reply: InterviewerOutput | None = None
+        self._turn_number: int = 0
+        self._respondent_text: str = ""
+        self._llm_latency_ms: int = 0
+        self._first_token_ms: int | None = None
 
-    prepared = await prepare_interviewer_turn_concurrent(
-        engine,
-        call_id,
-        turn_number,
-        respondent_text=respondent_text,
-        vapi_messages=vapi_messages,
-    )
+    async def stream_tokens(self) -> AsyncGenerator[str, None]:
+        """Yield LLM text tokens as they arrive. Must be fully consumed before commit()."""
+        call_id = self._call_id
+        vapi_messages = self._vapi_messages
 
-    deps = InterviewerDeps(call_id=call_id, session=None, turn_number=turn_number)
-    gen = stream_interviewer_utterance(
-        deps,
-        respondent_text,
-        prepared=prepared,
-    )
+        last = vapi_messages[-1] if vapi_messages else None
+        respondent_text = last.get("content", "") if last and last.get("role") == "user" else ""
+        self._respondent_text = respondent_text
 
-    reply: InterviewerOutput | None = None
-    async for item in gen:
-        if isinstance(item, str):
-            if first_token_ms is None:
-                first_token_ms = int((time.perf_counter() - t0) * 1000)
+        with state.session_scope(self._engine) as session:
+            self._turn_number = state.next_turn_number(session, call_id)
+        logfire.info("turn_started", call_id=call_id, turn_number=self._turn_number)
+
+        with logfire.span("interviewer_db_prep", call_id=call_id, turn_number=self._turn_number):
+            prepared = await prepare_interviewer_turn_concurrent(
+                self._engine,
+                call_id,
+                self._turn_number,
+                respondent_text=respondent_text,
+                vapi_messages=vapi_messages,
+            )
+
+        deps = InterviewerDeps(call_id=call_id, session=None, turn_number=self._turn_number)
+        stream = InterviewerStream(deps, prepared)
+
+        t0 = time.perf_counter()
+        async for token in stream.tokens():
+            if self._first_token_ms is None:
+                self._first_token_ms = int((time.perf_counter() - t0) * 1000)
                 logfire.info(
                     "interviewer_first_token",
                     call_id=call_id,
-                    turn_number=turn_number,
-                    ttft_ms=first_token_ms,
+                    turn_number=self._turn_number,
+                    ttft_ms=self._first_token_ms,
                 )
-            yield item
-        else:
-            reply = item
+            yield token
+        self._reply = stream.output
 
-    assert reply is not None
-    llm_latency_ms = int((time.perf_counter() - t0) * 1000)
+        assert self._reply is not None
+        self._llm_latency_ms = int((time.perf_counter() - t0) * 1000)
+        logfire.info(
+            "interviewer_stream_done",
+            call_id=call_id,
+            turn_number=self._turn_number,
+            action=self._reply.action,
+            utterance=self._reply.utterance,
+            reasoning=self._reply.reasoning,
+            llm_latency_ms=self._llm_latency_ms,
+            ttft_ms=self._first_token_ms,
+            fallback=self._reply.is_fallback,
+            probe_source="analyst" if self._reply.probe_id_used else "interviewer" if self._reply.action == "probe" else None,
+        )
 
-    logfire.info(
-        "interviewer_stream_done",
-        call_id=call_id,
-        turn_number=turn_number,
-        action=reply.action,
-        utterance=reply.utterance,
-        reasoning=reply.reasoning,
-        llm_latency_ms=llm_latency_ms,
-        ttft_ms=first_token_ms,
-        fallback=reply.reasoning.startswith("fallback:"),
-        probe_source="analyst" if reply.probe_id_used else "interviewer" if reply.action == "probe" else None,
-    )
+    async def commit(self) -> StreamTurnResult:
+        """Persist side effects after stream_tokens() is fully consumed."""
+        assert self._reply is not None, "commit() called before stream_tokens() completed"
+        reply = self._reply
+        call_id = self._call_id
+        vapi_messages = self._vapi_messages
+        turn_number = self._turn_number
 
-    persist_t0 = time.perf_counter()
-    with logfire.span("turn_persist", call_id=call_id, turn_number=turn_number, action=reply.action, probe_id_used=reply.probe_id_used):
-        with state.session_scope(engine) as session:
-            if reply.action in ("scripted", "skip_scripted"):
-                state.mark_scripted_asked(session, call_id)
-            if reply.probe_id_used is not None:
-                probe = session.get(state.Probe, reply.probe_id_used)
-                if probe is not None:
-                    lag = turn_number - (probe.generated_after_turn or 0)
-                    logfire.info("probe_used", call_id=call_id, turn_number=turn_number, probe_id=reply.probe_id_used, probe_priority=probe.priority, analyst_lag_turns=lag)
-                state.mark_probe_asked(session, reply.probe_id_used)
-    persist_ms = int((time.perf_counter() - persist_t0) * 1000)
+        persist_t0 = time.perf_counter()
+        should_run_analyst = False
+        with logfire.span("turn_persist", call_id=call_id, turn_number=turn_number, action=reply.action, probe_id_used=reply.probe_id_used):
+            with state.session_scope(self._engine) as session:
+                if reply.action in ("scripted", "skip_scripted"):
+                    state.mark_scripted_asked(session, call_id)
+                if reply.probe_id_used is not None:
+                    probe = session.get(state.Probe, reply.probe_id_used)
+                    if probe is not None:
+                        lag = turn_number - (probe.generated_after_turn or 0)
+                        logfire.info("probe_used", call_id=call_id, turn_number=turn_number, probe_id=reply.probe_id_used, probe_priority=probe.priority, analyst_lag_turns=lag)
+                    state.mark_probe_asked(session, reply.probe_id_used)
 
-    yield {
-        "action": reply.action,
-        "reasoning": reply.reasoning,
-        "latency_ms": llm_latency_ms,
-        "llm_latency_ms": llm_latency_ms,
-        "ttft_ms": first_token_ms,
-        "persist_ms": persist_ms,
-    }
+                if vapi_messages is not None:
+                    next_num = turn_number
+                    if self._respondent_text:
+                        session.add(state.Turn(call_id=call_id, turn_number=next_num, speaker="respondent", text=self._respondent_text))
+                        next_num += 1
+                    session.add(state.Turn(call_id=call_id, turn_number=next_num, speaker="interviewer", text=reply.utterance))
+                    should_run_analyst = state.should_run_analyst(session, call_id)
+        persist_ms = int((time.perf_counter() - persist_t0) * 1000)
+
+        return StreamTurnResult(
+            action=reply.action,
+            reasoning=reply.reasoning,
+            llm_latency_ms=self._llm_latency_ms,
+            ttft_ms=self._first_token_ms,
+            persist_ms=persist_ms,
+            should_run_analyst=should_run_analyst,
+        )

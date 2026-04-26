@@ -7,7 +7,7 @@ the LLM and evals, not persistence shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 from sqlmodel import Session
@@ -45,6 +45,10 @@ class InterviewerOutput(BaseModel):
         default=None,
         description="The id of the PENDING_PROBE used, if action=probe. Must match exactly.",
     )
+    is_fallback: bool = Field(
+        default=False,
+        description="True when returned by the timeout fallback path, not the LLM.",
+    )
 
 
 # --- Analyst ---------------------------------------------------------------
@@ -53,7 +57,7 @@ class InterviewerOutput(BaseModel):
 @dataclass
 class AnalystDeps:
     call_id: str
-    session: Session
+    engine: Any
 
 
 class NewProbe(BaseModel):

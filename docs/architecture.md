@@ -59,6 +59,85 @@ An AI-powered outbound interviewer that conducts structured investor/user resear
 
 ---
 
+## Vapi Server Events
+
+**1.** `speech-update` 
+
+The `speech-update` event fires when speaking starts or stops for either the user or the assistant **[1](https://docs.vapi.ai/server-url/events)**:
+
+```
+
+```
+
+
+|                                      |
+| ------------------------------------ |
+| {                                    |
+| "message": {                         |
+| "type": "speech-update",             |
+| "status": "started", // or "stopped" |
+| "role": "assistant", // or "user"    |
+| "turn": 2                            |
+| }                                    |
+| }                                    |
+
+
+**2.** `conversation-update` **—** 
+
+Basically when the speech is detected & written down to Vapi msg history. The `conversation-update` event is sent when an update is committed to the conversation history. This is fired pretty much per speech-update (let's say user pauses in middle, and restarts, this will be two speech updates & 2 conversation updates too) :
+
+```
+
+```
+
+
+|                                                                |
+| -------------------------------------------------------------- |
+| {                                                              |
+| "message": {                                                   |
+| "type": "conversation-update",                                 |
+| "messages": [ /* current conversation messages */ ],           |
+| "messagesOpenAIFormatted": [ /* openai-formatted messages */ ] |
+| }                                                              |
+| }                                                              |
+
+
+The key nuance: it fires when *any* update is committed to the history — this includes user messages, assistant messages, tool call results, and system messages. It's not strictly one event per user turn and one per AI turn; it reflects the full conversation state at the time of the commit.
+
+
+|                                                        |
+| ------------------------------------------------------ |
+| User speaks                                            |
+| → speech-update (role: "user", status: "started")      |
+| → speech-update (role: "user", status: "stopped")      |
+| → [Endpointing evaluates completion]                   |
+| → LLM called                                           |
+| → conversation-update (user message committed)         |
+| → speech-update (role: "assistant", status: "started") |
+| → conversation-update (assistant message committed)    |
+| → speech-update (role: "assistant", status: "stopped") |
+
+
+The ordering of `conversation-update` relative to `speech-update` can vary slightly depending on when Vapi commits each message to history.
+
+**3. LLM called after endpointing** 
+
+The LLM is called immediately after the endpointing system determines the user has finished speaking. The pipeline is **[2](https://docs.vapi.ai/customization/voice-pipeline-configuration)**:
+
+```
+
+```
+
+
+|                                                                                                                                               |
+| --------------------------------------------------------------------------------------------------------------------------------------------- |
+| User stops speaking → VAD detects utterance-stop → Endpointing decision → LLM request sent immediately → TTS → waitSeconds → Assistant speaks |
+
+
+The endpointing decision itself can be driven by smart endpointing (AI-based), transcription-based heuristics, or custom rules — but yes, the LLM is only invoked once Vapi is confident the turn is complete.
+
+Vapi sends `messagesOpenAIFormatted` to the LLM endpoint, which enforces OpenAI's strict alternating user/assistant requirement — so Vapi concatenates consecutive same-role segments into one. The `conversation-update` webhook sends the raw native format, preserving every VAD pause boundary as a separate entry.
+
 ## The Three Agents
 
 All three are PydanticAI agents with Anthropic backends. Models and flags live in `[voice_agent/config.py](../voice_agent/config.py)` — nothing else needs to change when swapping a model.
@@ -386,6 +465,4 @@ LLM judge model: `claude-opus-4-6` (defined in `evals/evaluators.py`).
 
 
 ---
-
-
 

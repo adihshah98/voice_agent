@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     "sqlmodel>=0.0.22",
     "pydantic>=2.7",
+    "pydantic-settings>=2.0",
     "logfire[httpx,fastapi,sqlalchemy]>=4.0",
     "pydantic-ai-slim[anthropic]>=1.0",
     "pydantic-evals>=1.0",

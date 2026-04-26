@@ -11,11 +11,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, update
+from sqlalchemy import Column
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
 from sqlalchemy.pool import NullPool, StaticPool
-from sqlmodel import Field, Relationship, Session, SQLModel, create_engine, select
+from sqlmodel import Field, Relationship, Session, SQLModel, create_engine, func, select
 
 
 def _utcnow() -> datetime:
@@ -30,7 +30,6 @@ class Call(SQLModel, table=True):
     phone_number: Optional[str] = None
     scripted_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     scripted_cursor: int = Field(default=0)
-    turn_count: int = Field(default=0)
     status: str = Field(default="pending")  # pending|active|ended
     end_reason: Optional[str] = None
     started_at: datetime = Field(default_factory=_utcnow)
@@ -171,7 +170,7 @@ def init_db(engine) -> None:
 
 @contextmanager
 def session_scope(engine) -> Iterator[Session]:
-    session = Session(engine)
+    session = Session(engine, expire_on_commit=False)
     try:
         yield session
         session.commit()
@@ -186,20 +185,8 @@ def session_scope(engine) -> Iterator[Session]:
 
 
 def next_turn_number(session: Session, call_id: str) -> int:
-    """Atomically increment turn_count and return the new value.
-
-    Using UPDATE + RETURNING avoids the SELECT max() race where two concurrent
-    requests read the same max and assign duplicate turn numbers.
-    """
-    result = session.exec(
-        update(Call)
-        .where(Call.id == call_id)
-        .values(turn_count=Call.turn_count + 1)
-        .returning(Call.turn_count)
-    )
-    row = result.one()
-    # SQLAlchemy returns a Row for RETURNING, not a bare int.
-    return int(row[0])
+    """Return COUNT(turns for this call) + 1 — the turn_number of the next utterance to be written."""
+    return session.exec(select(func.count()).where(Turn.call_id == call_id)).one() + 1
 
 
 def next_scripted(session: Session, call_id: str) -> Optional[str]:
@@ -224,10 +211,14 @@ def mark_scripted_asked(session: Session, call_id: str) -> None:
     session.add(call)
 
 
-def top_probes(session: Session, call_id: str, n: int = 3) -> list[Probe]:
+def top_probes(session: Session, call_id: str, n: int = 3, min_turn: int = 0) -> list[Probe]:
     stmt = (
         select(Probe)
-        .where(Probe.call_id == call_id, Probe.asked == False)  # noqa: E712
+        .where(
+            Probe.call_id == call_id,
+            Probe.asked == False,  # noqa: E712
+            (Probe.generated_after_turn == None) | (Probe.generated_after_turn >= min_turn),  # noqa: E711
+        )
         .order_by(Probe.priority.asc(), Probe.created_at.asc())
         .limit(n)
     )
@@ -263,13 +254,26 @@ ANALYST_TURN_INTERVAL = 25
 
 
 def should_run_analyst(session: Session, call_id: str) -> bool:
-    """True when a scripted question was just answered OR >= 25 turns have passed since last run."""
+    """True when a scripted question was just answered OR >= 25 exchanges have passed since last run.
+
+    Counts interviewer (bot) turns since the last snapshot, not call.turn_count, because Vapi
+    can split one user utterance into multiple Turn rows at pauses — counting bot rows gives
+    exactly one count per complete exchange regardless of how the user's speech was segmented.
+    """
     call = session.get(Call, call_id)
     if call is None:
         return False
     snapshot = latest_snapshot(session, call_id)
     scripted_advanced = call.scripted_cursor > (snapshot.after_scripted_cursor if snapshot else 0)
-    turns_elapsed = call.turn_count - (snapshot.after_turn if snapshot else 0) >= ANALYST_TURN_INTERVAL
+    after_turn = snapshot.after_turn if snapshot else 0
+    exchanges_since = session.exec(
+        select(func.count()).where(
+            Turn.call_id == call_id,
+            Turn.turn_number > after_turn,
+            Turn.speaker == "interviewer",
+        )
+    ).one()
+    turns_elapsed = exchanges_since >= ANALYST_TURN_INTERVAL
     return scripted_advanced or turns_elapsed
 
 

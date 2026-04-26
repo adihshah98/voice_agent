@@ -1,8 +1,55 @@
 """Central model and runtime configuration.
 
-Single source of truth for model IDs, latency budgets, and scheduling knobs.
+Single source of truth for model IDs, latency budgets, scheduling knobs, and env settings.
 Swap a model here — nothing else changes.
 """
+
+from __future__ import annotations
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    # Core
+    anthropic_api_key: str | None = None  # validated by Anthropic SDK at call time
+    database_url: str = "sqlite:///voice_agent.db"
+
+    # Logfire (no token = console output only)
+    logfire_token: str | None = None
+    logfire_project: str = "research-agent"
+    logfire_project_path: str | None = None  # falls back to logfire_project
+
+    # Vapi (all optional — empty means local simulation only)
+    vapi_api_key: str = ""
+    vapi_phone_number_id: str = ""
+    webhook_url: str = ""
+
+    # Voice
+    vapi_voice_provider: str = "11labs"
+    vapi_voice_id: str | None = None  # default depends on provider
+    vapi_voice_stability: float | None = None
+    vapi_voice_similarity_boost: float | None = None
+    vapi_voice_style: float | None = None
+    vapi_voice_speed: float | None = None
+
+    # Dev
+    log_level: str = "INFO"
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    @field_validator("vapi_voice_provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, v: str) -> str:
+        stripped = str(v).strip().lower()
+        return stripped if stripped else "11labs"
+
+    @property
+    def effective_logfire_project_path(self) -> str:
+        return self.logfire_project_path or self.logfire_project
+
+
+settings = Settings()
 
 # Models
 INTERVIEWER_MODEL = "anthropic:claude-haiku-4-5-20251001"  # real-time, latency-critical

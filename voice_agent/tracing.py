@@ -1,9 +1,10 @@
 """Logfire configuration + span helpers.
 
-`init_tracing()` is the single entry point — webhook/eval/replay all call it
-once at startup. Instrumentation for optional deps (fastapi, pydantic_ai, etc.)
-is attempted best-effort so this module is safe to import before those
-packages land.
+`init_tracing()` is the single entry point — webhook, eval, and replay all call
+it. Core Logfire + pydantic/httpx are configured once; `instrument_fastapi` /
+`instrument_sqlalchemy` run on the first `init_tracing` that supplies `app` or
+`engine` so a prior call without them does not block later server/play wiring.
+Optional deps are skipped when not installed.
 
 Every span that matters should carry `call_id` + `turn_number` so Logfire can
 slice by call or by turn. Use `agent_span(...)` to get that for free.
@@ -11,15 +12,20 @@ slice by call or by turn. Use `agent_span(...)` to get that for free.
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import Any, Iterator, Optional
 
 import logfire
+from voice_agent.config import settings
 
-
-_configured = False
+# Logfire.configure and pydantic/httpx are one-time; FastAPI and SQLAlchemy
+# are attached on first `init_tracing` that passes `app` / `engine` so a
+# `send_to_logfire=False` test init does not block later `instrument_fastapi`
+# when `voice_agent.server` (or `scripts.play`) is imported in the same process.
+_logfire_core = False
+_fastapi_instrumented = False
+_sqlalchemy_instrumented = False
 
 
 def init_tracing(
@@ -32,9 +38,10 @@ def init_tracing(
 ) -> None:
     """Configure Logfire and attach auto-instrumentation.
 
-    Idempotent — safe to call from multiple entrypoints. Instrumentation for
-    optional deps is skipped silently when the dep isn't installed so this
-    doesn't break early in the build order.
+    Safe to call multiple times: `logfire.configure` and pydantic/httpx are
+    applied once. FastAPI and SQLAlchemy are each applied at most once, when
+    `app` or `engine` is first provided. Optional deps are skipped if not
+    installed.
 
     `send_to_logfire`:
       - None   → honor LOGFIRE_TOKEN env (default Logfire behaviour).
@@ -45,44 +52,46 @@ def init_tracing(
       - None   → off when exporting to Logfire (token set or send_to_logfire
         True); on when local-only (no export). Pass True/False to override.
     """
-    global _configured
-    if _configured:
-        return
+    global _logfire_core, _fastapi_instrumented, _sqlalchemy_instrumented
 
-    if find_spec("dotenv") is not None:
-        from dotenv import load_dotenv
-        load_dotenv()
+    if not _logfire_core:
+        if find_spec("dotenv") is not None:
+            from dotenv import load_dotenv
+            load_dotenv()
 
-    effective_send = send_to_logfire
-    if effective_send is None and not os.getenv("LOGFIRE_TOKEN"):
-        effective_send = False
+        effective_send = send_to_logfire
+        if effective_send is None and not settings.logfire_token:
+            effective_send = False
 
-    if send_to_logfire is False:
-        exports_to_logfire = False
-    elif send_to_logfire is True:
-        exports_to_logfire = True
-    else:
-        exports_to_logfire = bool(os.getenv("LOGFIRE_TOKEN"))
+        if send_to_logfire is False:
+            exports_to_logfire = False
+        elif send_to_logfire is True:
+            exports_to_logfire = True
+        else:
+            exports_to_logfire = bool(settings.logfire_token)
 
-    if console is None:
-        console = not exports_to_logfire
+        if console is None:
+            console = not exports_to_logfire
 
-    logfire.configure(
-        service_name=service_name,
-        send_to_logfire=effective_send,
-        console=logfire.ConsoleOptions() if console else False,
-    )
+        logfire.configure(
+            service_name=service_name,
+            send_to_logfire=effective_send,
+            console=logfire.ConsoleOptions(min_log_level="debug") if console else False,
+        )
 
-    if find_spec("pydantic_ai") is not None:
-        logfire.instrument_pydantic_ai()
-    if find_spec("httpx") is not None:
-        logfire.instrument_httpx()
-    if app is not None and find_spec("fastapi") is not None:
+        if find_spec("pydantic_ai") is not None:
+            logfire.instrument_pydantic_ai()
+        if find_spec("httpx") is not None:
+            logfire.instrument_httpx()
+        _logfire_core = True
+
+    if not _fastapi_instrumented and app is not None and find_spec("fastapi") is not None:
         logfire.instrument_fastapi(app)
-    if engine is not None:
-        logfire.instrument_sqlalchemy(engine=engine)
+        _fastapi_instrumented = True
 
-    _configured = True
+    if not _sqlalchemy_instrumented and engine is not None:
+        logfire.instrument_sqlalchemy(engine=engine)
+        _sqlalchemy_instrumented = True
 
 
 # --- Span helpers ----------------------------------------------------------
