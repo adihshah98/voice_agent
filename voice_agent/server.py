@@ -38,6 +38,15 @@ LOGFIRE_BASE_URL = "https://logfire.pydantic.dev"
 
 engine = state.make_engine(settings.database_url)
 
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire(coro, *, name: str | None = None) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,13 +72,16 @@ def _end_call_on_error(call_id: str) -> None:
                 session.add(call)
         if vapi_call_id and settings.vapi_api_key:
             async def _delete():
-                async with httpx.AsyncClient() as client:
-                    await client.delete(
-                        f"https://api.vapi.ai/call/{vapi_call_id}",
-                        headers={"Authorization": f"Bearer {settings.vapi_api_key}"},
-                        timeout=5,
-                    )
-            asyncio.create_task(_delete())
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.delete(
+                            f"https://api.vapi.ai/call/{vapi_call_id}",
+                            headers={"Authorization": f"Bearer {settings.vapi_api_key}"},
+                            timeout=5,
+                        )
+                except Exception:
+                    logfire.exception("vapi_delete_call_failed", vapi_call_id=vapi_call_id)
+            _fire(_delete(), name="vapi-delete-call")
     except Exception:
         logfire.exception("end_call_on_error_failed", call_id=call_id)
 
@@ -108,15 +120,13 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 
 
 async def _synthesis_task(call_id: str) -> None:
-    session = Session(engine)
     try:
         with agent_span("synthesis", call_id):
-            deps = SynthesisDeps(call_id=call_id, session=session)
-            await _synthesis_safely(deps)
+            with state.session_scope(engine) as session:
+                deps = SynthesisDeps(call_id=call_id, session=session)
+                await _synthesis_safely(deps)
     except Exception:
         logfire.exception("synthesis_task_error", call_id=call_id)
-    finally:
-        session.close()
 
 
 async def _analyst_task(call_id: str) -> None:
@@ -255,7 +265,7 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 probe_utilization_pct=round(100 * probes_asked / probes_total) if probes_total else None,
             )
             if ENABLE_SYNTHESIS_REPORT:
-                asyncio.create_task(_synthesis_task(call_id))
+                _fire(_synthesis_task(call_id), name=f"synthesis-{call_id}")
             else:
                 logfire.info("synthesis_skipped", call_id=call_id, reason="ENABLE_SYNTHESIS_REPORT=false")
             return {}
@@ -455,7 +465,7 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
                     if result.ttft_ms is not None:
                         req_span.set_attribute("ttft_ms", result.ttft_ms)
                     if result.should_run_analyst:
-                        asyncio.create_task(_analyst_task(call_id))
+                        _fire(_analyst_task(call_id), name=f"analyst-{call_id}")
                 except asyncio.CancelledError:
                     stream_cancelled = True
                     logfire.info(

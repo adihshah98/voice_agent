@@ -103,7 +103,8 @@ class TurnPipeline:
             yield token
         self._reply = stream.output
 
-        assert self._reply is not None
+        if self._reply is None:
+            raise RuntimeError("InterviewerStream produced no output")
         self._llm_latency_ms = int((time.perf_counter() - t0) * 1000)
         logfire.info(
             "interviewer_stream_done",
@@ -120,7 +121,8 @@ class TurnPipeline:
 
     async def commit(self) -> StreamTurnResult:
         """Persist side effects after stream_tokens() is fully consumed."""
-        assert self._reply is not None, "commit() called before stream_tokens() completed"
+        if self._reply is None:
+            raise RuntimeError("commit() called before stream_tokens() completed")
         reply = self._reply
         call_id = self._call_id
         vapi_messages = self._vapi_messages
