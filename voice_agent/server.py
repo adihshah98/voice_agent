@@ -40,6 +40,10 @@ engine = state.make_engine(settings.database_url)
 
 _background_tasks: set[asyncio.Task] = set()
 
+# Per-call speech timing for latency instrumentation.
+# Keyed by call_id; cleaned up on end-of-call-report.
+_speech_ts: dict[str, dict[str, Any]] = {}
+
 
 def _fire(coro, *, name: str | None = None) -> asyncio.Task:
     task = asyncio.create_task(coro, name=name)
@@ -127,6 +131,26 @@ async def _synthesis_task(call_id: str) -> None:
                 await _synthesis_safely(deps)
     except Exception:
         logfire.exception("synthesis_task_error", call_id=call_id)
+
+
+async def _warmup_groq() -> None:
+    """Fire a minimal Groq request so llama is loaded onto a GPU before the first real user turn.
+
+    Groq de-allocates models after ~20 min of inactivity. The first request to a cold
+    model is unstable (structured output fails). This throwaway completion warms it up
+    while the assistant is still delivering its greeting message.
+    """
+    try:
+        import groq as groq_sdk
+        client = groq_sdk.AsyncGroq()
+        await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+        logfire.debug("groq_warmup_done")
+    except Exception:
+        logfire.debug("groq_warmup_failed")  # best-effort, never affects the call
 
 
 async def _analyst_task(call_id: str) -> None:
@@ -233,6 +257,7 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                         call.status = "active"
                         session.add(call)
                         logfire.info("call_activated", call_id=call_id, vapi_call_id=vapi_call_id)
+                        _fire(_warmup_groq(), name="groq-warmup")
             return {}
 
         if event_type == "end-of-call-report":
@@ -255,6 +280,27 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 else:
                     logfire.warning("end_of_call_unknown_call_id", call_id=call_id)
                     return {}
+            _speech_ts.pop(call_id, None)
+
+            # Extract Vapi's per-turn TurnLatency breakdown (seconds → ms).
+            # Path: message.call.analysis.performanceMetrics.turnLatencies
+            call_analysis = (msg.get("call") or {}).get("analysis") or {}
+            perf = call_analysis.get("performanceMetrics") or {}
+            turn_latencies: list[dict] = perf.get("turnLatencies") or []
+            vapi_latency: dict[str, Any] = {}
+            if turn_latencies:
+                def _avg_ms(field: str) -> int:
+                    vals = [t[field] for t in turn_latencies if field in t]
+                    return round(sum(vals) / len(vals) * 1000) if vals else 0
+                vapi_latency = {
+                    "vapi_turns": len(turn_latencies),
+                    "vapi_endpointing_ms_avg": _avg_ms("endpointingLatency"),
+                    "vapi_stt_ms_avg": _avg_ms("transcriberLatency"),
+                    "vapi_llm_ms_avg": _avg_ms("modelLatency"),
+                    "vapi_tts_ms_avg": _avg_ms("voiceLatency"),
+                    "vapi_turn_ms_avg": _avg_ms("turnLatency"),
+                }
+
             logfire.info(
                 "call_ended",
                 call_id=call_id,
@@ -263,6 +309,7 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 probes_asked=probes_asked,
                 probes_total=probes_total,
                 probe_utilization_pct=round(100 * probes_asked / probes_total) if probes_total else None,
+                **vapi_latency,
             )
             if ENABLE_SYNTHESIS_REPORT:
                 _fire(_synthesis_task(call_id), name=f"synthesis-{call_id}")
@@ -271,14 +318,39 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
             return {}
 
         if event_type == "speech-update":
+            role = msg.get("role")
+            status = msg.get("status")
+            vapi_turn = msg.get("turn")
+            now = time.time()
+            turnaround_ms: int | None = None
+            tts_duration_ms: int | None = None
+
+            if call_id:
+                entry = _speech_ts.setdefault(call_id, {})
+                if role == "user" and status == "stopped":
+                    entry["user_stopped_at"] = now
+                    entry["user_stopped_turn"] = vapi_turn
+                elif role == "assistant" and status == "started":
+                    user_stopped = entry.get("user_stopped_at")
+                    if user_stopped is not None:
+                        turnaround_ms = int((now - user_stopped) * 1000)
+                    entry["assistant_started_at"] = now
+                elif role == "assistant" and status == "stopped":
+                    assistant_started = entry.get("assistant_started_at")
+                    if assistant_started is not None:
+                        tts_duration_ms = int((now - assistant_started) * 1000)
+                    entry.pop("assistant_started_at", None)
+
             logfire.info(
                 "vapi_speech_update",
                 call_id=call_id,
                 vapi_call_id=vapi_call_id,
-                status=msg.get("status"),
-                role=msg.get("role"),
-                turn=msg.get("turn"),
-                tts_started=(msg.get("role") == "assistant" and msg.get("status") == "started"),
+                status=status,
+                role=role,
+                turn=vapi_turn,
+                tts_started=(role == "assistant" and status == "started"),
+                turnaround_ms=turnaround_ms,
+                tts_duration_ms=tts_duration_ms,
             )
             return {}
 
@@ -446,12 +518,20 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
             chunk = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": fallback}, "finish_reason": None}]}
             yield f"data: {json.dumps(chunk)}\n\n"
         else:
+            # Time from Vapi's "user stopped speaking" webhook to this LLM call —
+            # captures STT transcription + endpointing delay as seen from our server.
+            stt_endpointing_ms: int | None = None
+            entry = _speech_ts.get(call_id, {})
+            if "user_stopped_at" in entry:
+                stt_endpointing_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
+
             with logfire.span(
-                "vapi_llm_request",
-                call_id=call_id,
-                vapi_call_id=vapi_call_id,
-                message_count=len(messages),
-            ) as req_span:
+                    "vapi_llm_request",
+                    call_id=call_id,
+                    vapi_call_id=vapi_call_id,
+                    message_count=len(messages),
+                    stt_endpointing_ms=stt_endpointing_ms,
+                ) as req_span:
                 reply_chars = 0
                 pipeline = TurnPipeline(engine, call_id, vapi_messages=messages)
                 try:
@@ -529,13 +609,15 @@ async def delete_call(request: Request, call_id: str) -> dict[str, str]:
 # --- Vapi dial-out helper ---------------
 
 
-def _vapi_assistant_voice() -> dict[str, Any]:
+def _build_voice_config() -> dict[str, Any]:
     provider = settings.vapi_voice_provider
     if not settings.vapi_voice_id:
         raise ValueError("VAPI_VOICE_ID must be set in .env")
     voice: dict[str, Any] = {"provider": provider, "voiceId": settings.vapi_voice_id}
     if provider != "11labs":
         return voice
+    if settings.vapi_voice_model:
+        voice["model"] = settings.vapi_voice_model
     for json_key, value in (
         ("stability", settings.vapi_voice_stability),
         ("similarityBoost", settings.vapi_voice_similarity_boost),
@@ -545,6 +627,30 @@ def _vapi_assistant_voice() -> dict[str, Any]:
         if value is not None:
             voice[json_key] = value
     return voice
+
+
+def _build_start_speaking_plan() -> dict[str, Any]:
+    return {
+        "smartEndpointingPlan": {"provider": "livekit"},
+        "transcriptionEndpointingPlan": {
+            "onPunctuationSeconds": 0.2,
+            "onNoPunctuationSeconds": 0.8,
+            "onNumberSeconds": 0.5,
+        },
+        "waitSeconds": settings.vapi_wait_seconds,
+    }
+
+
+def _build_stop_speaking_plan() -> dict[str, Any]:
+    return {
+        "numWords": settings.vapi_stop_num_words,
+        "backoffSeconds": settings.vapi_stop_backoff_seconds,
+        "acknowledgementPhrases": [
+            "hmm", "mm-hmm", "yeah", "yes", "okay", "ok",
+            "right", "uh-huh", "sure", "got it", "I see",
+            "totally", "absolutely", "interesting",
+        ],
+    }
 
 
 async def _dial_vapi(call_id: str, phone_number: str) -> None:
@@ -570,10 +676,13 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
                 "url": f"{settings.webhook_url}/vapi/webhook",
                 **({"credentialId": settings.vapi_server_credential_id} if settings.vapi_server_credential_id else {}),
             },
-            "voice": _vapi_assistant_voice(),
-            "transcriber": {"provider": "deepgram", "model": "nova-2", "language": "en"},
+            "voice": _build_voice_config(),
+            "transcriber": {"provider": "deepgram", "model": "nova-3", "language": "en"},
+            "startSpeakingPlan": _build_start_speaking_plan(),
+            "stopSpeakingPlan": _build_stop_speaking_plan(),
             "firstMessage": "Hey! Thank you for getting on the call — just want to check if you can hear me before we get started.",
             "firstMessageMode": "assistant-speaks-first",
+            "maxDurationSeconds": 1800,
             "metadata": {"call_id": call_id},
         },
     }

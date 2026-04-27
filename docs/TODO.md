@@ -7,32 +7,25 @@
 
 ## My questions/Future improvements
 
-- Cleanups
-  - `asyncio.create_task` **without task reference** — [server.py:193](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L193) and [server.py:230](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L230) fire tasks but hold no reference. CPython may GC the task before it finishes, and any exception escaping the outer `try/except` (e.g., from `agent_span` itself) disappears silently. Standard fix is a module-level `_background_tasks: set[asyncio.Task]` and adding a `task.add_done_callback(_background_tasks.discard)`
-  - `assert` **in hot path** — [turn.py:164](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/turn.py#L164): `assert reply is not None`. Asserts are disabled with `-O` and produce an ugly `AssertionError` in prod rather than a handled failure. The stream generator does always yield a final output, but this should be a proper guard.
-  - `_synthesis_task` **still uses bare** `Session` — [server.py:71](vscode-webview://1cs7h1ek6q7ovmprtg9bdot95jcsuqacgmkkvsp9dsk6pmgl8fem/voice_agent/server.py#L71). We fixed `_analyst_task` to use `session_scope` last session; `_synthesis_task` is still inconsistent — bare session, no rollback on failure.
-- Voice Nuances/Vapi Config
-  - Barge in etc.
-  - Gate LLM calls till final-transcript (more chatlike)
-  - Debounce partial updates (Wait 500ms of silence before triggering LLM)
-  - Reduce ASR chunk frequency
-  - See how to modify Vapi config
-  - If the respondent says hmm, or yes - it shouldn't stop
-  - If responder is taking time to think, it shoudn't interrupt/know when to interrupt
-  - If it asks for name, it should not give it. But make the transition back to the question smoother
-- TTS
-  - Right now, it's too fake sounding
-  - vapi_assistant_voice - fix when we do the TTS stuff. Write now config code is a bit messy/split across Vapi & 11Labs
-- Logging
-  - Should we be logging more stuff so if it fails, you can see it. Also log instead of trace?
+- Voice UX (Done)
+  - Added `_build_start_speaking_plan()` — LiveKit smart endpointing + transcription fallback timings
+  - Added `_build_stop_speaking_plan()` — acknowledgement phrases + barge-in word threshold
+  - Upgraded Deepgram `nova-2` → `nova-3` (faster + more accurate on phone audio)
+  - Added support for pauses
+  - Flash model
+  - Grow instead of Haiku
+- Voice UX
+  - **Anthropic Caching? How will it work with llama**
+  - **Filler audio** ("Give me a moment...") — needs pre-recorded clips + Vapi audio injection
+  - **LiveKit full barge-in control** — only if Vapi's built-in config is insufficient
+  - **Deepgram Flux** — better end-of-turn scoring but requires transcriber swap
+  - End of call measurement for each subpart of latency
+  - Still has latency issues --> Maybe because of the EoS detection? Still 2s
 - Multi-tenant 
   - See, eventual goal is per customer, per call, per project level configurabilityt across many customers. Design keeping that in midn
     - Tell it it is diligencing which product
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default
-- Synthesis Report
-  - Reinstate synthesis report once this works
-  - Maybe use async queues for this (learn to use async queues either way)
 - Conversation Trajectory
   - Make sure it asks everything
   - Make sure it probes at the correct depth
@@ -43,6 +36,8 @@
   - Live Observability
     - No per-call cost tracking (input/output tokens × rate).
     - No alerting on `vapi_unknown_call` or `vapi_dial_error` — they just log.
+  - Logging
+    - Should we be logging more stuff so if it fails, you can see it. Also log instead of trace?
   - Evals
     - E2E Evals
       - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
@@ -53,6 +48,9 @@
   - Alerts
     - Alerts created, but no channel added yet
   - Vesioned prompts/datasets/eval runs
+- Synthesis Report
+  - Reinstate synthesis report once this works
+  - Maybe use async queues for this (learn to use async queues either way)
 - Infra - Prod Level
   - Webhook correctness (auth/idempotency)
   - Live DB + Alembic
@@ -70,6 +68,6 @@
   - Rate limiting
   - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
 - Advanced
-  - Barge-in / interruption handling beyond Vapi's capabilities - Using Livekit
   - Memory/Improving agents with usage
+  - Advanced Voice UX features & Voice UX Evals
 

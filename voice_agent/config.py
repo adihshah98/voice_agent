@@ -33,10 +33,16 @@ class Settings(BaseSettings):
     # Voice
     vapi_voice_provider: str = "11labs"
     vapi_voice_id: str | None = None  # default depends on provider
+    vapi_voice_model: str | None = None  # ElevenLabs model, e.g. "eleven_flash_v2_5" (~75ms latency)
     vapi_voice_stability: float | None = None
     vapi_voice_similarity_boost: float | None = None
     vapi_voice_style: float | None = None
     vapi_voice_speed: float | None = None
+
+    # Voice pipeline timing & interruption
+    vapi_wait_seconds: float = 0.3          # delay before assistant speaks after turn ends (Vapi default: 0.4)
+    vapi_stop_num_words: int = 3            # words user must say before assistant stops (blocks backchannel interrupts)
+    vapi_stop_backoff_seconds: float = 0.5  # wait after real interruption before speaking again
 
     # Dev
     log_level: str = "INFO"
@@ -57,7 +63,8 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Models
-INTERVIEWER_MODEL = "anthropic:claude-haiku-4-5-20251001"  # real-time, latency-critical
+INTERVIEWER_MODEL = "groq:llama-3.3-70b-versatile"          # real-time, latency-critical
+INTERVIEWER_FALLBACK_MODEL = "anthropic:claude-haiku-4-5-20251001"  # used when Groq fails structured output
 ANALYST_MODEL = "anthropic:claude-sonnet-4-6"              # async, quality-sensitive
 SYNTHESIS_MODEL = "anthropic:claude-sonnet-4-6"            # post-call, no latency constraint
 

@@ -17,12 +17,15 @@ from dataclasses import dataclass
 
 import anyio
 import logfire
+from groq import APIError as GroqAPIError
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.messages import CachePoint
 from pydantic_ai.models.anthropic import AnthropicModelSettings
+from pydantic_ai.models.fallback import FallbackModel
 
 from voice_agent import state
-from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_MODEL, settings
+from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_FALLBACK_MODEL, INTERVIEWER_MODEL, settings
 from voice_agent.models import InterviewerDeps, InterviewerOutput
 
 
@@ -181,6 +184,14 @@ CONTEXT fields:
 
 Decision framework — use your judgment in this order:
 
+-1. SILENCE / THINKING PAUSE:
+    - If the respondent's utterance is empty or just silence (blank, "[silence]", or a
+      single non-word sound) — respond with only "Still there?" and use action=`clarify`.
+    - If the utterance is a thinking filler — "um", "uh", "let me think", "give me a
+      second", "hmm" as a standalone — respond with only "Take your time." and use
+      action=`clarify`.
+    In both cases: no question appended, nothing else added.
+
 0. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_SUBTOPICS.
    If the specific subtopic you're about to ask about was already addressed, skip it and
    move to the next step, unless the answer was incomplete or evasive. A broad topic
@@ -252,12 +263,19 @@ RED FLAGS — always probe these; don't move on without understanding them:
 --- END TRIGGERS ---
 
 Hard rules:
-- One question per utterance. Max one `?`.
+- One question per utterance. Max one `?`. Never ask two questions in one turn, even as
+  "and also..." constructions.
 - Never ask a leading question — never presuppose the answer or push a view.
   ("So you loved it, right?" / "That must have been frustrating?" are both leading.)
   Always use open, neutral phrasing: "What happened?", "How did that feel?",
   "What was that like for you?"
-- Keep utterances under ~30 words — this is spoken, not written.
+- Keep utterances under 25 words — this is spoken audio, not text. Short is natural.
+- Start every response with a brief spoken acknowledgment before your question:
+  "Got it.", "Right.", "Sure.", "Interesting.", "I see.", "Makes sense.", or a short
+  restatement like "So it's mostly ad-hoc use —". Never open with a bare question.
+- Speak numbers as words: "about thirty percent" not "30%", "three to five times" not "3–5x".
+- If the respondent asks who you are or for your name, deflect warmly and briefly —
+  "I'm Sagar/ I work at a market research firm" — then immediately ask your next question.
 - Valid actions: scripted, probe, clarify, off_topic, wrap_up. Do not use `acknowledge`
   as a standalone action — brief acknowledgments belong in the utterance itself before
   steering back.
@@ -267,7 +285,11 @@ Hard rules:
 
 
 interviewer = Agent(
-    INTERVIEWER_MODEL,
+    FallbackModel(
+        INTERVIEWER_MODEL,
+        INTERVIEWER_FALLBACK_MODEL,
+        fallback_on=(ModelAPIError, GroqAPIError),
+    ),
     deps_type=InterviewerDeps,
     output_type=InterviewerOutput,
     system_prompt=INTERVIEWER_PROMPT,
