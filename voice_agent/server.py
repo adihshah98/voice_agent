@@ -44,6 +44,9 @@ _background_tasks: set[asyncio.Task] = set()
 # Keyed by call_id; cleaned up on end-of-call-report.
 _speech_ts: dict[str, dict[str, Any]] = {}
 
+# One asyncio.Task per call: fires Vapi DELETE if user stays silent after assistant stops speaking.
+_silence_watch_tasks: dict[str, asyncio.Task] = {}
+
 
 def _fire(coro, *, name: str | None = None) -> asyncio.Task:
     task = asyncio.create_task(coro, name=name)
@@ -63,31 +66,89 @@ app = FastAPI(title="voice-agent", lifespan=lifespan)
 
 
 
-def _end_call_on_error(call_id: str) -> None:
-    """Mark a call ended and fire Vapi DELETE — best-effort, never raises."""
+def _cancel_silence_watch(call_id: str) -> None:
+    """Stop the extended-silence task for this call if one is running."""
+    task = _silence_watch_tasks.pop(call_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def _end_call_vapi_delete(call_id: str, end_reason: str) -> None:
+    """Mark a call ended in the DB, cancel silence watch, and fire Vapi DELETE — best-effort, never raises."""
+    vapi_call_id: str | None = None
     try:
         with state.session_scope(engine) as session:
             call = session.get(state.Call, call_id)
             if call and call.status != "ended":
                 vapi_call_id = call.vapi_call_id
                 call.status = "ended"
-                call.end_reason = "server_error"
+                call.end_reason = end_reason
                 call.ended_at = datetime.now(timezone.utc)
                 session.add(call)
-        if vapi_call_id and settings.vapi_api_key:
-            async def _delete():
-                try:
-                    async with httpx.AsyncClient() as client:
-                        await client.delete(
-                            f"https://api.vapi.ai/call/{vapi_call_id}",
-                            headers={"Authorization": f"Bearer {settings.vapi_api_key}"},
-                            timeout=5,
-                        )
-                except Exception:
-                    logfire.exception("vapi_delete_call_failed", vapi_call_id=vapi_call_id)
-            _fire(_delete(), name="vapi-delete-call")
     except Exception:
-        logfire.exception("end_call_on_error_failed", call_id=call_id)
+        logfire.exception("end_call_vapi_delete_db_failed", call_id=call_id, end_reason=end_reason)
+        return
+
+    _cancel_silence_watch(call_id)
+    _speech_ts.pop(call_id, None)
+
+    if not vapi_call_id or not settings.vapi_api_key:
+        if vapi_call_id and not settings.vapi_api_key:
+            logfire.warning("vapi_delete_skipped_no_key", call_id=call_id, vapi_call_id=vapi_call_id, end_reason=end_reason)
+        return
+
+    async def _delete() -> None:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.delete(
+                    f"https://api.vapi.ai/call/{vapi_call_id}",
+                    headers={"Authorization": f"Bearer {settings.vapi_api_key}"},
+                    timeout=5,
+                )
+        except Exception:
+            logfire.exception("vapi_delete_call_failed", vapi_call_id=vapi_call_id, end_reason=end_reason)
+
+    _fire(_delete(), name=f"vapi-delete-call-{end_reason}")
+
+
+def _end_call_on_error(call_id: str) -> None:
+    """Mark a call ended and fire Vapi DELETE — best-effort, never raises."""
+    _end_call_vapi_delete(call_id, "server_error")
+
+
+def _schedule_silence_watch_if_enabled(call_id: str, vapi_call_id: str | None) -> None:
+    """Start (or replace) a timer: end the call if the user does not start/stop speaking before the deadline.
+
+    Fires after each assistant TTS `stopped` event. Cancelled when the user or assistant next speaks.
+    """
+    if settings.vapi_extended_silence_seconds <= 0 or not call_id:
+        return
+
+    _cancel_silence_watch(call_id)
+
+    async def _run() -> None:
+        try:
+            await asyncio.sleep(settings.vapi_extended_silence_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            with state.session_scope(engine) as session:
+                call = session.get(state.Call, call_id)
+                if not call or call.status == "ended":
+                    return
+            logfire.info("extended_silence_timeout", call_id=call_id, vapi_call_id=vapi_call_id)
+            _end_call_vapi_delete(call_id, "extended_silence")
+        except Exception:
+            logfire.exception("silence_watch_failed", call_id=call_id)
+
+    task = _fire(_run(), name=f"silence-watch-{call_id}")
+    _silence_watch_tasks[call_id] = task
+
+    def _on_done(t: asyncio.Task) -> None:
+        if _silence_watch_tasks.get(call_id) is t:
+            _silence_watch_tasks.pop(call_id, None)
+
+    task.add_done_callback(_on_done)
 
 
 @app.exception_handler(HTTPException)
@@ -270,6 +331,8 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 if call:
                     # Guard is a no-op if DELETE /calls/{id} already fired — both paths are valid.
                     if call.status == "ended":
+                        _cancel_silence_watch(call_id)
+                        _speech_ts.pop(call_id, None)
                         return {}
                     call.status = "ended"
                     call.end_reason = ended_reason
@@ -280,26 +343,48 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 else:
                     logfire.warning("end_of_call_unknown_call_id", call_id=call_id)
                     return {}
+            _cancel_silence_watch(call_id)
             _speech_ts.pop(call_id, None)
 
             # Extract Vapi's per-turn TurnLatency breakdown (seconds → ms).
-            # Path: message.call.analysis.performanceMetrics.turnLatencies
-            call_analysis = (msg.get("call") or {}).get("analysis") or {}
-            perf = call_analysis.get("performanceMetrics") or {}
+            # Metrics live under msg.artifact.performanceMetrics, not msg.analysis.
+            artifact = msg.get("artifact") or {}
+            perf = artifact.get("performanceMetrics") or {}
             turn_latencies: list[dict] = perf.get("turnLatencies") or []
             vapi_latency: dict[str, Any] = {}
             if turn_latencies:
                 def _avg_ms(field: str) -> int:
+                    # Vapi sends latency values already in milliseconds.
                     vals = [t[field] for t in turn_latencies if field in t]
-                    return round(sum(vals) / len(vals) * 1000) if vals else 0
+                    return round(sum(vals) / len(vals)) if vals else 0
+                # vapi_turn_ms = endpointing + stt + llm + tts = true E2E from last audio byte
                 vapi_latency = {
                     "vapi_turns": len(turn_latencies),
                     "vapi_endpointing_ms_avg": _avg_ms("endpointingLatency"),
                     "vapi_stt_ms_avg": _avg_ms("transcriberLatency"),
                     "vapi_llm_ms_avg": _avg_ms("modelLatency"),
                     "vapi_tts_ms_avg": _avg_ms("voiceLatency"),
-                    "vapi_turn_ms_avg": _avg_ms("turnLatency"),
+                    "vapi_turn_ms_avg": _avg_ms("turnLatency"),  # true E2E from last audio byte
                 }
+                for i, t in enumerate(turn_latencies):
+                    logfire.info(
+                        "vapi_turn_latency",
+                        call_id=call_id,
+                        vapi_turn_index=i,
+                        vapi_endpointing_ms=round(t.get("endpointingLatency", 0)),
+                        vapi_stt_ms=round(t.get("transcriberLatency", 0)),
+                        vapi_llm_ms=round(t.get("modelLatency", 0)),
+                        vapi_tts_ms=round(t.get("voiceLatency", 0)),
+                        vapi_turn_ms=round(t.get("turnLatency", 0)),
+                    )
+            else:
+                logfire.warning(
+                    "vapi_perf_metrics_absent",
+                    call_id=call_id,
+                    msg_keys=list(msg.keys()),
+                    artifact_keys=list(artifact.keys()),
+                    perf_keys=list(perf.keys()),
+                )
 
             logfire.info(
                 "call_ended",
@@ -330,16 +415,38 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 if role == "user" and status == "stopped":
                     entry["user_stopped_at"] = now
                     entry["user_stopped_turn"] = vapi_turn
+                    _cancel_silence_watch(call_id)
+                elif role == "user" and status == "started":
+                    _cancel_silence_watch(call_id)
                 elif role == "assistant" and status == "started":
-                    user_stopped = entry.get("user_stopped_at")
+                    # Pop so the next turn can't accidentally reuse a stale value when
+                    # speech-update(user, stopped) races or arrives after the LLM call.
+                    user_stopped = entry.pop("user_stopped_at", None)
                     if user_stopped is not None:
                         turnaround_ms = int((now - user_stopped) * 1000)
+                        stt_ms = entry.pop("stt_ms", None)
+                        llm_ttft_ms = entry.pop("llm_ttft_ms", None)
+                        filler_injected = entry.pop("filler_injected", False)
+                        if stt_ms is not None and llm_ttft_ms is not None:
+                            tts_ttft_ms = turnaround_ms - stt_ms - llm_ttft_ms
+                            logfire.info(
+                                "turn_latency",
+                                call_id=call_id,
+                                e2e_ms=turnaround_ms,
+                                stt_ms=stt_ms,
+                                llm_ttft_ms=llm_ttft_ms,
+                                tts_ttft_ms=tts_ttft_ms,
+                                filler_injected=filler_injected,
+                            )
+                            entry["e2e_ms"] = turnaround_ms
                     entry["assistant_started_at"] = now
+                    _cancel_silence_watch(call_id)
                 elif role == "assistant" and status == "stopped":
                     assistant_started = entry.get("assistant_started_at")
                     if assistant_started is not None:
                         tts_duration_ms = int((now - assistant_started) * 1000)
                     entry.pop("assistant_started_at", None)
+                    _schedule_silence_watch_if_enabled(call_id, vapi_call_id)
 
             logfire.info(
                 "vapi_speech_update",
@@ -517,33 +624,55 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
             fallback = "Thank you for your time."
             chunk = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": fallback}, "finish_reason": None}]}
             yield f"data: {json.dumps(chunk)}\n\n"
+        elif not messages or messages[-1].get("role") != "user":
+            # Ghost turn: Vapi called the LLM but the last message is from the assistant,
+            # meaning no real user utterance triggered this call (state-sync race condition).
+            # Return an empty response so Vapi speaks nothing and no DB write happens.
+            logfire.info("ghost_turn_skipped", call_id=call_id, vapi_call_id=vapi_call_id, message_count=len(messages))
         else:
-            # Time from Vapi's "user stopped speaking" webhook to this LLM call —
-            # captures STT transcription + endpointing delay as seen from our server.
-            stt_endpointing_ms: int | None = None
+            # Time from Vapi's "user stopped speaking" webhook to this LLM call.
+            # speech-update fires at endpointing, so this window is STT transcription time.
+            stt_ms: int | None = None
             entry = _speech_ts.get(call_id, {})
             if "user_stopped_at" in entry:
-                stt_endpointing_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
+                stt_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
+
+            # Stash stt_ms immediately — before any streaming — so the
+            # speech-update(assistant/started) handler always finds it even if it
+            # fires before the streaming loop finishes.
+            if stt_ms is not None:
+                _speech_ts.setdefault(call_id, {})["stt_ms"] = stt_ms
 
             with logfire.span(
                     "vapi_llm_request",
                     call_id=call_id,
                     vapi_call_id=vapi_call_id,
                     message_count=len(messages),
-                    stt_endpointing_ms=stt_endpointing_ms,
+                    stt_ms=stt_ms,
                 ) as req_span:
                 reply_chars = 0
                 pipeline = TurnPipeline(engine, call_id, vapi_messages=messages)
                 try:
+                    ttft_stashed = False
                     async for token in pipeline.stream_tokens():
                         reply_chars += len(token)
+                        # Stash llm_ttft_ms + filler_injected on the first token.
+                        # pipeline.ttft_ms is set by stream_tokens() before yielding,
+                        # so it's available here. Stashing here ensures the values are
+                        # in _speech_ts before Vapi fires speech-update(assistant/started),
+                        # which can't arrive until after Vapi receives this first token.
+                        if not ttft_stashed and stt_ms is not None and pipeline.ttft_ms is not None:
+                            live_entry = _speech_ts.setdefault(call_id, {})
+                            live_entry["llm_ttft_ms"] = pipeline.ttft_ms
+                            live_entry["filler_injected"] = pipeline.filler_injected
+                            ttft_stashed = True
                         chunk = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}]}
                         yield f"data: {json.dumps(chunk)}\n\n"
                     result = await pipeline.commit()
                     req_span.set_attribute("action", result.action)
                     req_span.set_attribute("reply_chars", reply_chars)
                     if result.ttft_ms is not None:
-                        req_span.set_attribute("ttft_ms", result.ttft_ms)
+                        req_span.set_attribute("llm_ttft_ms", result.ttft_ms)
                     if result.should_run_analyst:
                         _fire(_analyst_task(call_id), name=f"analyst-{call_id}")
                 except asyncio.CancelledError:
@@ -590,6 +719,8 @@ async def delete_call(request: Request, call_id: str) -> dict[str, str]:
         call.end_reason = "deleted"
         call.ended_at = datetime.now(timezone.utc)
         session.add(call)
+    _cancel_silence_watch(call_id)
+    _speech_ts.pop(call_id, None)
 
     if vapi_call_id and settings.vapi_api_key:
         async with httpx.AsyncClient() as client:
@@ -626,6 +757,9 @@ def _build_voice_config() -> dict[str, Any]:
     ):
         if value is not None:
             voice[json_key] = value
+    # Start TTS on the filler phrase itself rather than waiting for LLM tokens.
+    # Default minCharacters is 30; our fillers are 11-12 chars, so 10 triggers on them.
+    voice["chunkPlan"] = {"enabled": True, "minCharacters": 10}
     return voice
 
 
@@ -634,7 +768,7 @@ def _build_start_speaking_plan() -> dict[str, Any]:
         "smartEndpointingPlan": {"provider": "livekit"},
         "transcriptionEndpointingPlan": {
             "onPunctuationSeconds": 0.2,
-            "onNoPunctuationSeconds": 0.8,
+            "onNoPunctuationSeconds": 0.5,
             "onNumberSeconds": 0.5,
         },
         "waitSeconds": settings.vapi_wait_seconds,
@@ -680,7 +814,7 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
             "transcriber": {"provider": "deepgram", "model": "nova-3", "language": "en"},
             "startSpeakingPlan": _build_start_speaking_plan(),
             "stopSpeakingPlan": _build_stop_speaking_plan(),
-            "firstMessage": "Hey! Thank you for getting on the call — just want to check if you can hear me before we get started.",
+            "firstMessage": "Hey! Thank you for getting on the call. Just want to check if you can hear me before we get started.",
             "firstMessageMode": "assistant-speaks-first",
             "maxDurationSeconds": 1800,
             "metadata": {"call_id": call_id},

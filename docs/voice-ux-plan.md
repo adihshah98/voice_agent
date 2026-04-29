@@ -1,5 +1,107 @@
 # Plan: Voice UX Improvements — Latency, Endpointing, Barge-in, TTS, Conversation Design
 
+## Metrics
+
+**Per-turn** — one `turn_latency` log per turn (emitted when assistant starts speaking):
+
+```
+stt_ms        STT transcription time
+llm_ttft_ms   LLM first token
+tts_ttft_ms   TTS first audio (derived: total - stt - llm)
+total_ms      End-to-end from user stopped → first audio heard
+
+```
+
+**Per-call** — Vapi's `vapi_endpointing_ms_avg`, `vapi_stt_ms_avg` etc. on `call_ended` (all 4 stages averaged). You'll now see `vapi_perf_metrics_absent` as a **warning** if Vapi isn't sending that payload, so you'll know immediately if the data path is wrong.
+
+The one component you can't get per-turn from our server is **endpointing latency** — that's the configurable silence timeout in Vapi before VAD fires, and it's not observable to us. Vapi's per-call average is the only place we'll ever see it.
+
+The **only metric that actually matters** is:
+
+```
+T_last_audio_byte_received → T_first_audio_byte_sent
+```
+
+Everything in between is a pipeline implementation detail. The sub-segment breakdowns only make sense for **debugging where time is being lost**, not for representing user-perceived latency.
+
+---
+
+### Why Sub-Segment Math Breaks Down
+
+In a streaming pipeline:
+
+```
+t=0ms    Last audio byte arrives
+t=0ms    STT has already been processing for 2000ms (overlapped with speech)
+t=80ms   VAD fires (endpointing)
+t=120ms  Final transcript ready (STT marginal)
+t=130ms  LLM first token arrives (LLM was speculatively started at t=100ms)
+t=210ms  First TTS audio chunk sent out
+```
+
+If you add up "endpointing + STT + LLM TTFT + TTS TTFT" you'd get ~700ms. But actual E2E was **210ms**. The sub-segments are overlapping — you can't sum them.
+
+---
+
+### What You Actually Measure
+
+**One primary metric:**
+
+python
+
+```python
+t0 = timestamp of last audio packet received from user
+t1 = timestamp of first audio packet written to output stream
+
+e2e_voice_latency = t1 - t0
+```
+
+**Sub-segments only for debugging (wall-clock deltas, not summed):**
+
+python
+
+```python
+# Each measured from t0, not from each other
+endpointing_from_t0   = t_vad_fired - t0
+transcript_from_t0    = t_final_transcript - t0
+llm_first_token_from_t0 = t_llm_first_token - t0
+first_audio_from_t0   = t1 - t0  # = e2e_latency
+```
+
+This gives you a **waterfall**, not a sum. You can see where in the pipeline time is being spent relative to T0.
+
+---
+
+### What Vapi Does
+
+Vapi exposes this in call analytics as `assistant_latency` — defined exactly as: end of user speech → start of assistant audio. That's the number they surface in their dashboard and webhooks.
+
+Internally they also log sub-segments but the contract they expose to customers is the single E2E number, because that's what maps to user experience.
+
+If you're building on Vapi, the `call.ended` webhook payload includes latency metadata. For deeper instrumentation you'd need to run your own timestamps at the WebRTC/audio stream layer since Vapi abstracts the internals.
+
+---
+
+### The Right Mental Model
+
+Think of it like a **Gantt chart**, not a serial chain:
+
+```
+t0 (last audio byte)
+│
+├── VAD processing          ████░░░░░░░░░░░░░░░░░░
+├── STT finalization             ████░░░░░░░░░░░░░
+├── LLM streaming                    ████████░░░░░
+├── TTS first chunk                          █████
+│                                                │
+t1 (first audio out) ────────────────────────────┘
+
+E2E = t1 - t0  ← this is your metric
+Sub-segments = each bar's start relative to t0 ← these are your debug tools
+```
+
+The sub-segments tell you **which stage is your bottleneck**, but the only number you report is E2E.
+
 ## Context
 
 The voice pipeline from user-stops-speaking to first audio has 5 stages where time accumulates:

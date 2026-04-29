@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column
+from sqlalchemy import Column, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
 from sqlalchemy.pool import NullPool, StaticPool
@@ -79,6 +79,11 @@ class Turn(SQLModel, table=True):
     action: Optional[str] = None  # scripted|skip_scripted|probe|clarify|off_topic|wrap_up
     reasoning: Optional[str] = None
     latency_ms: Optional[int] = None
+    # Interviewer LLM only (null for respondent rows, or if timeout/fallback had no usage)
+    tokens_input: Optional[int] = None
+    tokens_output: Optional[int] = None
+    tokens_cache_read: Optional[int] = None
+    tokens_cache_write: Optional[int] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
     call: Call = Relationship(
@@ -117,6 +122,10 @@ class AnalystSnapshot(SQLModel, table=True):
     investor_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     covered_subtopics: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     latency_ms: Optional[int] = None
+    tokens_input: Optional[int] = None
+    tokens_output: Optional[int] = None
+    tokens_cache_read: Optional[int] = None
+    tokens_cache_write: Optional[int] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
     call: Call = Relationship(
@@ -162,6 +171,9 @@ def make_engine(url: str = "sqlite:///voice_agent.db", *, echo: bool = False):
         # concurrent requests.
         return create_engine(url, echo=echo, connect_args={"check_same_thread": False}, poolclass=NullPool)
     return create_engine(url, echo=echo)
+
+
+
 
 
 def init_db(engine) -> None:
@@ -250,11 +262,23 @@ def latest_snapshot(session: Session, call_id: str) -> Optional["AnalystSnapshot
     return session.exec(stmt).first()
 
 
-ANALYST_TURN_INTERVAL = 25
+def call_llm_token_totals(session: Session, call_id: str) -> dict[str, int]:
+    """Sum LLM token fields for this call: interviewer (Turn) + analyst (AnalystSnapshot)."""
+    out: dict[str, int] = {}
+    for key in ("tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write"):
+        tcol = getattr(Turn, key)
+        acol = getattr(AnalystSnapshot, key)
+        t = session.exec(select(func.coalesce(func.sum(tcol), 0)).where(Turn.call_id == call_id)).one()
+        a = session.exec(select(func.coalesce(func.sum(acol), 0)).where(AnalystSnapshot.call_id == call_id)).one()
+        out[key] = int(t or 0) + int(a or 0)
+    return out
+
+
+ANALYST_TURN_INTERVAL = 10
 
 
 def should_run_analyst(session: Session, call_id: str) -> bool:
-    """True when a scripted question was just answered OR >= 25 exchanges have passed since last run.
+    """True when a scripted question was just answered OR >= 10 exchanges have passed since last run.
 
     Counts interviewer (bot) turns since the last snapshot, not call.turn_count, because Vapi
     can split one user utterance into multiple Turn rows at pauses — counting bot rows gives

@@ -21,15 +21,16 @@ from groq import APIError as GroqAPIError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.messages import CachePoint
+from pydantic_ai.usage import RunUsage
 from pydantic_ai.models.anthropic import AnthropicModelSettings
 from pydantic_ai.models.fallback import FallbackModel
 
 from voice_agent import state
-from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_FALLBACK_MODEL, INTERVIEWER_MODEL, settings
+from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_FALLBACK_MODEL_1, INTERVIEWER_FALLBACK_MODEL_2, INTERVIEWER_MODEL, settings
 from voice_agent.models import InterviewerDeps, InterviewerOutput
 
 
-CONTEXT_WINDOW_TURNS = 50  # recent turns injected into the LLM context block
+CONTEXT_WINDOW_TURNS = 15  # recent turns injected into the LLM context block; keep under Cerebras 8k limit
 PROBE_STALENESS_TURNS = 15    # probes older than this many turns are dropped from context
 
 
@@ -185,12 +186,18 @@ CONTEXT fields:
 Decision framework — use your judgment in this order:
 
 -1. SILENCE / THINKING PAUSE:
-    - If the respondent's utterance is empty or just silence (blank, "[silence]", or a
-      single non-word sound) — respond with only "Still there?" and use action=`clarify`.
-    - If the utterance is a thinking filler — "um", "uh", "let me think", "give me a
-      second", "hmm" as a standalone — respond with only "Take your time." and use
-      action=`clarify`.
-    In both cases: no question appended, nothing else added.
+    - SHORT AFFIRMATIONS are NOT silence. If the utterance is "yes", "yeah", "sure",
+      "okay", "mm-hmm", "I can hear you", or any other brief confirmation — treat it as
+      a go-ahead and proceed directly to step 4 (SCRIPTED). Do not say "Still there?".
+    - LOOP GUARD: check RECENT_TURNS. If the interviewer has already said "Still there?"
+      or "Take your time." in the last 2 turns, skip this rule and go to step 4
+      (SCRIPTED) — repeating the same clarify is never helpful.
+    - If the utterance is truly empty or silence (blank, "[silence]", no transcribed
+      words at all) — respond with only "Still there?" and use action=`clarify`.
+    - If the utterance is a pure thinking filler with no other words — "um", "uh",
+      "let me think", "give me a second", "hmm" standing alone — respond with only
+      "Take your time." and use action=`clarify`.
+    In true silence/filler cases: no question appended, nothing else added.
 
 0. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_SUBTOPICS.
    If the specific subtopic you're about to ask about was already addressed, skip it and
@@ -270,9 +277,12 @@ Hard rules:
   Always use open, neutral phrasing: "What happened?", "How did that feel?",
   "What was that like for you?"
 - Keep utterances under 25 words — this is spoken audio, not text. Short is natural.
-- Start every response with a brief spoken acknowledgment before your question:
-  "Got it.", "Right.", "Sure.", "Interesting.", "I see.", "Makes sense.", or a short
-  restatement like "So it's mostly ad-hoc use —". Never open with a bare question.
+- Start every response with a brief spoken acknowledgment before your question such as
+  "Right.", "Sure.", "Interesting.", "I see.", "Makes sense.", or a short restatement
+  like "So it's mostly ad-hoc use —". Never open with a bare question. Match the
+  acknowledgment to the content: for a simple yes/no confirmation ("Yes", "Sure",
+  "I can hear you") use "Great." or "Perfect." — not "Hmm." Those sound
+  off when there's nothing substantive to acknowledge.
 - Speak numbers as words: "about thirty percent" not "30%", "three to five times" not "3–5x".
 - If the respondent asks who you are or for your name, deflect warmly and briefly —
   "I'm Sagar/ I work at a market research firm" — then immediately ask your next question.
@@ -284,12 +294,47 @@ Hard rules:
 """
 
 
+def _log_and_fallback(exc: Exception) -> bool:
+    """Log any provider API error and fall back to the next model in the chain.
+
+    Chain: Cerebras → Groq → Groq (retry) → Haiku.
+    Returning True tells FallbackModel to try the next model.
+    Returning False re-raises (for non-API errors we don't want to silently swallow).
+    """
+    is_api_error = isinstance(exc, (GroqAPIError, ModelAPIError))
+    if not is_api_error:
+        try:
+            from openai import APIError as OpenAIAPIError
+            is_api_error = isinstance(exc, OpenAIAPIError)
+        except ImportError:
+            pass
+    if is_api_error:
+        logfire.warning(
+            "interviewer_model_error",
+            error_type=type(exc).__name__,
+            error=str(exc)[:300],
+        )
+        return True
+    return False
+
+
+def _build_interviewer_model() -> FallbackModel:
+    """Build fallback chain: Haiku → Groq → Groq retry → Cerebras.
+
+   
+    """
+    
+    chain = [
+        INTERVIEWER_MODEL,           # Haiku
+        INTERVIEWER_FALLBACK_MODEL_1,   # Groq
+        INTERVIEWER_FALLBACK_MODEL_1,   # Groq retry (transient failures)
+        INTERVIEWER_FALLBACK_MODEL_2,  # Cerebras last resort
+    ]
+    return FallbackModel(*chain, fallback_on=_log_and_fallback)
+
+
 interviewer = Agent(
-    FallbackModel(
-        INTERVIEWER_MODEL,
-        INTERVIEWER_FALLBACK_MODEL,
-        fallback_on=(ModelAPIError, GroqAPIError),
-    ),
+    _build_interviewer_model(),
     deps_type=InterviewerDeps,
     output_type=InterviewerOutput,
     system_prompt=INTERVIEWER_PROMPT,
@@ -356,6 +401,12 @@ class InterviewerStream:
         self._prepared = prepared
         self._budget_s = budget_s
         self._output: InterviewerOutput | None = None
+        self._usage: RunUsage | None = None
+
+    @property
+    def usage(self) -> RunUsage | None:
+        """Populated after a successful model run; None on timeout, API error fallback, or no call."""
+        return self._usage
 
     @property
     def output(self) -> InterviewerOutput:
@@ -366,19 +417,30 @@ class InterviewerStream:
         """Yield text deltas as the utterance streams in."""
         deps = self._deps
         prepared = self._prepared
-        final_output: InterviewerOutput | None = None
+        _stream_error: Exception | None = None
 
         with anyio.move_on_after(self._budget_s) as cancel_scope:
             prev = ""
-            async with interviewer.run_stream(prepared.prompt_parts, deps=deps) as streamed:
-                async for partial in streamed.stream_output(debounce_by=None):
-                    current = partial.utterance or ""
-                    if len(current) > len(prev):
-                        yield current[len(prev):]
-                        prev = current
-                final_output = await streamed.get_output()
+            try:
+                async with interviewer.run_stream(prepared.prompt_parts, deps=deps) as streamed:
+                    async for partial in streamed.stream_output(debounce_by=None):
+                        current = partial.utterance or ""
+                        if len(current) > len(prev):
+                            yield current[len(prev):]
+                            prev = current
+                    self._output = await streamed.get_output()
+                    self._usage = streamed.usage()
+            except (GroqAPIError, ModelAPIError) as exc:
+                _stream_error = exc
+            except RuntimeError as exc:
+                # pydantic-graph's anyio TaskGroup raises this specific message during
+                # __aexit__ when run inside asyncio.create_task on Python 3.14.
+                # self._output is set before __aexit__ runs, so the call succeeded.
+                if "Attempted to exit cancel scope in a different task" not in str(exc) or self._output is None:
+                    _stream_error = exc
 
         if cancel_scope.cancelled_caught:
+            self._usage = None
             logfire.warning(
                 "interviewer_timeout",
                 call_id=deps.call_id,
@@ -390,7 +452,19 @@ class InterviewerStream:
             yield fb.utterance
             return
 
-        self._output = final_output
+        if _stream_error is not None:
+            self._usage = None
+            logfire.warning(
+                "interviewer_model_error_fallback",
+                call_id=deps.call_id,
+                turn_number=deps.turn_number,
+                error=str(_stream_error),
+            )
+            fb = _fallback(deps, fallback_scripted_question=prepared.fallback_scripted_question)
+            self._output = fb
+            if not prev:
+                yield fb.utterance
+            return
 
 
 def _fallback(

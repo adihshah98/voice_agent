@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Core
     anthropic_api_key: str | None = None  # validated by Anthropic SDK at call time
+    cerebras_api_key: str | None = None   # optional; Cerebras skipped from chain when absent
     database_url: str = "sqlite:///voice_agent.db"
 
     # Logfire (no token = console output only)
@@ -40,9 +41,20 @@ class Settings(BaseSettings):
     vapi_voice_speed: float | None = None
 
     # Voice pipeline timing & interruption
-    vapi_wait_seconds: float = 0.3          # delay before assistant speaks after turn ends (Vapi default: 0.4)
+    vapi_wait_seconds: float = 0.0          # delay before assistant speaks after turn ends (Vapi default: 0.4)
     vapi_stop_num_words: int = 3            # words user must say before assistant stops (blocks backchannel interrupts)
     vapi_stop_backoff_seconds: float = 0.5  # wait after real interruption before speaking again
+
+    # After assistant TTS ends, if the user does not speak within this window, end the call (Vapi DELETE).
+    # 0 = disabled. Avoids unbounded "Still there?" loops until maxDurationSeconds.
+    vapi_extended_silence_seconds: float = 0.0
+
+    # Interviewer model chain (env-overridable; swap without redeploying)
+    # Cerebras: bare model name (no provider prefix); set to "" to skip Cerebras and start from Groq.
+    cerebras_model: str = "llama3.1-8b"
+    # Groq and Haiku: full pydantic-ai model strings
+    groq_model: str = "groq:llama-3.3-70b-versatile"
+    haiku_model: str = "anthropic:claude-haiku-4-5-20251001"
 
     # Dev
     log_level: str = "INFO"
@@ -62,9 +74,11 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Models
-INTERVIEWER_MODEL = "groq:llama-3.3-70b-versatile"          # real-time, latency-critical
-INTERVIEWER_FALLBACK_MODEL = "anthropic:claude-haiku-4-5-20251001"  # used when Groq fails structured output
+# Models — interviewer fallback chain: Cerebras → Groq → Groq (retry) → Haiku
+# Derived from settings so env vars (CEREBRAS_MODEL, GROQ_MODEL, HAIKU_MODEL) override them.
+INTERVIEWER_MODEL = settings.haiku_model
+INTERVIEWER_FALLBACK_MODEL_1 = settings.groq_model
+INTERVIEWER_FALLBACK_MODEL_2 = f"cerebras:{settings.cerebras_model}" if settings.cerebras_model else ""
 ANALYST_MODEL = "anthropic:claude-sonnet-4-6"              # async, quality-sensitive
 SYNTHESIS_MODEL = "anthropic:claude-sonnet-4-6"            # post-call, no latency constraint
 
@@ -74,6 +88,11 @@ ENABLE_SYNTHESIS_REPORT: bool = False
 # Interviewer hard deadline (seconds). Haiku + structured output can exceed ~2.5 s under variance;
 # 5 s reduces premature scripted fallbacks while still bounding hangs.
 INTERVIEWER_BUDGET_S: float = 5.0
+
+# Safety-valve filler: if LLM first token hasn't arrived within this window (seconds),
+# yield a brief acknowledgment sound so TTS starts immediately rather than staying silent.
+# 0.0 = disabled. Groq p50 TTFT is ~200-300 ms; 0.4 keeps fillers rare but catches slow turns.
+FILLER_THRESHOLD_S: float = 0.4
 
 # Vapi HMAC replay-attack window — reject requests whose timestamp is older than this.
 VAPI_TIMESTAMP_TOLERANCE_S: int = 300  # 5 minutes

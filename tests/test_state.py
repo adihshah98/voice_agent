@@ -17,6 +17,7 @@ from voice_agent.state import (
     Probe,
     SynthesisReport,
     Turn,
+    call_llm_token_totals,
     init_db,
     make_engine,
     mark_probe_asked,
@@ -198,3 +199,38 @@ def test_report_output_shape():
     )
     assert r.themes[0].theme == "t"
     assert r.contradictions == []
+
+
+def test_call_llm_token_totals_sums_turns_and_snapshots(engine, seeded_call):
+    with session_scope(engine) as s:
+        s.add(
+            Turn(
+                call_id=seeded_call,
+                turn_number=1,
+                speaker="interviewer",
+                text="Hi",
+                tokens_input=10,
+                tokens_output=5,
+                tokens_cache_read=1,
+                tokens_cache_write=0,
+            )
+        )
+        s.add(
+            AnalystSnapshot(
+                call_id=seeded_call,
+                after_turn=1,
+                themes=[],
+                tokens_input=1000,
+                tokens_output=200,
+                tokens_cache_read=50,
+                tokens_cache_write=10,
+            )
+        )
+    with session_scope(engine) as s:
+        totals = call_llm_token_totals(s, seeded_call)
+    assert totals == {
+        "tokens_input": 1010,
+        "tokens_output": 205,
+        "tokens_cache_read": 51,
+        "tokens_cache_write": 10,
+    }

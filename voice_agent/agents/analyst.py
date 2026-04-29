@@ -80,6 +80,12 @@ Your job:
    'Notion vs Google Docs pricing' is a separate entry. Examples: 'IT security SOC2 concerns',
    'VP of Sales budget ownership', 'day-to-day AE usage workflow'.
    Never collapse distinct things into one label.
+   IMPORTANT — also emit a parent-level summary label whenever two or more specific
+   sub-aspects of the same topic are covered. For example, if you add 'PRD writing in Notion'
+   and 'customer interview notes workflow in Notion', also add 'Notion day-to-day usage
+   multiple workflows'. The parent label lets the interviewer recognise that a broad scripted
+   question has been answered organically through its sub-topics. Specific and parent labels
+   must coexist — the parent never replaces the specifics.
 
 Be concise — bullet-point style for all lists except investor_signals (one tagged line each).
 """
@@ -171,6 +177,7 @@ async def run_analyst(deps: AnalystDeps) -> None:
 
     result = await analyst.run(prompt, deps=deps)
     update: AnalysisUpdate = result.output
+    usage = result.usage()
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -188,6 +195,10 @@ async def run_analyst(deps: AnalystDeps) -> None:
                 investor_signals=update.investor_signals,
                 covered_subtopics=update.covered_subtopics,
                 latency_ms=latency_ms,
+                tokens_input=usage.input_tokens,
+                tokens_output=usage.output_tokens,
+                tokens_cache_read=usage.cache_read_tokens,
+                tokens_cache_write=usage.cache_write_tokens,
             )
         )
         for np in update.new_probes:
@@ -201,7 +212,6 @@ async def run_analyst(deps: AnalystDeps) -> None:
                 )
             )
 
-    usage = result.usage()
     span = trace.get_current_span()
     span.set_attribute("after_turn", after_turn)
     span.set_attribute("latency_ms", latency_ms)
@@ -211,10 +221,20 @@ async def run_analyst(deps: AnalystDeps) -> None:
     span.set_attribute("investor_signals_count", len(update.investor_signals))
     span.set_attribute("covered_subtopics_count", len(update.covered_subtopics))
     span.set_attribute("new_probes_count", len(update.new_probes))
-    span.set_attribute("tokens_input", usage.request_tokens or 0)
-    span.set_attribute("tokens_output", usage.response_tokens or 0)
-    span.set_attribute("tokens_cache_read", usage.cache_read_tokens or 0)
-    span.set_attribute("tokens_cache_write", usage.cache_write_tokens or 0)
+    span.set_attribute("tokens_input", usage.input_tokens)
+    span.set_attribute("tokens_output", usage.output_tokens)
+    span.set_attribute("tokens_cache_read", usage.cache_read_tokens)
+    span.set_attribute("tokens_cache_write", usage.cache_write_tokens)
+    logfire.info(
+        "analyst_usage",
+        call_id=deps.call_id,
+        after_turn=after_turn,
+        latency_ms=latency_ms,
+        tokens_input=usage.input_tokens,
+        tokens_output=usage.output_tokens,
+        tokens_cache_read=usage.cache_read_tokens,
+        tokens_cache_write=usage.cache_write_tokens,
+    )
 
 
 async def run_analyst_safely(deps: AnalystDeps) -> None:

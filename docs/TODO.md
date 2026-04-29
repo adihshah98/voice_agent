@@ -7,50 +7,39 @@
 
 ## My questions/Future improvements
 
-- Voice UX (Done)
-  - Added `_build_start_speaking_plan()` — LiveKit smart endpointing + transcription fallback timings
-  - Added `_build_stop_speaking_plan()` — acknowledgement phrases + barge-in word threshold
-  - Upgraded Deepgram `nova-2` → `nova-3` (faster + more accurate on phone audio)
-  - Added support for pauses
-  - Flash model
-  - Grow instead of Haiku
-- Voice UX
-  - **Anthropic Caching? How will it work with llama**
-  - **Filler audio** ("Give me a moment...") — needs pre-recorded clips + Vapi audio injection
-  - **LiveKit full barge-in control** — only if Vapi's built-in config is insufficient
-  - **Deepgram Flux** — better end-of-turn scoring but requires transcriber swap
-  - End of call measurement for each subpart of latency
-  - Still has latency issues --> Maybe because of the EoS detection? Still 2s
-- Multi-tenant 
-  - See, eventual goal is per customer, per call, per project level configurabilityt across many customers. Design keeping that in midn
-    - Tell it it is diligencing which product
-    - Tell it which direction to go, where not to spend too much time
-    - If not customization, uses the default
+- Take Stock
+  - Haiku TTFT is 2s+ - which is a lag. Try to get a faster model that is also reliable
+  - Any best practices not there, any bugs, any issues, update Claude.md, any Vapi. nuances/race conditions not being worked on etc. before proceeding
+- Eval Infra
+  - Evals
+    - E2E Evals
+      - **The single most underrated item on your list:** stopping the REPL path from diverging further. It's already happening and it quietly invalidates your eval results — which are the foundation of everything else.
+      - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
+      - Eventually do something about the non-Vapi path (used only for evals) functions like run_speech_run in turn.py, db_messages_fallback, prepare_interviewer_turn
+      - REPL Path is already diverging from prod
+      - In the hot path (`turn.py`), the session is closed *before* `interviewer.run()` is awaited (hence `Session | None` — the docstring explains this). So `deps.session` is `None` during the actual LLM call in production; it's only non-None in the REPL and evals. run_interviewer & run_interviewer_with_timeout are only called by evals
+    - Online Evals
+  - Versioned prompts/datasets/eval runs
+  - Alerts
+    - Alerts created, but no channel added yet
+  - Live Observability
+    - No per-call cost tracking (input/output tokens × rate).
+    - No alerting on `vapi_unknown_call` or `vapi_dial_error` — they just log.
+  - Logging
+    - Should we be logging more stuff so if it fails, you can see it. Also log instead of trace?
 - Conversation Trajectory
   - Make sure it asks everything
   - Make sure it probes at the correct depth
   - Make sure it wraps up with everything covered in a set time
   - Make sure it doesn't ask again/get stuck in loops/rabbitholes
   - Make sure it deals with non-happy path behavior
-- Eval Infra
-  - Live Observability
-    - No per-call cost tracking (input/output tokens × rate).
-    - No alerting on `vapi_unknown_call` or `vapi_dial_error` — they just log.
-  - Logging
-    - Should we be logging more stuff so if it fails, you can see it. Also log instead of trace?
-  - Evals
-    - E2E Evals
-      - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
-      - Eventually do something about the non-Vapi path (used only for evals) functions like run_speech_run in turn.py, db_messages_fallback, prepare_interviewer_turn
-      - REPL Path is already diverging from prod
-      - In the hot path (`turn.py`), the session is closed *before* `interviewer.run()` is awaited (hence `Session | None` — the docstring explains this). So `deps.session` is `None` during the actual LLM call in production; it's only non-None in the REPL and evals. run_interviewer & run_interviewer_with_timeout are only called by evals
-    - Online Evals
-  - Alerts
-    - Alerts created, but no channel added yet
-  - Vesioned prompts/datasets/eval runs
-- Synthesis Report
-  - Reinstate synthesis report once this works
-  - Maybe use async queues for this (learn to use async queues either way)
+  - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
+  - When handling a probe from earlier, it should say like you said earlier
+- Multi-tenant 
+  - See, eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in midn
+    - Tell it it is diligencing which product
+    - Tell it which direction to go, where not to spend too much time
+    - If not customization, uses the default
 - Infra - Prod Level
   - Webhook correctness (auth/idempotency)
   - Live DB + Alembic
@@ -59,7 +48,6 @@
   - Model Pinning & Rollback
   - Secrets Management
   - Dependency Mgmt on pyproject.timl and remove requirements.txt
-- Infra - Deployment Level to make sure it works in prod at decent scale
   - The analyst is triggered by polling `should_run_analyst()` on every `conversation-update`. Fine for one call, but with N concurrent calls you get lock contention and polling overhead. Production systems use a task queue (Celery + Redis, SQS, etc.) — the webhook handler enqueues a job instead of calling `asyncio.create_task` inline.
   - The analyst competes with the real-time interviewer for the event loop. A slow Sonnet call during a burst can delay turn responses. In production you'd want the analyst as a separate worker service — the invariant holds, you just move the writes to a different process.
   - SQS Queues
@@ -67,7 +55,33 @@
   - Multi-tenant auth
   - Rate limiting
   - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
-- Advanced
+
+---
+
+---
+
+- Model Infra
+  - Groq Failing
+    - Llama 3.3 70B on Groq failed to produce a valid structured tool call for the `final_result` function. This is a known reliability issue — Groq's llama models occasionally fail function-calling, especially with large system prompts
+- Memory
   - Memory/Improving agents with usage
+- Advanced Voice UX
   - Advanced Voice UX features & Voice UX Evals
+    - Make the fillers sound more natural
+    - Livekit/Pipecat & Deepgram: In production systems, it's not acceptable to wait for 1+ seconds (to decide if user is done talking w/o punctuation), but also not acceptable to interrupt users mid thought - how would it be done irl.
+      - Speculative LLM Firing: Calling LLM before VAD done: That's a managed-service tax. If sub-500ms E2E latency is a hard requirement, the honest answer is **Vapi is the constraint** — frameworks like LiveKit Agents or Pipecat running on your own infra are the production best practice for latency-critical voice AI. Fire the LLM on the *interim transcript* — before endpointing confirms. If the user continues speaking, cancel the inflight request and refire with the updated transcript. The wasted token cost is negligible vs. the latency win.
+      This requires streaming STT with interim results (Deepgram supports it), and a cancellation mechanism on the LLM side. **This is the technique that cuts perceived latency in half.** It works because most of the time, the user's last ~200ms of audio doesn't change the semantic meaning.
+      - E2E Streaming overlap: Streaming is not overlapped right now. Each stage starts before the previous one finishes: (Vapi constraint)
+        - STT streams partial → LLM starts on partial
+        - LLM streams first tokens → TTS starts on first sentence
+        - Audio starts playing before the full response is generated
+        Your system already does LLM→TTS streaming. The missing piece is STT→LLM streaming.
+      - Custom EOT Models: RIght now, EOT is taking 1s
+      - **No backchannels** — The bot can't say "mm-hmm" mid-answer. This is the single biggest voice UX gap vs. a human interviewer. It's a Vapi architectural constraint — true backchannels require LiveKit/Pipecat on your own infra (the TODO already flags this). Not worth solving now unless latency and reliability are solid.
+      - **LiveKit full barge-in control** — only if Vapi's built-in config is insufficient
+      - Deepgram flux: To reduce aggressive cutting on long answers (Not part of deepgram free tier)
+- Not too important
+  - Synthesis Report
+    - Reinstate synthesis report once this works
+    - Maybe use async queues for this (learn to use async queues either way)
 

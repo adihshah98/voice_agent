@@ -6,8 +6,10 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from pydantic_ai.usage import RunUsage
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+os.environ.setdefault("GROQ_API_KEY", "test-key")
 
 from voice_agent.agents import interviewer as interviewer_module
 from voice_agent.models import InterviewerOutput
@@ -29,6 +31,14 @@ async def test_interviewer_stream_tokens_and_output(monkeypatch: pytest.MonkeyPa
 
         async def get_output(self):
             return final
+
+        def usage(self) -> RunUsage:
+            return RunUsage(
+                input_tokens=100,
+                output_tokens=20,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+            )
 
     class FakeRunStreamCtx:
         async def __aenter__(self):
@@ -54,3 +64,6 @@ async def test_interviewer_stream_tokens_and_output(monkeypatch: pytest.MonkeyPa
 
     assert tokens == ["What ", "happened", " next?"]
     assert stream.output == final
+    assert stream.usage is not None
+    assert stream.usage.input_tokens == 100
+    assert stream.usage.output_tokens == 20
