@@ -780,12 +780,6 @@ def _build_voice_config() -> dict[str, Any]:
 
 def _build_start_speaking_plan() -> dict[str, Any]:
     return {
-        "smartEndpointingPlan": {"provider": "livekit"},
-        "transcriptionEndpointingPlan": {
-            "onPunctuationSeconds": 0.2,
-            "onNoPunctuationSeconds": 0.5,
-            "onNumberSeconds": 0.5,
-        },
         "waitSeconds": settings.vapi_wait_seconds,
     }
 
@@ -826,7 +820,13 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
                 **({"credentialId": settings.vapi_server_credential_id} if settings.vapi_server_credential_id else {}),
             },
             "voice": _build_voice_config(),
-            "transcriber": {"provider": "deepgram", "model": "nova-3", "language": "en"},
+            "transcriber": {
+                "provider": "deepgram",
+                "model": "flux-general-en",
+                "language": "en",
+                "eotThreshold": 0.7,
+                "eotTimeoutMs": 4500,
+        },
             "startSpeakingPlan": _build_start_speaking_plan(),
             "stopSpeakingPlan": _build_stop_speaking_plan(),
             "firstMessage": "Hey, thank you for getting on the call! Want to check if you can hear me before we get started.",
