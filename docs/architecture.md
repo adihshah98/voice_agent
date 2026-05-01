@@ -257,7 +257,11 @@ Phase 2   Side effects (DB writes, brief session)
 
 **Turn rows are NOT written here.** Confirmed turns are written by `_write_confirmed_turns()` in `server.py` when Vapi fires a `conversation-update` event — only after the turn was actually spoken. This prevents ghost rows from abandoned mid-stream utterances.
 
-**Streaming path** additionally yields `str` deltas as they arrive from the LLM, records `ttft_ms` (time-to-first-token), and yields a final `dict` with all timing metadata as the last item. The caller (`server.py`) distinguishes chunks from the terminal item by `isinstance(item, str)`.
+**Streaming path** (`TurnPipeline.stream_tokens()`) yields `str` tokens as they arrive from the LLM. After the generator is fully consumed, `commit()` reads `stream.output` and applies DB side effects.
+
+**Filler + `<flush />` tag:** When the first LLM token hasn't arrived within `FILLER_THRESHOLD_S`, `stream_tokens()` yields `filler + " <flush /> "` before the real tokens. The `<flush />` is a Vapi-specific directive: it tells Vapi to dispatch the accumulated text to TTS *immediately*, without buffering for more tokens. Without it, TTS providers (especially ElevenLabs) hold a small chunk until they have enough context to synthesize natural-sounding audio, defeating the purpose of sending it early. Note: ElevenLabs may still buffer internally despite the flush — see `docs/Latency Measurement.md` for the nuance.
+
+**Streaming with structured output — one LLM call, two-phase read:** `InterviewerOutput` is a Pydantic model with both `utterance` (the voice response text) and decision fields (`action`, `reasoning`, `probe_id_used`). Structured JSON output can't be streamed token-by-token — it isn't valid until complete. PydanticAI's streaming API solves this: `InterviewerStream.tokens()` yields the `utterance` field's tokens as they arrive (for immediate TTS delivery) while PydanticAI assembles and validates the full output internally. The validated `InterviewerOutput` is only available via `stream.output` after the stream is exhausted. Result: Vapi/TTS gets tokens at LLM speed (low latency), and routing decisions (action dispatch, probe DB writes) happen in `commit()` after streaming ends — all within a single LLM call, no two-pass approach needed.
 
 ---
 

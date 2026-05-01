@@ -13,6 +13,9 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Core
     anthropic_api_key: str | None = None  # validated by Anthropic SDK at call time
+    google_api_key: str | None = None     # validated by Google GenAI SDK at call time (GOOGLE_API_KEY)
+    openai_api_key: str | None = None     # optional first interviewer tier (OPENAI_API_KEY)
+    groq_api_key: str | None = None       # validated by Groq SDK at call time (GROQ_API_KEY)
     cerebras_api_key: str | None = None   # optional; Cerebras skipped from chain when absent
     database_url: str = "sqlite:///voice_agent.db"
 
@@ -39,6 +42,9 @@ class Settings(BaseSettings):
     vapi_voice_similarity_boost: float | None = None
     vapi_voice_style: float | None = None
     vapi_voice_speed: float | None = None
+    # ElevenLabs via Vapi: flush streamed text to TTS after this many chars. High values delay
+    # first audio on short fillers; 1 starts TTS as soon as text arrives.
+    vapi_voice_chunk_min_characters: int = 1
 
     # Voice pipeline timing & interruption
     vapi_wait_seconds: float = 0.0          # delay before assistant speaks after turn ends (Vapi default: 0.4)
@@ -49,12 +55,17 @@ class Settings(BaseSettings):
     # 0 = disabled. Avoids unbounded "Still there?" loops until maxDurationSeconds.
     vapi_extended_silence_seconds: float = 0.0
 
-    # Interviewer model chain (env-overridable; swap without redeploying)
-    # Cerebras: bare model name (no provider prefix); set to "" to skip Cerebras and start from Groq.
-    cerebras_model: str = "llama3.1-8b"
-    # Groq and Haiku: full pydantic-ai model strings
-    groq_model: str = "groq:llama-3.3-70b-versatile"
+    # Spoken line when the model response cannot be parsed into a usable utterance + metadata.
+    interviewer_recovery_utterance: str = (
+        "Hey, sorry I could not hear you — could you come again?"
+    )
+
+    # Interviewer model chain (env-overridable): OpenAI (if key + model) → Haiku → Gemini → Groq → Cerebras (optional).
+    openai_model: str = "openai:gpt-4.1-mini"  # "" skips OpenAI tier even when OPENAI_API_KEY is set
     haiku_model: str = "anthropic:claude-haiku-4-5-20251001"
+    gemini_model: str = "google-gla:gemini-2.0-flash"
+    groq_model: str = "groq:llama-3.3-70b-versatile"
+    cerebras_model: str = "cerebras:llama3.1-8b"  # same provider:model form; "" skips Cerebras in the chain
 
     # Dev
     log_level: str = "INFO"
@@ -74,11 +85,13 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Models — interviewer fallback chain: Cerebras → Groq → Groq (retry) → Haiku
-# Derived from settings so env vars (CEREBRAS_MODEL, GROQ_MODEL, HAIKU_MODEL) override them.
-INTERVIEWER_MODEL = settings.haiku_model
-INTERVIEWER_FALLBACK_MODEL_1 = settings.groq_model
-INTERVIEWER_FALLBACK_MODEL_2 = f"cerebras:{settings.cerebras_model}" if settings.cerebras_model else ""
+# Models — interviewer chain: OpenAI (optional) → Haiku → Gemini → Groq → Cerebras (optional)
+# Env: OPENAI_MODEL, HAIKU_MODEL, GEMINI_MODEL, GROQ_MODEL, CEREBRAS_MODEL; OpenAI/Cerebras omitted when key/model unset.
+INTERVIEWER_OPENAI_MODEL = settings.openai_model
+INTERVIEWER_HAIKU_MODEL = settings.haiku_model
+INTERVIEWER_GEMINI_MODEL = settings.gemini_model
+INTERVIEWER_GROQ_MODEL = settings.groq_model
+INTERVIEWER_CEREBRAS_MODEL = settings.cerebras_model
 ANALYST_MODEL = "anthropic:claude-sonnet-4-6"              # async, quality-sensitive
 SYNTHESIS_MODEL = "anthropic:claude-sonnet-4-6"            # post-call, no latency constraint
 
@@ -89,9 +102,10 @@ ENABLE_SYNTHESIS_REPORT: bool = False
 # 5 s reduces premature scripted fallbacks while still bounding hangs.
 INTERVIEWER_BUDGET_S: float = 5.0
 
-# Safety-valve filler: if LLM first token hasn't arrived within this window (seconds),
-# yield a brief acknowledgment sound so TTS starts immediately rather than staying silent.
-# 0.0 = disabled. Groq p50 TTFT is ~200-300 ms; 0.4 keeps fillers rare but catches slow turns.
+INTERVIEWER_RECOVERY_UTTERANCE: str = settings.interviewer_recovery_utterance
+
+# Streaming filler: when > 0, TurnPipeline yields a brief acknowledgment as soon as the
+# LLM stream starts so TTS begins immediately; real tokens follow. 0.0 = disabled.
 FILLER_THRESHOLD_S: float = 0.4
 
 # Vapi HMAC replay-attack window — reject requests whose timestamp is older than this.

@@ -424,16 +424,16 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                     user_stopped = entry.pop("user_stopped_at", None)
                     if user_stopped is not None:
                         turnaround_ms = int((now - user_stopped) * 1000)
-                        stt_ms = entry.pop("stt_ms", None)
+                        vapi_pipeline_ms = entry.pop("vapi_pipeline_ms", None)
                         llm_ttft_ms = entry.pop("llm_ttft_ms", None)
                         filler_injected = entry.pop("filler_injected", False)
-                        if stt_ms is not None and llm_ttft_ms is not None:
-                            tts_ttft_ms = turnaround_ms - stt_ms - llm_ttft_ms
+                        if vapi_pipeline_ms is not None and llm_ttft_ms is not None:
+                            tts_ttft_ms = turnaround_ms - vapi_pipeline_ms - llm_ttft_ms
                             logfire.info(
                                 "turn_latency",
                                 call_id=call_id,
                                 e2e_ms=turnaround_ms,
-                                stt_ms=stt_ms,
+                                vapi_pipeline_ms=vapi_pipeline_ms,
                                 llm_ttft_ms=llm_ttft_ms,
                                 tts_ttft_ms=tts_ttft_ms,
                                 filler_injected=filler_injected,
@@ -630,25 +630,26 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
             # Return an empty response so Vapi speaks nothing and no DB write happens.
             logfire.info("ghost_turn_skipped", call_id=call_id, vapi_call_id=vapi_call_id, message_count=len(messages))
         else:
-            # Time from Vapi's "user stopped speaking" webhook to this LLM call.
-            # speech-update fires at endpointing, so this window is STT transcription time.
-            stt_ms: int | None = None
+            # Time from speech-update(user/stopped) to this LLM call. Includes Vapi's
+            # full endpointing silence window + STT finalization + any speculative-call
+            # retry overhead. NOT just STT time — label accordingly.
+            vapi_pipeline_ms: int | None = None
             entry = _speech_ts.get(call_id, {})
             if "user_stopped_at" in entry:
-                stt_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
+                vapi_pipeline_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
 
-            # Stash stt_ms immediately — before any streaming — so the
-            # speech-update(assistant/started) handler always finds it even if it
-            # fires before the streaming loop finishes.
-            if stt_ms is not None:
-                _speech_ts.setdefault(call_id, {})["stt_ms"] = stt_ms
+            # Stash immediately — before any streaming — so the
+            # speech-update(assistant/started) handler finds it even if it fires
+            # before the streaming loop finishes.
+            if vapi_pipeline_ms is not None:
+                _speech_ts.setdefault(call_id, {})["vapi_pipeline_ms"] = vapi_pipeline_ms
 
             with logfire.span(
                     "vapi_llm_request",
                     call_id=call_id,
                     vapi_call_id=vapi_call_id,
                     message_count=len(messages),
-                    stt_ms=stt_ms,
+                    vapi_pipeline_ms=vapi_pipeline_ms,
                 ) as req_span:
                 reply_chars = 0
                 pipeline = TurnPipeline(engine, call_id, vapi_messages=messages)
@@ -661,7 +662,7 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
                         # so it's available here. Stashing here ensures the values are
                         # in _speech_ts before Vapi fires speech-update(assistant/started),
                         # which can't arrive until after Vapi receives this first token.
-                        if not ttft_stashed and stt_ms is not None and pipeline.ttft_ms is not None:
+                        if not ttft_stashed and vapi_pipeline_ms is not None and pipeline.ttft_ms is not None:
                             live_entry = _speech_ts.setdefault(call_id, {})
                             live_entry["llm_ttft_ms"] = pipeline.ttft_ms
                             live_entry["filler_injected"] = pipeline.filler_injected
@@ -677,12 +678,23 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
                         _fire(_analyst_task(call_id), name=f"analyst-{call_id}")
                 except asyncio.CancelledError:
                     stream_cancelled = True
+                    filler_already_sent = pipeline.filler_injected
                     logfire.info(
                         "vapi_llm_stream_cancelled",
                         call_id=call_id,
                         vapi_call_id=vapi_call_id,
                         reply_chars=reply_chars,
+                        filler_already_sent=filler_already_sent,
                     )
+                    if filler_already_sent:
+                        # Vapi cancelled after the filler was played — user heard
+                        # "Mm-hm," but nothing after. Vapi will retry the full call.
+                        logfire.warning(
+                            "vapi_filler_orphaned",
+                            call_id=call_id,
+                            vapi_call_id=vapi_call_id,
+                            reply_chars=reply_chars,
+                        )
                     return
                 except Exception:
                     logfire.exception(
@@ -757,9 +769,12 @@ def _build_voice_config() -> dict[str, Any]:
     ):
         if value is not None:
             voice[json_key] = value
-    # Start TTS on the filler phrase itself rather than waiting for LLM tokens.
-    # Default minCharacters is 30; our fillers are 11-12 chars, so 10 triggers on them.
-    voice["chunkPlan"] = {"enabled": True, "minCharacters": 10}
+    # chunkPlan buffers streamed assistant text before sending a slice to ElevenLabs.
+    # Default without this is ~30 chars — short fillers never flush alone, so TTS waited for LLM text.
+    voice["chunkPlan"] = {
+        "enabled": True,
+        "minCharacters": max(1, settings.vapi_voice_chunk_min_characters),
+    }
     return voice
 
 
@@ -814,7 +829,7 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
             "transcriber": {"provider": "deepgram", "model": "nova-3", "language": "en"},
             "startSpeakingPlan": _build_start_speaking_plan(),
             "stopSpeakingPlan": _build_stop_speaking_plan(),
-            "firstMessage": "Hey! Thank you for getting on the call. Just want to check if you can hear me before we get started.",
+            "firstMessage": "Hey, thank you for getting on the call! Want to check if you can hear me before we get started.",
             "firstMessageMode": "assistant-speaks-first",
             "maxDurationSeconds": 1800,
             "metadata": {"call_id": call_id},

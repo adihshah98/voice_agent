@@ -36,15 +36,26 @@ Multi-agent voice research interviewer built on Vapi. **[docs/architecture.md](d
 
 Three PydanticAI agents, each with a different latency budget — this is the core design constraint:
 
-1. **Interviewer** ([voice_agent/agents/interviewer.py](voice_agent/agents/interviewer.py)) — Haiku 4.5, one LLM call per turn, hard 5 s deadline via `anyio.move_on_after`. **Not** a ReAct tool loop: all DB state is pre-fetched into a CONTEXT block and the model returns a single structured `InterviewerOutput`. Python then applies side effects (marking probe/scripted as asked) based on the output. If the deadline fires, `_fallback()` returns the next scripted question.
+1. **Interviewer** ([voice_agent/agents/interviewer.py](voice_agent/agents/interviewer.py)) — one LLM call per turn, hard 5 s deadline via `anyio.move_on_after`. **Not** a ReAct tool loop: all DB state is pre-fetched into a CONTEXT block and the model returns a single structured `InterviewerOutput`. Python then applies side effects (marking probe/scripted as asked) based on the output. If the deadline fires, `_fallback()` returns the next scripted question. Uses a `FallbackModel` chain: **Haiku 4.5 → Groq (llama-3.3-70b) → Groq retry → Cerebras (llama3.1-8b)**. Models are env-overridable via `HAIKU_MODEL`, `GROQ_MODEL`, `CEREBRAS_MODEL` in [voice_agent/config.py](voice_agent/config.py). Set `CEREBRAS_MODEL=""` to skip Cerebras. On `status-update: active`, a Groq warmup request fires in the background to pre-warm the connection.
 2. **Analyst** ([voice_agent/agents/analyst.py](voice_agent/agents/analyst.py)) — Sonnet 4.6, fire-and-forget via `asyncio.create_task`. Triggered from the `conversation-update` webhook when `should_run_analyst()` returns True: either the scripted cursor advanced, or ≥25 turns elapsed since the last snapshot. Reads prior `AnalystSnapshot` as established context + only the new turns since, so prompt size stays bounded on long calls. Wrapped in `run_analyst_safely` — exceptions are swallowed so a crashing analyst never affects the live call.
 3. **Synthesis** ([voice_agent/agents/synthesis.py](voice_agent/agents/synthesis.py)) — Sonnet 4.6, post-call. Gated by `ENABLE_SYNTHESIS_REPORT` in [voice_agent/config.py](voice_agent/config.py) (currently **False** — keep that in mind when testing the end-of-call path).
 
 **Invariant: agents never call each other.** All coordination flows through SQLite tables in [voice_agent/state.py](voice_agent/state.py). Model IDs, timeouts, and the synthesis flag all live in [voice_agent/config.py](voice_agent/config.py) — swap a model there, nothing else changes.
 
+**REPL path caveat:** `run_interviewer` and `run_interviewer_with_timeout` in `interviewer.py` are called only by evals. In the production hot path (`TurnPipeline` in `turn.py`), the SQLModel session is closed *before* `interviewer.run()` is awaited, so `deps.session` is `None` during the actual LLM call. The REPL and evals pass a live session. This path is diverging from prod — be careful when testing REPL behavior as a proxy for production.
+
 ### Turn pipeline
 
-The single entry point for a speech turn is `run_speech_turn` in [voice_agent/turn.py](voice_agent/turn.py). Both the Vapi custom-LLM webhook (`/vapi/llm/chat/completions` in [voice_agent/server.py](voice_agent/server.py)) and the local REPL (`scripts/play.py`) call it — so in-process REPL and production call share one code path. The custom-LLM endpoint returns OpenAI-shaped responses (with optional SSE streaming) because Vapi expects an OpenAI-compatible shape.
+[voice_agent/turn.py](voice_agent/turn.py) has two paths:
+
+- **`TurnPipeline`** — production streaming path. The Vapi custom-LLM webhook (`/vapi/llm/chat/completions`) instantiates this and streams SSE tokens. Tracks `llm_ttft_ms`, `filler_injected`, and prompt cache token counts per turn.
+- **`run_speech_turn`** — non-streaming, used only by the local REPL (`scripts/play.py`) and evals. Buffers tokens and returns a complete result.
+
+The custom-LLM endpoint returns OpenAI-shaped responses (SSE chunks) because Vapi expects an OpenAI-compatible shape.
+
+**Filler phrases:** When `FILLER_THRESHOLD_S` > 0, `TurnPipeline` yields a short acknowledgment (e.g. "Mm-hm,") followed by `" <flush /> "` if the first LLM token hasn't arrived within that window. The `<flush />` tag tells Vapi to dispatch the buffered text to TTS immediately — without it, TTS providers hold the filler until more tokens arrive. `FILLER_THRESHOLD_S = 0.0` disables this. The filler is flagged via `filler_injected`.
+
+**Streaming + structured output in one LLM call:** `InterviewerOutput` is a Pydantic model; its JSON can't be validated until complete. PydanticAI's streaming API lets `InterviewerStream.tokens()` yield `utterance` tokens live (for TTS) while building the full output internally. `stream.output` (action, reasoning, probe_id_used) is only readable after the stream is exhausted — consumed in `commit()`. No two-pass LLM call needed. See `docs/architecture.md` → Turn Pipeline for details.
 
 **Turn rows are not written in `run_speech_turn`.** They are written by `_write_confirmed_turns()` in `server.py`, triggered by `conversation-update` webhook events — only after Vapi confirms the turn was actually spoken. This eliminates ghost turns from rapid-fire utterance boundaries.
 
@@ -53,13 +64,20 @@ The single entry point for a speech turn is `run_speech_turn` in [voice_agent/tu
 Two endpoints, different roles:
 
 - `/vapi/llm/chat/completions` — per-turn inference (replaces OpenAI from Vapi's perspective).
-- `/vapi/webhook` — four event types:
-  - `status-update` — flips `Call.status` pending→active.
-  - `conversation-update` — writes confirmed turns to DB; triggers analyst if `should_run_analyst()`.
-  - `end-of-call-report` — flips status to ended; schedules synthesis if enabled.
-  - `speech-update` — logged only, no state change.
+- `/vapi/webhook` — HMAC-verified (see Security below). Four event types:
+  - `status-update` — flips `Call.status` pending→active; fires Groq warmup on first active.
+  - `conversation-update` — writes confirmed turns to DB; triggers analyst if `should_run_analyst()`; logs per-turn latency breakdown (`vapi_turn_ms`, `vapi_endpointing_ms`, `llm_ttft_ms`).
+  - `end-of-call-report` — flips status to ended; schedules synthesis if enabled; cancels silence watch.
+  - `speech-update` — tracks timing (`_speech_ts`) for latency measurement; manages the extended-silence watch (starts timer on `assistant/stopped`, cancels on `user/started`).
 
 Outbound dialing (`_dial_vapi`) writes the Vapi-assigned `vapi_call_id` back onto the `Call` row after the POST returns. Known fragile: Vapi can fire `status-update: ringing` before that write commits. Works in practice (ringing fires ~hundreds of ms later) but is not atomic. See `docs/TODO.md`.
+
+**Extended silence:** After assistant TTS ends, if the user doesn't speak within `VAPI_EXTENDED_SILENCE_SECONDS`, `_end_call_vapi_delete` fires. Set to 0 (default) to disable. Avoids unbounded silent calls up to `maxDurationSeconds`.
+
+### Security
+
+- **Webhook HMAC:** `/vapi/webhook` uses `_require_vapi_signature` (FastAPI dependency). Vapi signs the payload with `VAPI_WEBHOOK_SECRET` using HMAC-SHA256. Requests outside `VAPI_TIMESTAMP_TOLERANCE_S` (5 min) are rejected. `VAPI_WEBHOOK_SECRET=""` skips verification (dev mode).
+- **LLM secret token:** `/vapi/llm/chat/completions` checks the `X-Vapi-Secret` header against `LLM_SECRET_TOKEN`. Empty = skip check (dev mode).
 
 ### Database (SQLModel/SQLite)
 

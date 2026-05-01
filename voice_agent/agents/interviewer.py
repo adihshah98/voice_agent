@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
+import re
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
@@ -19,15 +21,34 @@ import anyio
 import logfire
 from groq import APIError as GroqAPIError
 from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior
 from pydantic_ai.messages import CachePoint
 from pydantic_ai.usage import RunUsage
-from pydantic_ai.models.anthropic import AnthropicModelSettings
+from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
+from pydantic_ai.models.cerebras import CerebrasModel
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.models.groq import GroqModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.anthropic import AnthropicProvider
+from pydantic_ai.providers.cerebras import CerebrasProvider
+from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.providers.groq import GroqProvider
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic import ValidationError
 
 from voice_agent import state
-from voice_agent.config import INTERVIEWER_BUDGET_S, INTERVIEWER_FALLBACK_MODEL_1, INTERVIEWER_FALLBACK_MODEL_2, INTERVIEWER_MODEL, settings
-from voice_agent.models import InterviewerDeps, InterviewerOutput
+from voice_agent.config import (
+    INTERVIEWER_BUDGET_S,
+    INTERVIEWER_CEREBRAS_MODEL,
+    INTERVIEWER_GEMINI_MODEL,
+    INTERVIEWER_GROQ_MODEL,
+    INTERVIEWER_HAIKU_MODEL,
+    INTERVIEWER_OPENAI_MODEL,
+    INTERVIEWER_RECOVERY_UTTERANCE,
+    settings,
+)
+from voice_agent.models import InterviewerDeps, InterviewerLLMMeta, InterviewerOutput
 
 
 CONTEXT_WINDOW_TURNS = 15  # recent turns injected into the LLM context block; keep under Cerebras 8k limit
@@ -208,10 +229,13 @@ Decision framework — use your judgment in this order:
 1. OFF-TOPIC: If the respondent went on a personal tangent unrelated to the study,
    acknowledge briefly and steer back with one open question. Use `off_topic`.
 
-2. IMMEDIATE FOLLOW-UP: If the respondent just said something worth digging into —
-   a complaint, surprise, contradiction, specific detail, red flag, or investor signal
-   (see triggers below) — probe it NOW. Don't wait for the analyst.
+2. IMMEDIATE FOLLOW-UP: If the respondent just said something that matches an investor
+   signal trigger below (referral, AI trust, ROI, competitor, budget, expansion, red flag)
+   OR stated a direct contradiction with what they said earlier — probe it NOW.
    Use action=`probe`.
+   SKIP this step if: the answer is too vague to understand (go to step 5 CLARIFY), or
+   if it's a closing/dismissive statement that wraps up the topic you just asked about
+   ("it's fine now", "not really", "I guess so", "never mind").
 
 3. ANALYST PROBE — PENDING_PROBES is non-empty:
    - Pick the highest-priority probe not already in COVERED_TOPICS.
@@ -228,8 +252,14 @@ Decision framework — use your judgment in this order:
    action=`skip_scripted` and move on to a probe or the following scripted question.
    Do NOT ask about a subtopic already in COVERED_SUBTOPICS or RECENT_TURNS.
 
-5. CLARIFY: Only if the answer was genuinely ambiguous before you can move on.
-   Do not use for clear, on-topic answers. Use action=`clarify`.
+5. CLARIFY: If the answer is too vague to understand — use action=`clarify`.
+   Triggers: single words ("Mixed.", "Fine.", "Maybe."), hedges without substance
+   ("it's fine I guess, kind of", "sort of", "I don't know"), or any answer where
+   you'd need to ask "what do you mean by that?" before you could usefully probe.
+   KEY DISTINCTION — clarify asks for the *meaning* of a vague answer; probe digs
+   deeper into a clear one. "What do you mean by mixed?" → clarify.
+   "You mentioned it saved you time — roughly how much?" → probe.
+   Do NOT use `probe` when the answer itself is unclear.
 
 6. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
    Use action=`wrap_up`.
@@ -286,29 +316,58 @@ Hard rules:
 - Speak numbers as words: "about thirty percent" not "30%", "three to five times" not "3–5x".
 - If the respondent asks who you are or for your name, deflect warmly and briefly —
   "I'm Sagar/ I work at a market research firm" — then immediately ask your next question.
-- Valid actions: scripted, probe, clarify, off_topic, wrap_up. Do not use `acknowledge`
+- Valid actions: scripted, probe, clarify, off_topic, wrap_up, skip_scripted. Do not use `acknowledge`
   as a standalone action — brief acknowledgments belong in the utterance itself before
   steering back.
-- Populate `reasoning` with one sentence on why you chose this action.
-  Not spoken; for traces and evals only.
+
+OUTPUT FORMAT — machine parsing depends on an exact shape. Deviation breaks the interview.
+
+Structure (in this order, nothing else):
+1) Opening tag `<utterance>` as the very first characters of your entire output.
+2) Spoken text only (no nested tags, no `</utterance>` inside the spoken text).
+3) Closing tag `</utterance>`.
+4) Exactly one newline.
+5) Exactly one JSON object on the next line: minified, one line, double-quoted keys.
+
+The JSON object MUST contain only these three keys (no others, no markdown fences):
+- "action": one of scripted, probe, clarify, off_topic, wrap_up, skip_scripted
+- "reasoning": one short sentence (not spoken)
+- "probe_id_used": either a positive integer matching a PENDING_PROBES id, or null
+
+Examples of WRONG output (do not do this):
+- Preamble before `<utterance>`
+- Pretty-printed JSON spanning multiple lines
+- Wrapping the JSON in ``` fences
+- Trailing text, apologies, or a second JSON object after the first
+- action "probe" with probe_id_used null when you followed a PENDING_PROBES suggestion (must copy the id)
+
+Example of CORRECT output (copy this shape; substitute your own strings):
+<utterance>Got it. Walk me through how your team actually uses the product day-to-day.</utterance>
+{"action":"scripted","reasoning":"Moving to the first scripted question.","probe_id_used":null}
 """
 
 
 def _log_and_fallback(exc: Exception) -> bool:
-    """Log any provider API error and fall back to the next model in the chain.
+    """Log any provider API or structured-output error and fall back to the next model.
 
-    Chain: Cerebras → Groq → Groq (retry) → Haiku.
+    Chain: OpenAI (optional) → Haiku → Gemini → Groq → Cerebras (when API key and model are configured).
     Returning True tells FallbackModel to try the next model.
-    Returning False re-raises (for non-API errors we don't want to silently swallow).
+    Returning False re-raises (for logic errors we don't want to silently swallow).
     """
-    is_api_error = isinstance(exc, (GroqAPIError, ModelAPIError))
-    if not is_api_error:
+    is_fallback_error = isinstance(exc, (GroqAPIError, ModelAPIError, UnexpectedModelBehavior))
+    if not is_fallback_error:
         try:
             from openai import APIError as OpenAIAPIError
-            is_api_error = isinstance(exc, OpenAIAPIError)
+            is_fallback_error = isinstance(exc, OpenAIAPIError)
         except ImportError:
             pass
-    if is_api_error:
+    if not is_fallback_error:
+        try:
+            from google.genai.errors import APIError as GoogleAPIError
+            is_fallback_error = isinstance(exc, GoogleAPIError)
+        except ImportError:
+            pass
+    if is_fallback_error:
         logfire.warning(
             "interviewer_model_error",
             error_type=type(exc).__name__,
@@ -319,29 +378,61 @@ def _log_and_fallback(exc: Exception) -> bool:
 
 
 def _build_interviewer_model() -> FallbackModel:
-    """Build fallback chain: Haiku → Groq → Groq retry → Cerebras.
+    """Build model chain: OpenAI (optional) → Haiku → Gemini → Groq → Cerebras (optional).
 
-   
+    Each model is constructed explicitly with its provider so API keys are read
+    from settings (pydantic-settings / .env) rather than requiring them in os.environ
+    at import time.
     """
-    
-    chain = [
-        INTERVIEWER_MODEL,           # Haiku
-        INTERVIEWER_FALLBACK_MODEL_1,   # Groq
-        INTERVIEWER_FALLBACK_MODEL_1,   # Groq retry (transient failures)
-        INTERVIEWER_FALLBACK_MODEL_2,  # Cerebras last resort
-    ]
+    def _strip(model_str: str) -> str:
+        """'provider:model-name' → 'model-name' (bare model id still accepted)."""
+        return model_str.split(":", 1)[1] if ":" in model_str else model_str
+
+    chain: list = []
+    openai_id = _strip(INTERVIEWER_OPENAI_MODEL).strip()
+    if settings.openai_api_key and openai_id:
+        chain.append(
+            OpenAIChatModel(
+                openai_id,
+                provider=OpenAIProvider(api_key=settings.openai_api_key),
+            )
+        )
+
+    haiku = AnthropicModel(
+        _strip(INTERVIEWER_HAIKU_MODEL),
+        provider=AnthropicProvider(api_key=settings.anthropic_api_key),
+        settings=AnthropicModelSettings(anthropic_cache_instructions="1h"),
+    )
+    # thinking_budget=0 caps unbounded reasoning that can spike to 12s+ on complex turns.
+    gemini = GoogleModel(
+        _strip(INTERVIEWER_GEMINI_MODEL),
+        provider=GoogleProvider(api_key=settings.google_api_key),
+        settings=GoogleModelSettings(thinking_config={'thinking_budget': 0}),
+    )
+    groq = GroqModel(
+        _strip(INTERVIEWER_GROQ_MODEL),
+        provider=GroqProvider(api_key=settings.groq_api_key),
+    )
+
+    chain.extend([haiku, gemini, groq])
+    cerebras_id = _strip(INTERVIEWER_CEREBRAS_MODEL).strip()
+    if settings.cerebras_api_key and cerebras_id:
+        chain.append(
+            CerebrasModel(
+                cerebras_id,
+                provider=CerebrasProvider(api_key=settings.cerebras_api_key),
+            )
+        )
+
     return FallbackModel(*chain, fallback_on=_log_and_fallback)
 
 
 interviewer = Agent(
     _build_interviewer_model(),
     deps_type=InterviewerDeps,
-    output_type=InterviewerOutput,
+    output_type=str,
     system_prompt=INTERVIEWER_PROMPT,
     instrument=True,
-    model_settings=AnthropicModelSettings(
-        anthropic_cache_instructions='1h',
-    ),
 )
 
 
@@ -366,7 +457,7 @@ async def run_interviewer(
             vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
         )
     result = await interviewer.run(prepared.prompt_parts, deps=deps)
-    return result.output
+    return _parse_streamed_output(result.output, prepared.fallback_scripted_question)
 
 
 def _db_messages_fallback(session, call_id: str) -> list[dict]:
@@ -380,6 +471,104 @@ def _db_messages_fallback(session, call_id: str) -> list[dict]:
         role = "assistant" if t.speaker == "interviewer" else "user"
         messages.append({"role": role, "content": t.text})
     return messages
+
+
+_OPEN_TAG = "<utterance>"
+_CLOSE_TAG = "</utterance>"
+_META_RE = re.compile(r"</utterance>\s*(\{.*)", re.DOTALL)
+_META_BARE_RE = re.compile(r"\n(\{.*)", re.DOTALL)  # tag-free fallback: JSON after first \n{
+
+
+def _parse_streamed_output(
+    text: str,
+    fallback_scripted_question: str | None = None,  # noqa: ARG001
+) -> InterviewerOutput:
+    """Parse <utterance>...</utterance> + trailing JSON from a plain-text model response.
+
+    Falls back to bare format (utterance text then newline + JSON) when tags are absent.
+    """
+    tag_m = re.search(r"<utterance>(.*?)</utterance>", text, re.DOTALL)
+    wire_delimited = False
+    if tag_m:
+        utterance = tag_m.group(1).strip()
+        meta_m = _META_RE.search(text)
+        meta_json = meta_m.group(1).strip() if meta_m else ""
+        wire_delimited = True
+    else:
+        bare_m = _META_BARE_RE.search(text)
+        if bare_m:
+            utterance = text[:bare_m.start()].strip()
+            meta_json = bare_m.group(1).strip()
+            wire_delimited = True
+        else:
+            utterance = text.strip()
+            meta_json = ""
+
+    # Whole-body JSON (no tags and no bare newline-before-{ split) — never send to TTS as speech.
+    if not wire_delimited:
+        u = utterance.strip()
+        if u.startswith("{") and '"action"' in u:
+            try:
+                blob = json.loads(u)
+                if isinstance(blob, dict) and "action" in blob:
+                    logfire.warning(
+                        "interviewer_json_only_body",
+                        text_snippet=u[:200],
+                    )
+                    return InterviewerOutput(
+                        utterance=INTERVIEWER_RECOVERY_UTTERANCE,
+                        action="scripted",
+                        reasoning="model returned JSON without a spoken utterance block",
+                        probe_id_used=None,
+                    )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    try:
+        raw = json.loads(meta_json) if meta_json.strip() else {}
+        if not isinstance(raw, dict):
+            raise ValueError("metadata JSON must be an object")
+        meta = InterviewerLLMMeta.model_validate(raw)
+        if meta.action == "probe" and meta.probe_id_used is None:
+            logfire.warning(
+                "interviewer_probe_action_missing_id",
+                utterance_snippet=(utterance or "")[:80],
+            )
+        spoken = utterance.strip()
+        if not spoken:
+            logfire.warning("interviewer_empty_utterance", wire_delimited=wire_delimited)
+            return InterviewerOutput(
+                utterance=INTERVIEWER_RECOVERY_UTTERANCE,
+                action="scripted",
+                reasoning="empty utterance from model",
+                probe_id_used=None,
+            )
+        return InterviewerOutput(
+            utterance=spoken,
+            action=meta.action,
+            reasoning=meta.reasoning,
+            probe_id_used=meta.probe_id_used,
+        )
+    except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+        logfire.warning(
+            "interviewer_metadata_parse_failed",
+            text_snippet=text[:300],
+            error_type=type(exc).__name__,
+        )
+        spoken = (utterance or "").strip()
+        if spoken:
+            return InterviewerOutput(
+                utterance=spoken,
+                action="scripted",
+                reasoning="metadata parse failed",
+                probe_id_used=None,
+            )
+        return InterviewerOutput(
+            utterance=INTERVIEWER_RECOVERY_UTTERANCE,
+            action="scripted",
+            reasoning="metadata parse failed",
+            probe_id_used=None,
+        )
 
 
 class InterviewerStream:
@@ -414,29 +603,102 @@ class InterviewerStream:
         return self._output
 
     async def tokens(self) -> AsyncGenerator[str, None]:
-        """Yield text deltas as the utterance streams in."""
+        """Yield utterance tokens as they stream in.
+
+        Model outputs <utterance>...</utterance> as plain text (no JSON schema,
+        so all providers stream token-by-token), followed by a JSON metadata block
+        used only for DB commit. We yield tokens inside the tags and stop there;
+        the full text is parsed into InterviewerOutput after the stream completes.
+        """
         deps = self._deps
         prepared = self._prepared
         _stream_error: Exception | None = None
+        full_text = ""
+        any_yielded = False
 
         with anyio.move_on_after(self._budget_s) as cancel_scope:
-            prev = ""
             try:
                 async with interviewer.run_stream(prepared.prompt_parts, deps=deps) as streamed:
-                    async for partial in streamed.stream_output(debounce_by=None):
-                        current = partial.utterance or ""
-                        if len(current) > len(prev):
-                            yield current[len(prev):]
-                            prev = current
-                    self._output = await streamed.get_output()
+                    in_utterance = False
+                    utterance_done = False
+                    bare_mode = False  # True when model omits <utterance> tags
+                    carry = ""
+
+                    async for delta in streamed.stream_text(delta=True, debounce_by=None):
+                        full_text += delta
+
+                        if utterance_done:
+                            continue
+
+                        carry += delta
+
+                        if not in_utterance and not bare_mode:
+                            idx = carry.find(_OPEN_TAG)
+                            if idx >= 0:
+                                in_utterance = True
+                                carry = carry[idx + len(_OPEN_TAG):]
+                                # Fall through to in_utterance block below
+                            elif len(carry) > len(_OPEN_TAG):
+                                # Opening tag not found after enough chars — model is tag-free
+                                bare_mode = True
+                                # Fall through to bare_mode block below
+                            else:
+                                continue
+
+                        if in_utterance:
+                            # Inside tagged utterance — yield safe prefix, hold back enough
+                            # chars to detect a split </utterance> close tag
+                            idx = carry.find(_CLOSE_TAG)
+                            if idx >= 0:
+                                utterance_done = True
+                                if idx > 0:
+                                    yield carry[:idx]
+                                    any_yielded = True
+                                carry = ""
+                            else:
+                                safe_end = max(0, len(carry) - (len(_CLOSE_TAG) - 1))
+                                if safe_end > 0:
+                                    yield carry[:safe_end]
+                                    any_yielded = True
+                                    carry = carry[safe_end:]
+
+                        elif bare_mode:
+                            # Tag-free format: yield until \n{ marks the start of the JSON block
+                            idx = carry.find('\n{')
+                            if idx >= 0:
+                                utterance_done = True
+                                if idx > 0:
+                                    yield carry[:idx]
+                                    any_yielded = True
+                                carry = ""
+                            else:
+                                # Hold back 1 char so \n{ can be detected across delta boundaries
+                                safe_end = max(0, len(carry) - 1)
+                                if safe_end > 0:
+                                    yield carry[:safe_end]
+                                    any_yielded = True
+                                    carry = carry[safe_end:]
+
+                    self._output = _parse_streamed_output(full_text, prepared.fallback_scripted_question)
                     self._usage = streamed.usage()
+                    # Safety: if the model skipped both tag and bare formats entirely, yield the
+                    # parsed utterance as a single chunk so TTS always gets something.
+                    if not any_yielded and self._output:
+                        yield self._output.utterance
+                        any_yielded = True
             except (GroqAPIError, ModelAPIError) as exc:
                 _stream_error = exc
-            except RuntimeError as exc:
-                # pydantic-graph's anyio TaskGroup raises this specific message during
-                # __aexit__ when run inside asyncio.create_task on Python 3.14.
-                # self._output is set before __aexit__ runs, so the call succeeded.
-                if "Attempted to exit cancel scope in a different task" not in str(exc) or self._output is None:
+            except Exception as exc:  # noqa: BLE001
+                # Catches provider errors not in the known set (e.g. google.genai.errors.ServerError)
+                # that escape _log_and_fallback and the FallbackModel chain.
+                # RuntimeError from pydantic-graph's anyio TaskGroup is the one exception:
+                # if the call actually succeeded (self._output is set), don't treat it as an error.
+                if isinstance(exc, RuntimeError) and (
+                    "Attempted to exit cancel scope in a different task" in str(exc)
+                    and self._output is not None
+                ):
+                    pass
+                else:
                     _stream_error = exc
 
         if cancel_scope.cancelled_caught:
@@ -462,7 +724,7 @@ class InterviewerStream:
             )
             fb = _fallback(deps, fallback_scripted_question=prepared.fallback_scripted_question)
             self._output = fb
-            if not prev:
+            if not any_yielded:
                 yield fb.utterance
             return
 

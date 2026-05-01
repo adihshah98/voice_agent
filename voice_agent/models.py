@@ -7,9 +7,9 @@ the LLM and evals, not persistence shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlmodel import Session
 
 
@@ -19,6 +19,32 @@ Action = Literal[
 
 
 # --- Interviewer -----------------------------------------------------------
+
+
+class InterviewerLLMMeta(BaseModel):
+    """JSON tail of the interviewer wire format (`<utterance>`…`</utterance>` then one object).
+
+    Validated separately from `InterviewerOutput` so streaming can parse metadata
+    with the same rules as the non-streaming path.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: Action = Field(
+        default="scripted",
+        description="Must be one of the allowed interviewer actions.",
+    )
+    reasoning: str = Field(default="", description="One sentence; not spoken.")
+    probe_id_used: int | None = Field(
+        default=None,
+        description="PENDING_PROBES id when action is probe; otherwise null.",
+    )
+
+    @model_validator(mode="after")
+    def clear_probe_id_unless_probe(self) -> Self:
+        if self.action != "probe" and self.probe_id_used is not None:
+            return self.model_copy(update={"probe_id_used": None})
+        return self
 
 
 @dataclass

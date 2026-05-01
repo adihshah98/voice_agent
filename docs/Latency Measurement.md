@@ -18,13 +18,25 @@ e2e_ms	Our primary metric: endpointing → first assistant audio	user_stopped_at
 stt_ms	Endpointing → transcript at LLM endpoint	user_stopped_at → LLM request arrival
 llm_ttft_ms	LLM internal TTFT	time.perf_counter() inside stream_tokens()
 tts_ttft_ms	First LLM token → first audio out	e2e_ms - stt_ms - llm_ttft_ms (residual)
-filler_injected	Whether a filler was played instead of real response	stashed from _first_token_ms check in stream_tokens()
+filler_injected	Whether an instant filler prefix was streamed before LLM tokens	stashed from stream_tokens()
 Vapi endpointingLatency	Last audio byte → VAD fires (pre-t0 offset, per turn)	end-of-call-report turnLatencies[i]
 Vapi turnLatency	Vapi's E2E ≈ our e2e_ms (same window, different clock)	end-of-call-report turnLatencies[i]
 true_e2e_ms	True user-perceived: last audio byte → first audio out	vapi_endpointing_ms + e2e_ms (computable at call-end)
 Important: e2e_ms does NOT include the endpointing decision delay. The time from the user's actual last word to our t0 is Vapi's endpointingLatency. True user-perceived latency = vapi_endpointing_ms + e2e_ms.
 
-Filler effect: When a filler fires (TTFT > FILLER_THRESHOLD_S), speech-update(assistant/started) fires for the filler, making e2e_ms reflect filler latency (much lower), not LLM response latency. e2e_ms must be read alongside filler_injected to be meaningful.
+Filler effect: When fillers are enabled, speech-update(assistant/started) fires for the filler first, so e2e_ms reflects filler-to-audio latency before the main LLM line. e2e_ms must be read alongside filler_injected to be meaningful.
+
+**Why no gap between filler and the rest of speech?**
+
+The most likely explanation: **ElevenLabs is buffering**. Vapi sends "Mm-hm, " (8 chars) to ElevenLabs immediately, but ElevenLabs' streaming TTS internally waits for enough context before generating audio — `chunkPlan.minCharacters=1` controls Vapi's chunk size, not ElevenLabs' internal synthesis buffer. So:
+
+- ElevenLabs holds "Mm-hm, " until more text arrives ~1.5s later
+- Then generates audio for the full concatenated response in one pass
+- Result: no gap, but `voiceLatency = 1.7s` because TTS started at the filler token but audio didn't come back until LLM was done
+
+**If this is what's happening, the filler isn't actually helping perceptual latency at all** — ElevenLabs is just absorbing it into the full response.
+
+
 
 Currently
 

@@ -21,24 +21,28 @@ from voice_agent.config import FILLER_THRESHOLD_S
 from voice_agent.models import InterviewerDeps, InterviewerOutput
 
 # Brief acknowledgment phrases injected when the LLM first token is slow.
-# Long enough (≥10 chars) to trigger ElevenLabs TTS via chunkPlan.minCharacters=10,
-# so audio starts on the filler itself rather than waiting for the first LLM token.
+# Keep short — ElevenLabs chunkPlan uses vapi_voice_chunk_min_characters (default 1) so TTS
+# starts on the filler without waiting for more streamed characters from the LLM.
 # Lowercase + trailing comma so they flow into the LLM's opener ("Mm, got it, tell me more...")
 _FILLERS = [
-    "Mm-hm,",
-    "Uh-huh,",
-    "Yeah,",
-    "Mhm,",
-    "Gotcha,",
+    "Mm-hm...",
+    "Uh-huh...",
+    "Yeah...",
+    "Mhm...",
+    "Right...",
+    "Okay..",
+    "Gotcha... ",
+    "Got it...",
+    "Good to know,"
 ]
-_last_filler: dict[str, str] = {}  # call_id → last filler used (avoid immediate repeats)
+_recent_fillers: dict[str, list[str]] = {}  # call_id → last 2 fillers used
 
 
 def _pick_filler(call_id: str) -> str:
-    last = _last_filler.get(call_id)
-    pool = [f for f in _FILLERS if f != last]
+    recent = _recent_fillers.get(call_id, [])
+    pool = [f for f in _FILLERS if f not in recent] or _FILLERS
     choice = random.choice(pool)
-    _last_filler[call_id] = choice
+    _recent_fillers[call_id] = (recent + [choice])[-2:]
     return choice
 
 
@@ -130,7 +134,7 @@ class TurnPipeline:
 
         # The generator uses anyio cancel scopes internally, which can't cross asyncio
         # task boundaries. Running it fully in a background task keeps the cancel scope
-        # contained; we race the queue's get() — which has no anyio internals — for the filler.
+        # contained; we read tokens from the queue (no anyio internals in get()).
         token_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
         async def _produce() -> None:
@@ -142,13 +146,22 @@ class TurnPipeline:
 
         produce_task = asyncio.create_task(_produce())
         t0 = time.perf_counter()
-        try:
-            first = await asyncio.wait_for(token_queue.get(), timeout=FILLER_THRESHOLD_S)
-        except asyncio.TimeoutError:
-            filler = _pick_filler(call_id)
-            logfire.info("filler_injected", call_id=call_id, turn_number=self._turn_number, filler=filler)
-            yield filler + " "
-            self._filler_injected = True
+
+        # Wait up to FILLER_THRESHOLD_S for the first real token.
+        # If the LLM is fast enough, skip the filler entirely — no gap, no disruption.
+        # If it's slow, flush the filler immediately so TTS starts before the real response arrives.
+        first: str | None = None
+        if FILLER_THRESHOLD_S > 0:
+            first_fut = asyncio.ensure_future(token_queue.get())
+            try:
+                first = await asyncio.wait_for(asyncio.shield(first_fut), timeout=FILLER_THRESHOLD_S)
+            except asyncio.TimeoutError:
+                filler = _pick_filler(call_id)
+                logfire.info("filler_injected", call_id=call_id, turn_number=self._turn_number, filler=filler)
+                yield filler + " <flush /> "
+                self._filler_injected = True
+                first = await first_fut
+        else:
             first = await token_queue.get()
 
         self._first_token_ms = int((time.perf_counter() - t0) * 1000)
