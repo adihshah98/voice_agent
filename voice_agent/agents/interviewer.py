@@ -24,7 +24,7 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior
 from pydantic_ai.messages import CachePoint
 from pydantic_ai.usage import RunUsage
-from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.cerebras import CerebrasModel
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
@@ -47,6 +47,11 @@ from voice_agent.config import (
     INTERVIEWER_OPENAI_MODEL,
     INTERVIEWER_RECOVERY_UTTERANCE,
     settings,
+)
+from voice_agent.interviewer_llm_caching import (
+    anthropic_interviewer_settings,
+    openai_interviewer_settings,
+    user_message_cache_breakpoint,
 )
 from voice_agent.models import InterviewerDeps, InterviewerLLMMeta, InterviewerOutput
 
@@ -75,6 +80,7 @@ def _build_prompt_parts_from_reads(
     respondent_text: str,
     vapi_messages: list[dict],
 ) -> list[str | CachePoint]:
+    # Order: COVERED_SUBTOPICS, cache breakpoint (Anthropic), then per-turn CONTEXT. See interviewer_llm_caching.
     covered_lines = []
     if reads.snapshot and reads.snapshot.covered_subtopics:
         covered_lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
@@ -113,7 +119,7 @@ def _build_prompt_parts_from_reads(
 
     return [
         "\n".join(covered_lines),
-        CachePoint(ttl="1h"),
+        user_message_cache_breakpoint(),
         "\n".join(dynamic_lines),
     ]
 
@@ -395,13 +401,14 @@ def _build_interviewer_model() -> FallbackModel:
             OpenAIChatModel(
                 openai_id,
                 provider=OpenAIProvider(api_key=settings.openai_api_key),
+                settings=openai_interviewer_settings(settings),
             )
         )
 
     haiku = AnthropicModel(
         _strip(INTERVIEWER_HAIKU_MODEL),
         provider=AnthropicProvider(api_key=settings.anthropic_api_key),
-        settings=AnthropicModelSettings(anthropic_cache_instructions="1h"),
+        settings=anthropic_interviewer_settings(),
     )
     # thinking_budget=0 caps unbounded reasoning that can spike to 12s+ on complex turns.
     gemini = GoogleModel(

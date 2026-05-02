@@ -6,6 +6,8 @@ Swap a model here — nothing else changes.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
@@ -62,6 +64,11 @@ class Settings(BaseSettings):
 
     # Interviewer model chain (env-overridable): OpenAI (if key + model) → Haiku → Gemini → Groq → Cerebras (optional).
     openai_model: str = "openai:gpt-4.1-mini"  # "" skips OpenAI tier even when OPENAI_API_KEY is set
+    # OpenAI Chat Completions prompt caching — shared prefix (system + COVERED_SUBTOPICS block). Empty = omit API params.
+    openai_prompt_cache_key: str = "voice_agent_interviewer"
+    openai_prompt_cache_retention: Literal["in_memory", "24h"] = "24h"
+    # Bump when INTERVIEWER_PROMPT or user-prefix layout changes (suffixes OpenAI prompt_cache_key).
+    interviewer_prompt_cache_version: str = "1"
     haiku_model: str = "anthropic:claude-haiku-4-5-20251001"
     gemini_model: str = "google-gla:gemini-2.0-flash"
     groq_model: str = "groq:llama-3.3-70b-versatile"

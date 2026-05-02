@@ -34,31 +34,35 @@
   - Make sure it deals with non-happy path behavior
   - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
   - When handling a probe from earlier, it should say like you said earlier
+- Infra - Prod Level
+  - Render Deployment 
+  - Webhook correctness (auth/idempotency)
+  - Live DB + Alembic
+  - Dependency Mgmt on pyproject.timl and remove requirements.txt
+  - Rate limiting
 - Multi-tenant 
   - See, eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in midn
     - Tell it it is diligencing which product
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default
-- Infra - Prod Level
-  - Webhook correctness (auth/idempotency)
-  - Live DB + Alembic
+  - Multi-tenant auth
+- Fun Stuff
+  - Clone my voice on 11labs & use it
+
+---
+
+---
+
+- Prod Infra
+  - CI/CD
+  - SQS Queues
+  - Secrets Mgmt.
+  - Model Pinning & Rollback
   - Caching & Latency
     - Add *tts*active to Redis
-  - Model Pinning & Rollback
-  - Secrets Management
-  - Dependency Mgmt on pyproject.timl and remove requirements.txt
+  - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
   - The analyst is triggered by polling `should_run_analyst()` on every `conversation-update`. Fine for one call, but with N concurrent calls you get lock contention and polling overhead. Production systems use a task queue (Celery + Redis, SQS, etc.) — the webhook handler enqueues a job instead of calling `asyncio.create_task` inline.
   - The analyst competes with the real-time interviewer for the event loop. A slow Sonnet call during a burst can delay turn responses. In production you'd want the analyst as a separate worker service — the invariant holds, you just move the writes to a different process.
-  - SQS Queues
-  - Render Deployment + CI/CD
-  - Multi-tenant auth
-  - Rate limiting
-  - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
-
----
-
----
-
 - Memory
   - Memory/Improving agents with usage
 - Advanced Voice UX

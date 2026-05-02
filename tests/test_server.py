@@ -28,6 +28,8 @@ async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.Monkey
     monkeypatch.setattr(server.settings, "llm_secret_token", "")
 
     class FakePipeline:
+        filler_injected = False
+
         def __init__(self, engine, call_id, vapi_messages=None):
             assert call_id == "call-123"
             assert vapi_messages is not None
