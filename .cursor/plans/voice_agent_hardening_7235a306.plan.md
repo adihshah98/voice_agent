@@ -12,7 +12,7 @@ todos:
     content: "Phase 2: API_AUTH_TOKEN bearer auth on /calls/start and DELETE /calls/{id}; better signature-mismatch logging"
     status: pending
   - id: p3_idempotency
-    content: "Phase 3: convert webhook status flips to conditional UPDATEs; only fire synthesis/warmup on rowcount==1"
+    content: "Phase 3: convert webhook status flips to conditional UPDATEs; only fire synthesis on rowcount==1"
     status: pending
   - id: p4_dial
     content: "Phase 4: dial_status (or status=dialing|dial_failed); single-transaction vapi_call_id write; fire-and-forget dial in /calls/start"
@@ -24,7 +24,7 @@ todos:
     content: "Phase 6: CallStateStore abstraction over _speech_ts/_silence_watch_tasks/_last_filler with periodic janitor"
     status: pending
   - id: p7_polish
-    content: "Phase 7: sorted covered_subtopics + probes for cache stability; fix interviewer fallback-chain doc; decide on _warmup_groq"
+    content: "Phase 7: sorted covered_subtopics + probes for cache stability; fix interviewer fallback-chain doc"
     status: pending
 isProject: false
 ---
@@ -51,19 +51,10 @@ isProject: false
 
 ## Phase 3 — Webhook idempotency (row-conditional UPDATEs)
 
-**Problem:** `end-of-call-report` and `status-update` do read-modify-write under default SQLite isolation. Two concurrent retries can both pass the status guard and double-fire `_synthesis_task` / `_warmup_groq`.
+**Problem:** `end-of-call-report` and `status-update` do read-modify-write under default SQLite isolation. Two concurrent retries can both pass the status guard and double-fire `_synthesis_task`.
 
 **Fixes in [`voice_agent/server.py`](voice_agent/server.py):**
-- Replace status flips with conditional updates and only fire side-effects when the rowcount confirms we won the race:
-  ```python
-  result = session.execute(
-      update(state.Call)
-      .where(state.Call.id == call_id, state.Call.status == "pending")
-      .values(status="active")
-  )
-  if result.rowcount == 1:
-      _fire(_warmup_groq(), name="groq-warmup")
-  ```
+- Replace status flips with conditional updates so only one writer wins; use `UPDATE … WHERE status = 'pending'` and check `rowcount == 1` before treating the transition as authoritative.
 - Same pattern for `pending|active → ended` in `end-of-call-report` and `delete_call`. Synthesis and the final `call_ended` log only fire on `rowcount == 1`.
 - Cleanup of `_speech_ts` and silence-watch is safe to run on both branches.
 
@@ -99,7 +90,6 @@ isProject: false
 
 - Sort `covered_subtopics` (and `pending_probes` by `(priority, id)`) before formatting in [`_build_prompt_parts_from_reads`](voice_agent/agents/interviewer.py) — keeps Anthropic prompt cache stable across turns when the analyst returns the same set in a different order.
 - Fix the chain-order doc lie in [`_build_interviewer_model`](voice_agent/agents/interviewer.py): docstring says `Cerebras → Groq → Groq → Haiku`, code does `Haiku → Groq → Groq → Cerebras`. Either correct the docstring (fast) or actually flip the order (cheaper p50 TTFT, more behavior change — defer).
-- Decide what to do with [`_warmup_groq`](voice_agent/server.py): with Haiku as primary, Groq is only hit on Haiku failure. Either drop the warmup, or move it to the first observed Haiku error so it warms exactly when needed.
 - Add `WHERE (call_id, turn_number)` index check now that the `UNIQUE` constraint from Phase 1 exists — SQLAlchemy/SQLModel does this automatically with `UniqueConstraint`, just verify.
 
 ---

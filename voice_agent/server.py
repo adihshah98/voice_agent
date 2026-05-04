@@ -28,6 +28,7 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import update
 from sqlmodel import Session, select
 from voice_agent import state
 from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely as _synthesis_safely
@@ -75,17 +76,27 @@ def _cancel_silence_watch(call_id: str) -> None:
 
 
 def _end_call_vapi_delete(call_id: str, end_reason: str) -> None:
-    """Mark a call ended in the DB, cancel silence watch, and fire Vapi DELETE — best-effort, never raises."""
+    """Mark a call ended in the DB, cancel silence watch, and fire Vapi DELETE — best-effort, never raises.
+
+    Uses a single conditional UPDATE (Postgres-safe under concurrent callers): only the first
+    transition from pending|active → ended returns vapi_call_id for DELETE; duplicates no-op the DB write.
+    """
     vapi_call_id: str | None = None
+    ended_at = datetime.now(timezone.utc)
     try:
         with state.session_scope(engine) as session:
-            call = session.get(state.Call, call_id)
-            if call and call.status != "ended":
-                vapi_call_id = call.vapi_call_id
-                call.status = "ended"
-                call.end_reason = end_reason
-                call.ended_at = datetime.now(timezone.utc)
-                session.add(call)
+            stmt = (
+                update(state.Call)
+                .where(
+                    state.Call.id == call_id,
+                    state.Call.status.in_(["pending", "active"]),
+                )
+                .values(status="ended", end_reason=end_reason, ended_at=ended_at)
+                .returning(state.Call.vapi_call_id)
+            )
+            row = session.execute(stmt).fetchone()
+            if row is not None:
+                vapi_call_id = row[0]
     except Exception:
         logfire.exception("end_call_vapi_delete_db_failed", call_id=call_id, end_reason=end_reason)
         return
@@ -193,26 +204,6 @@ async def _synthesis_task(call_id: str) -> None:
                 await _synthesis_safely(deps)
     except Exception:
         logfire.exception("synthesis_task_error", call_id=call_id)
-
-
-async def _warmup_groq() -> None:
-    """Fire a minimal Groq request so llama is loaded onto a GPU before the first real user turn.
-
-    Groq de-allocates models after ~20 min of inactivity. The first request to a cold
-    model is unstable (structured output fails). This throwaway completion warms it up
-    while the assistant is still delivering its greeting message.
-    """
-    try:
-        import groq as groq_sdk
-        client = groq_sdk.AsyncGroq()
-        await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1,
-        )
-        logfire.debug("groq_warmup_done")
-    except Exception:
-        logfire.debug("groq_warmup_failed")  # best-effort, never affects the call
 
 
 async def _analyst_task(call_id: str) -> None:
@@ -340,12 +331,13 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
             event_span.set_attribute("status", status)
             if status == "in-progress" and call_id:
                 with state.session_scope(engine) as session:
-                    call = session.get(state.Call, call_id)
-                    if call and call.status == "pending":
-                        call.status = "active"
-                        session.add(call)
+                    result = session.execute(
+                        update(state.Call)
+                        .where(state.Call.id == call_id, state.Call.status == "pending")
+                        .values(status="active")
+                    )
+                    if result.rowcount == 1:
                         logfire.info("call_activated", call_id=call_id, vapi_call_id=vapi_call_id)
-                        _fire(_warmup_groq(), name="groq-warmup")
             return {}
 
         if event_type == "end-of-call-report":
@@ -353,23 +345,26 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 logfire.warning("end_of_call_missing_call_id", vapi_call_id=vapi_call_id)
                 return {}
             ended_reason = msg.get("endedReason")
+            ended_at = datetime.now(timezone.utc)
             with state.session_scope(engine) as session:
-                call = session.get(state.Call, call_id)
-                if call:
-                    # Guard is a no-op if DELETE /calls/{id} already fired — both paths are valid.
-                    if call.status == "ended":
-                        _cancel_silence_watch(call_id)
-                        _speech_ts.pop(call_id, None)
+                result = session.execute(
+                    update(state.Call)
+                    .where(
+                        state.Call.id == call_id,
+                        state.Call.status.in_(["pending", "active"]),
+                    )
+                    .values(status="ended", end_reason=ended_reason, ended_at=ended_at)
+                )
+                if result.rowcount != 1:
+                    call = session.get(state.Call, call_id)
+                    if call is None:
+                        logfire.warning("end_of_call_unknown_call_id", call_id=call_id)
                         return {}
-                    call.status = "ended"
-                    call.end_reason = ended_reason
-                    call.ended_at = datetime.now(timezone.utc)
-                    session.add(call)
-                    event_span.set_attribute("ended_reason", ended_reason)
-                    probes_asked, probes_total = state.probe_utilization(session, call_id)
-                else:
-                    logfire.warning("end_of_call_unknown_call_id", call_id=call_id)
+                    _cancel_silence_watch(call_id)
+                    _speech_ts.pop(call_id, None)
                     return {}
+                event_span.set_attribute("ended_reason", ended_reason)
+                probes_asked, probes_total = state.probe_utilization(session, call_id)
             _cancel_silence_watch(call_id)
             _speech_ts.pop(call_id, None)
 
@@ -749,17 +744,25 @@ async def delete_call(
     """Cancel an in-flight call. Fires DELETE to Vapi if the call is still active."""
     request.state.call_id = call_id
 
+    ended_at = datetime.now(timezone.utc)
+    vapi_call_id: str | None = None
     with state.session_scope(engine) as session:
-        call = session.get(state.Call, call_id)
-        if call is None:
-            raise HTTPException(status_code=404, detail="Call not found")
-        if call.status == "ended":
+        stmt = (
+            update(state.Call)
+            .where(
+                state.Call.id == call_id,
+                state.Call.status.in_(["pending", "active"]),
+            )
+            .values(status="ended", end_reason="deleted", ended_at=ended_at)
+            .returning(state.Call.vapi_call_id)
+        )
+        row = session.execute(stmt).fetchone()
+        if row is not None:
+            vapi_call_id = row[0]
+        else:
+            if session.get(state.Call, call_id) is None:
+                raise HTTPException(status_code=404, detail="Call not found")
             return {"call_id": call_id, "status": "already_ended"}
-        vapi_call_id = call.vapi_call_id
-        call.status = "ended"
-        call.end_reason = "deleted"
-        call.ended_at = datetime.now(timezone.utc)
-        session.add(call)
     _cancel_silence_watch(call_id)
     _speech_ts.pop(call_id, None)
 
