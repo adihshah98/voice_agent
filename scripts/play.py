@@ -278,9 +278,24 @@ def dial_via_server(questions: list[str], phone_number: str) -> None:
                 resp.text,
             )
         resp.raise_for_status()
+        body = resp.json()
+        if body.get("dial_status") == "dial_failed":
+            play_logger.error("Dial did not start: %s", body.get("dial_error", ""))
+            sys.exit(1)
 
-    play_logger.info("Call created call_id=%s", call_id)
-    play_logger.info("Dialing %s via Vapi (interviewer should call you now)", phone_number)
+    play_logger.info("Call created call_id=%s dial_status=%s", call_id, body.get("dial_status"))
+    if resp.status_code == 202:
+        play_logger.info(
+            "Outbound dial queued — poll GET %s/calls/%s for dial_status / vapi_call_id",
+            BASE_URL,
+            call_id,
+        )
+    elif body.get("dial_status") is None:
+        play_logger.warning(
+            "No outbound dial (set VAPI_API_KEY and dial env) — call_id=%s was created for %s",
+            call_id,
+            phone_number,
+        )
     play_logger.info(
         "After the call, synthesis report: curl %s/calls/%s/report",
         BASE_URL,

@@ -70,7 +70,7 @@ Two endpoints, different roles:
   - `end-of-call-report` — flips status to ended; schedules synthesis if enabled; cancels silence watch.
   - `speech-update` — tracks timing (`_speech_ts`) for latency measurement; manages the extended-silence watch (starts timer on `assistant/stopped`, cancels on `user/started`).
 
-Outbound dialing (`_dial_vapi`) writes the Vapi-assigned `vapi_call_id` back onto the `Call` row after the POST returns. Known fragile: Vapi can fire `status-update: ringing` before that write commits. Works in practice (ringing fires ~hundreds of ms later) but is not atomic. See `docs/TODO.md`.
+Outbound dialing: `POST /calls/start` with `phone_number` + `VAPI_API_KEY` and full dial config returns **202** and sets `Call.dial_status` to `queued`; `_dial_vapi` runs in a background task (`queued`→`dialing`→`dialed` + atomic `UPDATE` of `vapi_call_id`, or terminal `dial_failed` / `dial_skipped`). Poll **`GET /calls/{call_id}`** for `dial_status`, `vapi_call_id`, and `status`. Without a phone (or without a dial), response stays **200** and `dial_status` is null. See `docs/TODO.md` for remaining edge cases.
 
 **Extended silence:** After assistant TTS ends, if the user doesn't speak within `VAPI_EXTENDED_SILENCE_SECONDS`, `_end_call_vapi_delete` fires. Set to 0 (default) to disable. Avoids unbounded silent calls up to `maxDurationSeconds`.
 

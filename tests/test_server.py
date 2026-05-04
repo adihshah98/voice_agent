@@ -24,8 +24,13 @@ def _call_body(vapi_call_id: str, call_id: str, content: str, stream: bool = Tru
 
 @pytest.mark.asyncio
 async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.MonkeyPatch) -> None:
+    eng = state.make_engine("sqlite:///:memory:")
+    state.init_db(eng)
+    monkeypatch.setattr(server, "engine", eng)
     monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
     monkeypatch.setattr(server.settings, "llm_secret_token", "")
+    with state.session_scope(eng) as session:
+        session.add(state.Call(id="call-123", scripted_questions=[], status="pending"))
 
     class FakePipeline:
         filler_injected = False
@@ -58,8 +63,13 @@ async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    eng = state.make_engine("sqlite:///:memory:")
+    state.init_db(eng)
+    monkeypatch.setattr(server, "engine", eng)
     monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
     monkeypatch.setattr(server.settings, "llm_secret_token", "")
+    with state.session_scope(eng) as session:
+        session.add(state.Call(id="call-456", scripted_questions=[], status="pending"))
 
     class FakePipeline:
         def __init__(self, engine, call_id, vapi_messages=None):
@@ -341,7 +351,17 @@ async def test_calls_start_and_delete_require_bearer_when_api_auth_configured(
             headers={"Authorization": "Bearer test-bearer-secret"},
         )
         assert r.status_code == 200
+        assert r.json()["dial_status"] is None
         call_id = r.json()["call_id"]
+
+        g = await client.get(
+            f"/calls/{call_id}",
+            headers={"Authorization": "Bearer test-bearer-secret"},
+        )
+        assert g.status_code == 200
+        assert g.json()["call_id"] == call_id
+        assert g.json()["status"] == "pending"
+        assert g.json()["dial_status"] is None
 
         d = await client.delete(f"/calls/{call_id}")
         assert d.status_code == 401
@@ -352,3 +372,61 @@ async def test_calls_start_and_delete_require_bearer_when_api_auth_configured(
         )
         assert d.status_code == 200
         assert d.json()["status"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_calls_start_async_dial_returns_202(monkeypatch: pytest.MonkeyPatch) -> None:
+    eng = state.make_engine("sqlite:///:memory:")
+    state.init_db(eng)
+    monkeypatch.setattr(server, "engine", eng)
+    monkeypatch.setattr(server.settings, "api_auth_token", "")
+    monkeypatch.setattr(server.settings, "vapi_api_key", "fake-key")
+    monkeypatch.setattr(server.settings, "vapi_phone_number_id", "phone-id")
+    monkeypatch.setattr(server.settings, "webhook_url", "https://example.com")
+
+    async def _noop_dial(_cid: str, _phone: str) -> None:
+        return
+
+    monkeypatch.setattr(server, "_dial_vapi", _noop_dial)
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/calls/start",
+            json={"scripted_questions": ["q1"], "phone_number": "+15551234567"},
+        )
+    assert r.status_code == 202
+    assert r.json()["dial_status"] == "queued"
+    with state.session_scope(eng) as session:
+        c = session.get(state.Call, r.json()["call_id"])
+        assert c is not None
+        assert c.dial_status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_calls_start_sync_abort_when_dial_config_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eng = state.make_engine("sqlite:///:memory:")
+    state.init_db(eng)
+    monkeypatch.setattr(server, "engine", eng)
+    monkeypatch.setattr(server.settings, "api_auth_token", "")
+    monkeypatch.setattr(server.settings, "vapi_api_key", "fake-key")
+    monkeypatch.setattr(server.settings, "vapi_phone_number_id", "")
+    monkeypatch.setattr(server.settings, "webhook_url", "https://example.com")
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/calls/start",
+            json={"scripted_questions": ["q1"], "phone_number": "+15551234567"},
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["dial_status"] == "dial_failed"
+    assert "dial_error" in body
+    with state.session_scope(eng) as session:
+        c = session.get(state.Call, body["call_id"])
+        assert c is not None
+        assert c.status == "ended"
+        assert c.end_reason == "dial_skipped"

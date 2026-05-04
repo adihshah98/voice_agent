@@ -13,10 +13,10 @@ todos:
     status: pending
   - id: p3_idempotency
     content: "Phase 3: convert webhook status flips to conditional UPDATEs; only fire synthesis on rowcount==1"
-    status: pending
+    status: completed
   - id: p4_dial
-    content: "Phase 4: dial_status (or status=dialing|dial_failed); single-transaction vapi_call_id write; fire-and-forget dial in /calls/start"
-    status: pending
+    content: "Phase 4: dial_status + non-blocking /calls/start; atomic vapi_call_id write; dial_failed terminal state; GET /calls/{id} or extend report"
+    status: completed
   - id: p5_analyst
     content: "Phase 5: move analyst trigger to conversation-update; reconcile Turn.text against Vapi messagesOpenAIFormatted on barge-in"
     status: pending
@@ -49,24 +49,17 @@ isProject: false
 - Add `API_AUTH_TOKEN` to [`Settings`](voice_agent/config.py); require it via `Authorization: Bearer …` on `/calls/start` and `DELETE /calls/{id}` ([`voice_agent/server.py`](voice_agent/server.py)). No-op when unset (dev mode), same pattern as `LLM_SECRET_TOKEN`.
 - In [`_require_vapi_signature`](voice_agent/server.py), on mismatch log `expected_prefix=expected[:12]`, `received_prefix=sig_hex[:12]`, `payload_len=len(payload)`, and whether timestamp header was present. Never log secrets.
 
-## Phase 3 — Webhook idempotency (row-conditional UPDATEs)
+## Phase 3 — Webhook idempotency (row-conditional UPDATEs) ✅
 
-**Problem:** `end-of-call-report` and `status-update` do read-modify-write under default SQLite isolation. Two concurrent retries can both pass the status guard and double-fire `_synthesis_task`.
+**Problem:** `end-of-call-report` and `status-update` did read-modify-write; duplicate webhooks could double-fire synthesis (and similar races on hang-up paths).
 
-**Fixes in [`voice_agent/server.py`](voice_agent/server.py):**
-- Replace status flips with conditional updates so only one writer wins; use `UPDATE … WHERE status = 'pending'` and check `rowcount == 1` before treating the transition as authoritative.
-- Same pattern for `pending|active → ended` in `end-of-call-report` and `delete_call`. Synthesis and the final `call_ended` log only fire on `rowcount == 1`.
-- Cleanup of `_speech_ts` and silence-watch is safe to run on both branches.
+**Implemented in [`voice_agent/server.py`](voice_agent/server.py):** conditional `UPDATE … WHERE` + `rowcount == 1` (or `RETURNING` for hang-up) for `status-update` (`pending → active`), `end-of-call-report`, `delete_call`, and `_end_call_vapi_delete`. Postgres-safe; SQLite tests use the same SQL.
 
-## Phase 4 — Dial lifecycle: atomic + non-blocking
+## Phase 4 — Dial lifecycle: atomic + non-blocking ✅
 
-**Problem:** `_dial_vapi` writes `vapi_call_id` in a separate transaction after the POST returns; if it fails or the POST raises, the `Call` row stays `pending` forever and Vapi may have an orphan call. `/calls/start` blocks the caller for up to 10s.
+**Implemented:** [`Call`](voice_agent/state.py) has `dial_status` (`queued`→`dialing`→`dialed` | `dial_failed`) and `dial_error`. No dial: `dial_status` stays **null**. [`POST /calls/start`](voice_agent/server.py) returns **202** + `{call_id, dial_status}` when an async dial is queued; **200** + immediate `dial_failed` when `phone_number` + `VAPI_API_KEY` are set but `VAPI_PHONE_NUMBER_ID` or `WEBHOOK_URL` is missing (`end_reason=dial_skipped`). [`_dial_vapi`](voice_agent/server.py) runs as a background task — no `HTTPException`; success/failure use conditional `UPDATE`s; orphan Vapi call gets best-effort `DELETE` if the DB persist step loses the race. **`GET /calls/{call_id}`** returns lifecycle fields for polling. [`GET .../report`](voice_agent/server.py) returns a **200** `dial_failed` stub when `dial_status=dial_failed` so clients are not stuck on synthesis **202**. [`init_db`](voice_agent/state.py) **ALTER TABLE**-adds the new columns on existing SQLite files. Custom LLM skips turns when the call row is **ended** or **dial_failed** (`_call_terminal_for_llm`).
 
-**Fixes:**
-- Add `dial_status` column on `Call`: `pending|dialing|dialed|dial_failed`. Or repurpose `status`: `pending → dialing → active|dial_failed`.
-- In [`/calls/start`](voice_agent/server.py): create row with `status="dialing"`, then `_fire(_dial_vapi(...))` — return `202 {call_id}` immediately. Caller polls `GET /calls/{id}` for state.
-- In `_dial_vapi`: wrap in try/except; on success, single transaction sets `vapi_call_id` + leaves status `dialing` (the Vapi `status-update: in-progress` flips it to `active` via Phase 3's conditional update). On failure, single transaction sets `status="dial_failed"`, `end_reason=…`. Logfire-error.
-- Update `/calls/{id}/report` and the `delete_call` paths to handle `dial_failed`.
+**Original problem statement (pre-fix):** `/calls/start` blocked on `_dial_vapi`; separate transaction for `vapi_call_id`; skipped-config dials left the row pending with only a log.
 
 ## Phase 5 — Partial-utterance reconciliation (analyst-side only)
 

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, UniqueConstraint, text
+from sqlalchemy import Column, UniqueConstraint, inspect, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
 from sqlalchemy.pool import NullPool, StaticPool
@@ -20,6 +20,13 @@ from sqlmodel import Field, Relationship, Session, SQLModel, create_engine, func
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Outbound dial lifecycle (see server Phase 4). None on Call = no outbound dial.
+DIAL_QUEUED = "queued"
+DIAL_DIALING = "dialing"
+DIAL_DIALED = "dialed"
+DIAL_FAILED = "dial_failed"
 
 
 class Call(SQLModel, table=True):
@@ -31,6 +38,8 @@ class Call(SQLModel, table=True):
     scripted_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     scripted_cursor: int = Field(default=0)
     status: str = Field(default="pending")  # pending|active|ended
+    dial_status: Optional[str] = None  # queued|dialing|dialed|dial_failed; None = no dial
+    dial_error: Optional[str] = None
     end_reason: Optional[str] = None
     started_at: datetime = Field(default_factory=_utcnow)
     ended_at: Optional[datetime] = None
@@ -179,6 +188,16 @@ def make_engine(url: str = "sqlite:///voice_agent.db", *, echo: bool = False):
 
 def init_db(engine) -> None:
     SQLModel.metadata.create_all(engine)
+    # Additive columns for existing DBs (SQLite dev file / Postgres without Alembic yet).
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("calls")}
+    except Exception:
+        return
+    with engine.begin() as conn:
+        if "dial_status" not in cols:
+            conn.execute(text("ALTER TABLE calls ADD COLUMN dial_status VARCHAR"))
+        if "dial_error" not in cols:
+            conn.execute(text("ALTER TABLE calls ADD COLUMN dial_error VARCHAR"))
 
 
 @contextmanager

@@ -310,6 +310,45 @@ async def _require_api_auth(request: Request) -> None:
 # --- Webhook ----------------------------------------------------------------
 
 
+def _call_terminal_for_llm(session: Session, call_id: str) -> bool:
+    """True if the custom LLM must not run a turn (missing row, ended, or dial failed)."""
+    oc = session.get(state.Call, call_id)
+    if oc is None:
+        return True
+    if oc.status == "ended":
+        return True
+    if oc.dial_status == state.DIAL_FAILED:
+        return True
+    return False
+
+
+def _mark_dial_failed(call_id: str, *, end_reason: str, dial_error: str | None) -> None:
+    """Best-effort: pending + queued|dialing → ended + dial_failed; cleanup in-process speech state."""
+    ended_at = datetime.now(timezone.utc)
+    err = (dial_error or "")[:4000]
+    try:
+        with state.session_scope(engine) as session:
+            session.execute(
+                update(state.Call)
+                .where(
+                    state.Call.id == call_id,
+                    state.Call.status == "pending",
+                    state.Call.dial_status.in_([state.DIAL_QUEUED, state.DIAL_DIALING]),
+                )
+                .values(
+                    status="ended",
+                    dial_status=state.DIAL_FAILED,
+                    end_reason=end_reason,
+                    dial_error=err,
+                    ended_at=ended_at,
+                )
+            )
+    except Exception:
+        logfire.exception("mark_dial_failed_db_error", call_id=call_id)
+    _cancel_silence_watch(call_id)
+    _speech_ts.pop(call_id, None)
+
+
 def _call_id_from_event(msg: dict) -> str | None:
     """Extract our internal call_id from Vapi's metadata field."""
     return msg.get("call", {}).get("assistant", {}).get("metadata", {}).get("call_id")
@@ -509,9 +548,32 @@ class StartCallRequest(BaseModel):
 
 
 @app.post("/calls/start")
-async def start_call(req: StartCallRequest, _: None = Depends(_require_api_auth)) -> dict[str, str]:
-    """Seed scripted questions and optionally dial out via Vapi."""
+async def start_call(req: StartCallRequest, _: None = Depends(_require_api_auth)) -> JSONResponse:
+    """Seed scripted questions and optionally dial out via Vapi (dial runs in background; 202 if queued)."""
     call_id = req.call_id or str(uuid.uuid4())
+
+    wants_dial = bool(req.phone_number and settings.vapi_api_key)
+    can_dial = bool(
+        wants_dial and settings.vapi_phone_number_id and settings.webhook_url
+    )
+    sync_abort = bool(wants_dial and not can_dial)
+    ended_at = datetime.now(timezone.utc) if sync_abort else None
+    dial_status: str | None = None
+    status = "pending"
+    end_reason: str | None = None
+    dial_error: str | None = None
+    if can_dial:
+        dial_status = state.DIAL_QUEUED
+    elif sync_abort:
+        dial_status = state.DIAL_FAILED
+        status = "ended"
+        end_reason = "dial_skipped"
+        if not settings.vapi_phone_number_id and not settings.webhook_url:
+            dial_error = "VAPI_PHONE_NUMBER_ID and WEBHOOK_URL are not set"
+        elif not settings.vapi_phone_number_id:
+            dial_error = "VAPI_PHONE_NUMBER_ID is not set"
+        else:
+            dial_error = "WEBHOOK_URL is not set"
 
     with state.session_scope(engine) as session:
         existing = session.get(state.Call, call_id)
@@ -523,17 +585,55 @@ async def start_call(req: StartCallRequest, _: None = Depends(_require_api_auth)
                 id=call_id,
                 phone_number=req.phone_number,
                 scripted_questions=req.scripted_questions,
-                status="pending",
+                status=status,
+                dial_status=dial_status,
+                dial_error=dial_error,
+                end_reason=end_reason,
+                ended_at=ended_at,
             )
         )
 
-    logfire.info("call_created", call_id=call_id, phone_number=req.phone_number,
-                 question_count=len(req.scripted_questions))
+    logfire.info(
+        "call_created",
+        call_id=call_id,
+        phone_number=req.phone_number,
+        question_count=len(req.scripted_questions),
+        dial_status=dial_status,
+    )
 
-    if req.phone_number and settings.vapi_api_key:
-        await _dial_vapi(call_id, req.phone_number)
+    body: dict[str, Any] = {"call_id": call_id, "dial_status": dial_status}
+    if dial_error:
+        body["dial_error"] = dial_error
 
-    return {"call_id": call_id}
+    if sync_abort:
+        return JSONResponse(status_code=200, content=body)
+
+    if can_dial:
+        _fire(_dial_vapi(call_id, req.phone_number), name=f"dial-{call_id}")
+        return JSONResponse(status_code=202, content=body)
+
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.get("/calls/{call_id}")
+async def get_call(request: Request, call_id: str) -> dict[str, Any]:
+    """Poll call lifecycle: status, dial outcome, Vapi id (Phase 4)."""
+    request.state.call_id = call_id
+    with state.session_scope(engine) as session:
+        call = session.get(state.Call, call_id)
+        if call is None:
+            raise HTTPException(status_code=404, detail="Call not found")
+        return {
+            "call_id": call.id,
+            "status": call.status,
+            "dial_status": call.dial_status,
+            "vapi_call_id": call.vapi_call_id,
+            "end_reason": call.end_reason,
+            "dial_error": call.dial_error,
+            "phone_number": call.phone_number,
+            "started_at": call.started_at.isoformat() if call.started_at else None,
+            "ended_at": call.ended_at.isoformat() if call.ended_at else None,
+        }
 
 
 @app.get("/calls/{call_id}/report")
@@ -549,6 +649,20 @@ async def get_report(request: Request, call_id: str) -> JSONResponse:
             call = session.get(state.Call, call_id)
             if call is None:
                 raise HTTPException(status_code=404, detail="Call not found")
+            if call.dial_status == state.DIAL_FAILED:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "call_id": call_id,
+                        "status": "dial_failed",
+                        "dial_error": call.dial_error or "",
+                        "summary": "",
+                        "themes": [],
+                        "contradictions": [],
+                        "key_quotes": [],
+                        "follow_up_questions": [],
+                    },
+                )
             if call.status == "ended" and not ENABLE_SYNTHESIS_REPORT:
                 return JSONResponse(
                     status_code=200,
@@ -652,81 +766,100 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
             # Return an empty response so Vapi speaks nothing and no DB write happens.
             logfire.info("ghost_turn_skipped", call_id=call_id, vapi_call_id=vapi_call_id, message_count=len(messages))
         else:
-            # Time from speech-update(user/stopped) to this LLM call. Includes Vapi's
-            # full endpointing silence window + STT finalization + any speculative-call
-            # retry overhead. NOT just STT time — label accordingly.
-            vapi_pipeline_ms: int | None = None
-            entry = _speech_ts.get(call_id, {})
-            if "user_stopped_at" in entry:
-                vapi_pipeline_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
-
-            # Stash immediately — before any streaming — so the
-            # speech-update(assistant/started) handler finds it even if it fires
-            # before the streaming loop finishes.
-            if vapi_pipeline_ms is not None:
-                _speech_ts.setdefault(call_id, {})["vapi_pipeline_ms"] = vapi_pipeline_ms
-
-            with logfire.span(
-                    "vapi_llm_request",
-                    call_id=call_id,
+            skip_pipeline = False
+            if call_id is None:
+                logfire.warning(
+                    "vapi_llm_missing_call_id_with_user_message",
                     vapi_call_id=vapi_call_id,
                     message_count=len(messages),
-                    vapi_pipeline_ms=vapi_pipeline_ms,
-                ) as req_span:
-                reply_chars = 0
-                pipeline = TurnPipeline(engine, call_id, vapi_messages=messages)
-                try:
-                    ttft_stashed = False
-                    async for token in pipeline.stream_tokens():
-                        reply_chars += len(token)
-                        # Stash llm_ttft_ms + filler_injected on the first token.
-                        # pipeline.ttft_ms is set by stream_tokens() before yielding,
-                        # so it's available here. Stashing here ensures the values are
-                        # in _speech_ts before Vapi fires speech-update(assistant/started),
-                        # which can't arrive until after Vapi receives this first token.
-                        if not ttft_stashed and vapi_pipeline_ms is not None and pipeline.ttft_ms is not None:
-                            live_entry = _speech_ts.setdefault(call_id, {})
-                            live_entry["llm_ttft_ms"] = pipeline.ttft_ms
-                            live_entry["filler_injected"] = pipeline.filler_injected
-                            ttft_stashed = True
-                        chunk = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}]}
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                    result = await pipeline.commit()
-                    req_span.set_attribute("action", result.action)
-                    req_span.set_attribute("reply_chars", reply_chars)
-                    if result.ttft_ms is not None:
-                        req_span.set_attribute("llm_ttft_ms", result.ttft_ms)
-                    if result.should_run_analyst:
-                        _fire(_analyst_task(call_id), name=f"analyst-{call_id}")
-                except asyncio.CancelledError:
-                    stream_cancelled = True
-                    filler_already_sent = pipeline.filler_injected
+                )
+                skip_pipeline = True
+            else:
+                with state.session_scope(engine) as session:
+                    skip_pipeline = _call_terminal_for_llm(session, call_id)
+                if skip_pipeline:
                     logfire.info(
-                        "vapi_llm_stream_cancelled",
+                        "vapi_llm_skipped_terminal_call",
                         call_id=call_id,
                         vapi_call_id=vapi_call_id,
-                        reply_chars=reply_chars,
-                        filler_already_sent=filler_already_sent,
                     )
-                    if filler_already_sent:
-                        # Vapi cancelled after the filler was played — user heard
-                        # "Mm-hm," but nothing after. Vapi will retry the full call.
-                        logfire.warning(
-                            "vapi_filler_orphaned",
+
+            if not skip_pipeline:
+                # Time from speech-update(user/stopped) to this LLM call. Includes Vapi's
+                # full endpointing silence window + STT finalization + any speculative-call
+                # retry overhead. NOT just STT time — label accordingly.
+                vapi_pipeline_ms: int | None = None
+                entry = _speech_ts.get(call_id, {})
+                if "user_stopped_at" in entry:
+                    vapi_pipeline_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
+
+                # Stash immediately — before any streaming — so the
+                # speech-update(assistant/started) handler finds it even if it fires
+                # before the streaming loop finishes.
+                if vapi_pipeline_ms is not None:
+                    _speech_ts.setdefault(call_id, {})["vapi_pipeline_ms"] = vapi_pipeline_ms
+
+                with logfire.span(
+                        "vapi_llm_request",
+                        call_id=call_id,
+                        vapi_call_id=vapi_call_id,
+                        message_count=len(messages),
+                        vapi_pipeline_ms=vapi_pipeline_ms,
+                    ) as req_span:
+                    reply_chars = 0
+                    pipeline = TurnPipeline(engine, call_id, vapi_messages=messages)
+                    try:
+                        ttft_stashed = False
+                        async for token in pipeline.stream_tokens():
+                            reply_chars += len(token)
+                            # Stash llm_ttft_ms + filler_injected on the first token.
+                            # pipeline.ttft_ms is set by stream_tokens() before yielding,
+                            # so it's available here. Stashing here ensures the values are
+                            # in _speech_ts before Vapi fires speech-update(assistant/started),
+                            # which can't arrive until after Vapi receives this first token.
+                            if not ttft_stashed and vapi_pipeline_ms is not None and pipeline.ttft_ms is not None:
+                                live_entry = _speech_ts.setdefault(call_id, {})
+                                live_entry["llm_ttft_ms"] = pipeline.ttft_ms
+                                live_entry["filler_injected"] = pipeline.filler_injected
+                                ttft_stashed = True
+                            chunk = {"id": "interviewer", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}]}
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        result = await pipeline.commit()
+                        req_span.set_attribute("action", result.action)
+                        req_span.set_attribute("reply_chars", reply_chars)
+                        if result.ttft_ms is not None:
+                            req_span.set_attribute("llm_ttft_ms", result.ttft_ms)
+                        if result.should_run_analyst:
+                            _fire(_analyst_task(call_id), name=f"analyst-{call_id}")
+                    except asyncio.CancelledError:
+                        stream_cancelled = True
+                        filler_already_sent = pipeline.filler_injected
+                        logfire.info(
+                            "vapi_llm_stream_cancelled",
+                            call_id=call_id,
+                            vapi_call_id=vapi_call_id,
+                            reply_chars=reply_chars,
+                            filler_already_sent=filler_already_sent,
+                        )
+                        if filler_already_sent:
+                            # Vapi cancelled after the filler was played — user heard
+                            # "Mm-hm," but nothing after. Vapi will retry the full call.
+                            logfire.warning(
+                                "vapi_filler_orphaned",
+                                call_id=call_id,
+                                vapi_call_id=vapi_call_id,
+                                reply_chars=reply_chars,
+                            )
+                        return
+                    except Exception:
+                        logfire.exception(
+                            "vapi_llm_stream_error",
                             call_id=call_id,
                             vapi_call_id=vapi_call_id,
                             reply_chars=reply_chars,
                         )
-                    return
-                except Exception:
-                    logfire.exception(
-                        "vapi_llm_stream_error",
-                        call_id=call_id,
-                        vapi_call_id=vapi_call_id,
-                        reply_chars=reply_chars,
-                    )
-                    _end_call_on_error(call_id)
-                    return
+                        _end_call_on_error(call_id)
+                        return
 
         if stream_cancelled:
             return
@@ -829,64 +962,128 @@ def _build_stop_speaking_plan() -> dict[str, Any]:
 
 
 async def _dial_vapi(call_id: str, phone_number: str) -> None:
-    """POST to Vapi's outbound call API. Requires VAPI_API_KEY + VAPI_PHONE_NUMBER_ID + WEBHOOK_URL."""
-    if not settings.vapi_phone_number_id:
-        logfire.warning("vapi_dial_skipped", reason="VAPI_PHONE_NUMBER_ID not set", call_id=call_id)
-        return
-    if not settings.webhook_url:
-        logfire.warning("vapi_dial_skipped", reason="WEBHOOK_URL not set", call_id=call_id)
-        return
+    """POST to Vapi's outbound call API (background task). Never raises to the HTTP client.
 
-    payload: dict[str, Any] = {
-        "phoneNumberId": settings.vapi_phone_number_id,
-        "customer": {"number": phone_number},
-        "assistant": {
-            "model": {
-                "provider": "custom-llm",
-                "url": f"{settings.webhook_url}/vapi/llm/chat/completions",
-                "model": "interviewer",
-                **({"headers": {"X-Vapi-Secret": settings.llm_secret_token}} if settings.llm_secret_token else {}),
-            },
-            "server": {
-                "url": f"{settings.webhook_url}/vapi/webhook",
-                **({"credentialId": settings.vapi_server_credential_id} if settings.vapi_server_credential_id else {}),
-            },
-            "voice": _build_voice_config(),
-            "transcriber": {
-                "provider": "deepgram",
-                "model": "flux-general-en",
-                "language": "en",
-                "eotThreshold": 0.7,
-                "eotTimeoutMs": 4500,
-        },
-            "startSpeakingPlan": _build_start_speaking_plan(),
-            "stopSpeakingPlan": _build_stop_speaking_plan(),
-            "firstMessage": "Hey, thank you for getting on the call! Want to check if you can hear me before we get started.",
-            "firstMessageMode": "assistant-speaks-first",
-            "maxDurationSeconds": 1800,
-            "metadata": {"call_id": call_id},
-        },
-    }
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.vapi.ai/call",
-            headers={"Authorization": f"Bearer {settings.vapi_api_key}"},
-            json=payload,
-            timeout=10,
+    Preconditions: row has dial_status=queued and VAPI_PHONE_NUMBER_ID + WEBHOOK_URL were set at enqueue.
+    """
+    if not settings.vapi_phone_number_id or not settings.webhook_url:
+        logfire.warning(
+            "vapi_dial_skipped",
+            reason="VAPI_PHONE_NUMBER_ID or WEBHOOK_URL not set",
+            call_id=call_id,
         )
-    if not resp.is_success:
-        logfire.error("vapi_dial_error", call_id=call_id, status=resp.status_code, body=resp.text[:4000])
-        raise HTTPException(status_code=502, detail=f"Vapi error {resp.status_code}: {resp.text}")
+        _mark_dial_failed(
+            call_id,
+            end_reason="dial_skipped",
+            dial_error="VAPI_PHONE_NUMBER_ID or WEBHOOK_URL became unset before dial",
+        )
+        return
 
-    vapi_call_id = resp.json().get("id")
-    with state.session_scope(engine) as session:
-        call = session.get(state.Call, call_id)
-        if call and vapi_call_id:
-            call.vapi_call_id = vapi_call_id
-            session.add(call)
+    try:
+        with state.session_scope(engine) as session:
+            flip = session.execute(
+                update(state.Call)
+                .where(
+                    state.Call.id == call_id,
+                    state.Call.dial_status == state.DIAL_QUEUED,
+                    state.Call.status == "pending",
+                )
+                .values(dial_status=state.DIAL_DIALING)
+            )
+            if flip.rowcount != 1:
+                return
 
-    logfire.info("vapi_dial_initiated", call_id=call_id, vapi_call_id=vapi_call_id, phone_number=phone_number)
+        payload: dict[str, Any] = {
+            "phoneNumberId": settings.vapi_phone_number_id,
+            "customer": {"number": phone_number},
+            "assistant": {
+                "model": {
+                    "provider": "custom-llm",
+                    "url": f"{settings.webhook_url}/vapi/llm/chat/completions",
+                    "model": "interviewer",
+                    **({"headers": {"X-Vapi-Secret": settings.llm_secret_token}} if settings.llm_secret_token else {}),
+                },
+                "server": {
+                    "url": f"{settings.webhook_url}/vapi/webhook",
+                    **({"credentialId": settings.vapi_server_credential_id} if settings.vapi_server_credential_id else {}),
+                },
+                "voice": _build_voice_config(),
+                "transcriber": {
+                    "provider": "deepgram",
+                    "model": "flux-general-en",
+                    "language": "en",
+                    "eotThreshold": 0.7,
+                    "eotTimeoutMs": 4500,
+                },
+                "startSpeakingPlan": _build_start_speaking_plan(),
+                "stopSpeakingPlan": _build_stop_speaking_plan(),
+                "firstMessage": (
+                    "Hey, thank you for getting on the call! Want to check if you can hear me before we get started."
+                ),
+                "firstMessageMode": "assistant-speaks-first",
+                "maxDurationSeconds": 1800,
+                "metadata": {"call_id": call_id},
+            },
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.vapi.ai/call",
+                headers={"Authorization": f"Bearer {settings.vapi_api_key}"},
+                json=payload,
+                timeout=10,
+            )
+
+        if not resp.is_success:
+            logfire.error("vapi_dial_error", call_id=call_id, status=resp.status_code, body=resp.text[:4000])
+            _mark_dial_failed(
+                call_id,
+                end_reason="dial_failed",
+                dial_error=f"HTTP {resp.status_code}: {resp.text[:2000]}",
+            )
+            return
+
+        vapi_call_id = resp.json().get("id")
+        if not vapi_call_id:
+            _mark_dial_failed(
+                call_id,
+                end_reason="dial_failed",
+                dial_error="Vapi response JSON missing id",
+            )
+            return
+
+        with state.session_scope(engine) as session:
+            persist = session.execute(
+                update(state.Call)
+                .where(
+                    state.Call.id == call_id,
+                    state.Call.dial_status == state.DIAL_DIALING,
+                    state.Call.status == "pending",
+                )
+                .values(vapi_call_id=vapi_call_id, dial_status=state.DIAL_DIALED)
+            )
+            if persist.rowcount != 1:
+                logfire.warning(
+                    "vapi_dial_id_not_persisted",
+                    call_id=call_id,
+                    vapi_call_id=vapi_call_id,
+                )
+                if settings.vapi_api_key:
+                    try:
+                        async with httpx.AsyncClient() as hc:
+                            await hc.delete(
+                                f"https://api.vapi.ai/call/{vapi_call_id}",
+                                headers={"Authorization": f"Bearer {settings.vapi_api_key}"},
+                                timeout=5,
+                            )
+                    except Exception:
+                        logfire.exception("vapi_dial_orphan_delete_failed", vapi_call_id=vapi_call_id)
+                return
+
+        logfire.info("vapi_dial_initiated", call_id=call_id, vapi_call_id=vapi_call_id, phone_number=phone_number)
+    except Exception as exc:
+        logfire.exception("vapi_dial_exception", call_id=call_id)
+        _mark_dial_failed(call_id, end_reason="dial_failed", dial_error=str(exc)[:2000])
 
 
 # --- Dev entrypoint ---------------------------------------------------------
