@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     vapi_timestamp_header: str = "x-timestamp"   # must match "Timestamp Header"; empty = omit timestamp from payload
     webhook_url: str = ""
     llm_secret_token: str = ""   # static secret sent by Vapi in X-Vapi-Secret header; empty = skip check (dev)
+    api_auth_token: str = ""  # Bearer for POST /calls/start and DELETE /calls/{id}; empty = skip check (dev)
 
     # Voice
     vapi_voice_provider: str = "11labs"

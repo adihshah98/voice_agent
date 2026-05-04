@@ -23,8 +23,8 @@ An AI-powered outbound interviewer that conducts structured investor/user resear
   ── speaks ───────────────►│
                             │  Deepgram transcribes
                             │
-                            ├─ POST /vapi/llm/chat/completions ─────► run_speech_turn()
-                            │   {messages: [...], call: {metadata:    ├─ increment turn# (DB)
+                            ├─ POST /vapi/llm/chat/completions ─────► TurnPipeline (SSE)
+                            │   {messages: [...], call: {metadata:    ├─ next_turn_number (COUNT+1)
                             │    {call_id: "..."}}}                   ├─ fetch context: next_q,
                             │                                         │   probes, snapshot (DB)
                             │                                         └─ interviewer LLM call
@@ -35,13 +35,14 @@ An AI-powered outbound interviewer that conducts structured investor/user resear
                             │    finish_reason: "stop"
                             │    data: [DONE]
                             │
-                            ├─ webhook: conversation-update ────────► _write_confirmed_turns()
-                            │   (fires after Vapi plays response)      upsert Turn rows in DB
-                            │                                                                    ──► analyst LLM
-                            │                                          should_run_analyst()?          (Sonnet 4.6)
-                            │                                          (scripted cursor moved      write AnalystSnapshot
-                            │                                           OR ≥25 turns elapsed)      write Probe rows
-                            │                                                                    ◄── new probes in DB
+                            │    after stream: commit() persists       ──► Turn rows (respondent + interviewer)
+                            │              Turn rows to DB               ──► analyst LLM if should_run_analyst()
+                            │                                                                    (Sonnet 4.6)
+                            │                                          scripted cursor advanced      write AnalystSnapshot
+                            │                                          OR ≥10 interviewer turns      write Probe rows
+                            │                                          since last snapshot           ◄── new probes in DB
+                            │
+                            ├─ webhook: conversation-update ─────────► debug log only (no DB writes here)
 
   ── 3. END OF CALL ─────────────────────────────────────────────────────────────────────────────
   ── hangs up ─────────────►│
@@ -51,8 +52,8 @@ An AI-powered outbound interviewer that conducts structured investor/user resear
                                                                         REPORT = True)          write SynthesisReport
 
   ── ALTERNATIVE: local REPL (no server, no Vapi) ───────────────────────────────────────────────
-  scripts/play.py ──────────────────────────────────────────────────► run_speech_turn() directly
-  (terminal I/O)                                                       _write_turns_local() for DB
+  scripts/play.py ──────────────────────────────────────────────────► run_speech_turn() → same TurnPipeline.commit()
+  (terminal I/O)                                                       (persists Turn rows to DB)
 ```
 
 **Core invariant:** Agents never call each other. All coordination happens through the DB. The interviewer reads from `calls`, `probes`, `analyst_snapshots`; the analyst writes to `analyst_snapshots` and `probes`; synthesis writes to `synthesis_reports`.
@@ -205,7 +206,9 @@ Async, fire-and-forget. Never blocks a turn response.
 **Trigger condition** (`state.should_run_analyst()`): True if either:
 
 - `scripted_cursor > snapshot.after_scripted_cursor` (a new scripted question was asked since last analysis), OR
-- `turn_count - snapshot.after_turn >= 25` (25-turn fallback to keep probes fresh on long calls)
+- At least `ANALYST_TURN_INTERVAL` (10) **interviewer** turns have elapsed since the last snapshot (`after_turn`) — counts `Turn` rows with `speaker == "interviewer"` after `after_turn`, not a `turn_count` column on `Call`.
+
+**Where it runs:** Evaluated inside `TurnPipeline.commit()` after turns are inserted. If true, `server.py` schedules `run_analyst_safely` from the `/vapi/llm/chat/completions` handler after streaming completes — **not** from the `conversation-update` webhook.
 
 **Incremental context:** If a prior `AnalystSnapshot` exists, the prompt includes only `NEW TRANSCRIPT` turns since `snapshot.after_turn`. This keeps the prompt size bounded regardless of call length. Also appends `EXISTING_PROBES` to prevent duplicating questions already in the queue.
 
@@ -234,12 +237,12 @@ Triggered from `server.py` on `end-of-call-report` webhook event. The Tier 3 eva
 
 ## Turn Pipeline — `voice_agent/turn.py`
 
-Single entry point for all speech turns: `run_speech_turn()` (non-streaming) or `run_speech_turn_stream()` (SSE). Both share the same phases.
+Production uses `TurnPipeline` from `/vapi/llm/chat/completions` (streaming SSE). The local REPL and evals call `run_speech_turn()`, which wraps the same pipeline and awaits `commit()` — same persistence path.
 
 ```
-Phase 1a  Atomic turn counter
-          UPDATE calls SET turn_count = turn_count + 1 RETURNING turn_count
-          → session opened and closed immediately (SQLite write lock released)
+Phase 1a  Turn number for this utterance
+          next_turn_number(session, call_id) → COUNT(existing turns for call) + 1
+          → short session, then closed before LLM work
 
 Phase 1b  Parallel context reads (no DB write lock held)
           5 anyio tasks: next_q, remaining, probes, snapshot, messages
@@ -250,14 +253,16 @@ Phase 1c  LLM call (no open DB session during this phase)
             run_interviewer() → InterviewerOutput
           on timeout: _fallback() → next scripted or wrap_up
 
-Phase 2   Side effects (DB writes, brief session)
+Phase 2   commit() — DB writes (brief session)
+          respondent Turn + interviewer Turn rows (when Vapi messages present)
           scripted/skip_scripted → mark_scripted_asked() (cursor += 1)
           probe_id_used → mark_probe_asked() + log analyst_lag_turns
+          should_run_analyst(session, call_id) for downstream scheduling in server
 ```
 
-**Turn rows are NOT written here.** Confirmed turns are written by `_write_confirmed_turns()` in `server.py` when Vapi fires a `conversation-update` event — only after the turn was actually spoken. This prevents ghost rows from abandoned mid-stream utterances.
+**Turn rows are written in `commit()`** as soon as the LLM stream finishes — before TTS necessarily completes and before the user necessarily hears the full reply. On barge-in, the DB can still hold the full generated text even if playback stops early; a future reconciliation pass may trim analyst-visible text (see project hardening plan).
 
-**Streaming path** (`TurnPipeline.stream_tokens()`) yields `str` tokens as they arrive from the LLM. After the generator is fully consumed, `commit()` reads `stream.output` and applies DB side effects.
+**Streaming path** (`TurnPipeline.stream_tokens()`) yields `str` tokens as they arrive from the LLM. After the generator is fully consumed, `commit()` reads `stream.output` and applies DB side effects (including `Turn` inserts).
 
 **Filler + `<flush />` tag:** When the first LLM token hasn't arrived within `FILLER_THRESHOLD_S`, `stream_tokens()` yields `filler + " <flush /> "` before the real tokens. The `<flush />` is a Vapi-specific directive: it tells Vapi to dispatch the accumulated text to TTS *immediately*, without buffering for more tokens. Without it, TTS providers (especially ElevenLabs) hold a small chunk until they have enough context to synthesize natural-sounding audio, defeating the purpose of sending it early. Note: ElevenLabs may still buffer internally despite the flush — see `docs/Latency Measurement.md` for the nuance.
 
@@ -295,12 +300,11 @@ Lifecycle events only, no LLM calls.
 | Event                         | Action                                                                                           |
 | ----------------------------- | ------------------------------------------------------------------------------------------------ |
 | `status-update` (in-progress) | `Call.status` → `"active"`                                                                       |
-| `conversation-update`         | Upsert confirmed turns via `_write_confirmed_turns()`; trigger analyst if `should_run_analyst()` |
+| `conversation-update`         | Debug log only (`messages` available for future reconciliation; **no** transcript writes here)    |
 | `end-of-call-report`          | `Call.status` → `"ended"`; schedule synthesis if enabled                                         |
-| `speech-update`               | Logged only                                                                                      |
+| `speech-update`               | Latency / extended-silence instrumentation (`_speech_ts`), not turn persistence                  |
 
-
-`**_write_confirmed_turns()`**: Counts existing `Turn` rows for the call, then inserts only the new messages (from that offset onward). Maps Vapi's `bot`/`user` roles to `"interviewer"`/`"respondent"`.
+**Turn persistence and analyst scheduling** happen in `POST /vapi/llm/chat/completions`: after `TurnPipeline.commit()` inserts rows, the handler may fire `run_analyst_safely` when `should_run_analyst()` returned true during that commit.
 
 ### Call Lifecycle Endpoints
 
@@ -332,18 +336,17 @@ All SQLModel tables. Schema is SQLite in dev but Postgres-compatible.
 ```
 calls
 ├── id (PK, our UUID)
-├── vapi_call_id (Vapi's ID, written after dial)
+├── vapi_call_id (Vapi's ID after dial; unique when set — multiple NULLs allowed pre-dial)
 ├── phone_number
 ├── scripted_questions (JSON list)
 ├── scripted_cursor (int, advances on scripted/skip_scripted)
-├── turn_count (atomically incremented)
 ├── status (pending | active | ended)
 ├── end_reason, started_at, ended_at
 └── → turns, probes, analyst_snapshots, synthesis_report (cascade delete)
 
 turns
 ├── call_id (FK)
-├── turn_number
+├── turn_number (unique per call — enforced with DB UniqueConstraint)
 ├── speaker (interviewer | respondent)
 ├── text
 ├── action, reasoning (interviewer turns only)
@@ -371,10 +374,10 @@ synthesis_reports
 
 **Key DB helpers** (all in `state.py`):
 
-- `next_turn_number()` — `UPDATE ... RETURNING` for atomic increment; avoids `SELECT max()` race.
+- `next_turn_number()` — `COUNT(turns for call) + 1` for the next utterance index (short read transaction at turn start).
 - `next_scripted()` / `scripted_remaining()` — cursor-based iteration over `scripted_questions` JSON array.
 - `top_probes(n=3)` — `WHERE asked=False ORDER BY priority ASC, created_at ASC LIMIT n`.
-- `should_run_analyst()` — scripted cursor advanced OR 25-turn fallback.
+- `should_run_analyst()` — scripted cursor advanced since last snapshot OR ≥ `ANALYST_TURN_INTERVAL` (10) interviewer turns since `after_turn`.
 - `turns_since(after_turn)` — incremental analyst context reads.
 - `session_scope(engine)` — context manager: commit on success, rollback on exception.
 - `make_engine(url)` — `:memory:` → `StaticPool` (tests); file SQLite → `NullPool`; Postgres → default pool.
@@ -450,7 +453,7 @@ LLM judge model: `claude-opus-4-6` (defined in `evals/evaluators.py`).
 
 ## Local Development
 
-**REPL mode** (`scripts/play.py`): Drives a full call in-process — no server, no Vapi. Loads questions from `investor_questions.yaml`, maintains message history, calls `run_speech_turn()` directly. Writes turns via `_write_turns_local()` since no webhook fires. Shares the same `voice_agent.db` as the server.
+**REPL mode** (`scripts/play.py`): Drives a full call in-process — no server, no Vapi. Loads questions from `investor_questions.yaml`, maintains message history, calls `run_speech_turn()` directly; `TurnPipeline.commit()` writes `Turn` rows to the DB like production. Shares the same `voice_agent.db` as the server.
 
 **Phone mode** (`scripts/play.py --phone +1...`): Requires the server running. POSTs to `/calls/start`, then Vapi handles everything.
 

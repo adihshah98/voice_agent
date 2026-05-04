@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -271,8 +272,18 @@ async def _require_vapi_signature(request: Request) -> None:
     # Vapi prefixes the hex digest with "v1"
     sig_hex = sig.removeprefix("v1")
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig_hex):
-        logfire.warning("vapi_signature_invalid", path=request.url.path)
+    digest_ok = len(expected) == len(sig_hex) and hmac.compare_digest(expected, sig_hex)
+    if not digest_ok:
+        ts_name = settings.vapi_timestamp_header
+        logfire.warning(
+            "vapi_signature_invalid",
+            path=request.url.path,
+            expected_prefix=expected[:12],
+            received_prefix=(sig_hex[:12] if sig_hex else ""),
+            payload_len=len(payload),
+            timestamp_header_present=(bool(request.headers.get(ts_name, "")) if ts_name else False),
+            hmac_includes_timestamp=bool(ts_name),
+        )
         raise HTTPException(status_code=403, detail="Invalid signature")
 
 
@@ -287,6 +298,22 @@ async def _require_llm_secret(request: Request) -> None:
     if not hmac.compare_digest(request.headers.get("X-Vapi-Secret", ""), secret):
         logfire.warning("llm_secret_invalid", path=request.url.path)
         raise HTTPException(status_code=401, detail="Invalid secret")
+
+
+async def _require_api_auth(request: Request) -> None:
+    """Require Authorization: Bearer … when API_AUTH_TOKEN is set. No-op when unset (dev)."""
+    expected = settings.api_auth_token
+    if not expected:
+        return
+    auth = request.headers.get("Authorization", "")
+    scheme, _, value = auth.partition(" ")
+    if scheme.lower() != "bearer":
+        logfire.warning("api_auth_invalid", path=request.url.path, reason="missing_or_non_bearer")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    given = value.strip()
+    if len(given) != len(expected) or not secrets.compare_digest(given, expected):
+        logfire.warning("api_auth_invalid", path=request.url.path, reason="bad_token")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # --- Webhook ----------------------------------------------------------------
@@ -487,7 +514,7 @@ class StartCallRequest(BaseModel):
 
 
 @app.post("/calls/start")
-async def start_call(req: StartCallRequest) -> dict[str, str]:
+async def start_call(req: StartCallRequest, _: None = Depends(_require_api_auth)) -> dict[str, str]:
     """Seed scripted questions and optionally dial out via Vapi."""
     call_id = req.call_id or str(uuid.uuid4())
 
@@ -716,7 +743,9 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
 
 
 @app.delete("/calls/{call_id}")
-async def delete_call(request: Request, call_id: str) -> dict[str, str]:
+async def delete_call(
+    request: Request, call_id: str, _: None = Depends(_require_api_auth)
+) -> dict[str, str]:
     """Cancel an in-flight call. Fires DELETE to Vapi if the call is still active."""
     request.state.call_id = call_id
 

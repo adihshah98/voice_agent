@@ -257,6 +257,10 @@ def dial_via_server(questions: list[str], phone_number: str) -> None:
             play_logger.error("Start it with: uv run uvicorn voice_agent.server:app --reload")
             sys.exit(1)
 
+        headers: dict[str, str] = {}
+        if settings.api_auth_token:
+            headers["Authorization"] = f"Bearer {settings.api_auth_token}"
+
         resp = client.post(
             f"{BASE_URL}/calls/start",
             json={
@@ -264,6 +268,7 @@ def dial_via_server(questions: list[str], phone_number: str) -> None:
                 "call_id": call_id,
                 "phone_number": phone_number,
             },
+            headers=headers,
             timeout=15,
         )
         if not resp.is_success:

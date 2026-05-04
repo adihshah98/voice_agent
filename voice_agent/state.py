@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, text
+from sqlalchemy import Column, UniqueConstraint, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
 from sqlalchemy.pool import NullPool, StaticPool
@@ -26,7 +26,7 @@ class Call(SQLModel, table=True):
     __tablename__ = "calls"
 
     id: str = Field(primary_key=True)
-    vapi_call_id: Optional[str] = Field(default=None, index=True)
+    vapi_call_id: Optional[str] = Field(default=None, unique=True, index=True)
     phone_number: Optional[str] = None
     scripted_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     scripted_cursor: int = Field(default=0)
@@ -70,6 +70,7 @@ class Call(SQLModel, table=True):
 
 class Turn(SQLModel, table=True):
     __tablename__ = "turns"
+    __table_args__ = (UniqueConstraint("call_id", "turn_number", name="uq_turns_call_turn_number"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
     call_id: str = Field(foreign_key="calls.id", index=True)

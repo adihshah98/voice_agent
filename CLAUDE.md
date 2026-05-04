@@ -37,7 +37,7 @@ Multi-agent voice research interviewer built on Vapi. **[docs/architecture.md](d
 Three PydanticAI agents, each with a different latency budget — this is the core design constraint:
 
 1. **Interviewer** ([voice_agent/agents/interviewer.py](voice_agent/agents/interviewer.py)) — one LLM call per turn, hard 5 s deadline via `anyio.move_on_after`. **Not** a ReAct tool loop: all DB state is pre-fetched into a CONTEXT block and the model returns a single structured `InterviewerOutput`. Python then applies side effects (marking probe/scripted as asked) based on the output. If the deadline fires, `_fallback()` returns the next scripted question. Uses a `FallbackModel` chain: **Haiku 4.5 → Groq (llama-3.3-70b) → Groq retry → Cerebras (llama3.1-8b)**. Models are env-overridable via `HAIKU_MODEL`, `GROQ_MODEL`, `CEREBRAS_MODEL` in [voice_agent/config.py](voice_agent/config.py). Set `CEREBRAS_MODEL=""` to skip Cerebras. On `status-update: active`, a Groq warmup request fires in the background to pre-warm the connection.
-2. **Analyst** ([voice_agent/agents/analyst.py](voice_agent/agents/analyst.py)) — Sonnet 4.6, fire-and-forget via `asyncio.create_task`. Triggered from the `conversation-update` webhook when `should_run_analyst()` returns True: either the scripted cursor advanced, or ≥25 turns elapsed since the last snapshot. Reads prior `AnalystSnapshot` as established context + only the new turns since, so prompt size stays bounded on long calls. Wrapped in `run_analyst_safely` — exceptions are swallowed so a crashing analyst never affects the live call.
+2. **Analyst** ([voice_agent/agents/analyst.py](voice_agent/agents/analyst.py)) — Sonnet 4.6, fire-and-forget via `asyncio.create_task`. Triggered after [`TurnPipeline.commit()`](voice_agent/turn.py) from the `/vapi/llm/chat/completions` handler ([`voice_agent/server.py`](voice_agent/server.py)) when `should_run_analyst()` returned true during that commit: either the scripted cursor advanced since the last snapshot, or ≥`ANALYST_TURN_INTERVAL` (10) interviewer turns since `after_turn`. Reads prior `AnalystSnapshot` as established context + only the new turns since, so prompt size stays bounded on long calls. Wrapped in `run_analyst_safely` — exceptions are swallowed so a crashing analyst never affects the live call.
 3. **Synthesis** ([voice_agent/agents/synthesis.py](voice_agent/agents/synthesis.py)) — Sonnet 4.6, post-call. Gated by `ENABLE_SYNTHESIS_REPORT` in [voice_agent/config.py](voice_agent/config.py) (currently **False** — keep that in mind when testing the end-of-call path).
 
 **Invariant: agents never call each other.** All coordination flows through SQLite tables in [voice_agent/state.py](voice_agent/state.py). Model IDs, timeouts, and the synthesis flag all live in [voice_agent/config.py](voice_agent/config.py) — swap a model there, nothing else changes.
@@ -57,7 +57,7 @@ The custom-LLM endpoint returns OpenAI-shaped responses (SSE chunks) because Vap
 
 **Streaming + structured output in one LLM call:** `InterviewerOutput` is a Pydantic model; its JSON can't be validated until complete. PydanticAI's streaming API lets `InterviewerStream.tokens()` yield `utterance` tokens live (for TTS) while building the full output internally. `stream.output` (action, reasoning, probe_id_used) is only readable after the stream is exhausted — consumed in `commit()`. No two-pass LLM call needed. See `docs/architecture.md` → Turn Pipeline for details.
 
-**Turn rows are not written in `run_speech_turn`.** They are written by `_write_confirmed_turns()` in `server.py`, triggered by `conversation-update` webhook events — only after Vapi confirms the turn was actually spoken. This eliminates ghost turns from rapid-fire utterance boundaries.
+**Turn rows** are inserted in [`TurnPipeline.commit()`](voice_agent/turn.py): respondent + interviewer rows after each completed LLM stream (`run_speech_turn()` uses the same pipeline for REPL/evals). Production triggers this from `/vapi/llm/chat/completions` after SSE finishes. The `conversation-update` webhook does **not** write turns — it is logged only (see [`docs/architecture.md`](docs/architecture.md)).
 
 ### Vapi lifecycle
 
@@ -66,7 +66,7 @@ Two endpoints, different roles:
 - `/vapi/llm/chat/completions` — per-turn inference (replaces OpenAI from Vapi's perspective).
 - `/vapi/webhook` — HMAC-verified (see Security below). Four event types:
   - `status-update` — flips `Call.status` pending→active; fires Groq warmup on first active.
-  - `conversation-update` — writes confirmed turns to DB; triggers analyst if `should_run_analyst()`; logs per-turn latency breakdown (`vapi_turn_ms`, `vapi_endpointing_ms`, `llm_ttft_ms`).
+  - `conversation-update` — debug log only (no DB writes; transcript reconciliation may use `messages` later); turn persistence and analyst scheduling happen in the custom-LLM endpoint after `commit()`.
   - `end-of-call-report` — flips status to ended; schedules synthesis if enabled; cancels silence watch.
   - `speech-update` — tracks timing (`_speech_ts`) for latency measurement; manages the extended-silence watch (starts timer on `assistant/stopped`, cancels on `user/started`).
 

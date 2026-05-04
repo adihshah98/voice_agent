@@ -181,3 +181,44 @@ async def test_extended_silence_cancelled_when_user_speaks(monkeypatch: pytest.M
         c = session.get(state.Call, "c-quiet")
         assert c is not None
         assert c.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_calls_start_and_delete_require_bearer_when_api_auth_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eng = state.make_engine("sqlite:///:memory:")
+    state.init_db(eng)
+    monkeypatch.setattr(server, "engine", eng)
+    monkeypatch.setattr(server.settings, "api_auth_token", "test-bearer-secret")
+    monkeypatch.setattr(server.settings, "vapi_api_key", "")
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.post("/calls/start", json={"scripted_questions": ["q1"]})
+        assert r.status_code == 401
+
+        r = await client.post(
+            "/calls/start",
+            json={"scripted_questions": ["q1"]},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert r.status_code == 401
+
+        r = await client.post(
+            "/calls/start",
+            json={"scripted_questions": ["q1"]},
+            headers={"Authorization": "Bearer test-bearer-secret"},
+        )
+        assert r.status_code == 200
+        call_id = r.json()["call_id"]
+
+        d = await client.delete(f"/calls/{call_id}")
+        assert d.status_code == 401
+
+        d = await client.delete(
+            f"/calls/{call_id}",
+            headers={"Authorization": "Bearer test-bearer-secret"},
+        )
+        assert d.status_code == 200
+        assert d.json()["status"] == "ended"
