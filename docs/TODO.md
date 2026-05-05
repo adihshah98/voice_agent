@@ -54,6 +54,7 @@
 ---
 
 - Prod Infra
+  - Multi-server deployment - cleaning up data that is in-memory worker dependant
   - CI/CD
   - SQS Queues
   - Secrets Mgmt.

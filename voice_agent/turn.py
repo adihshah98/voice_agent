@@ -227,6 +227,33 @@ class TurnPipeline:
                     state.mark_probe_asked(session, reply.probe_id_used)
 
                 if vapi_messages is not None:
+                    # Reconcile the previous interviewer turn against what Vapi confirmed
+                    # was actually spoken. On barge-in, Vapi sends the truncated (spoken)
+                    # assistant content in messages[-2]; commit() wrote the full LLM output.
+                    prev_spoken: str | None = None
+                    if len(vapi_messages) >= 2:
+                        m = vapi_messages[-2]
+                        if m.get("role") == "assistant":
+                            prev_spoken = m.get("content", "")
+                    if prev_spoken is not None:
+                        prev_turn = session.exec(
+                            select(state.Turn)
+                            .where(state.Turn.call_id == call_id, state.Turn.speaker == "interviewer")
+                            .order_by(state.Turn.turn_number.desc())
+                            .limit(1)
+                        ).first()
+                        if prev_turn and len(prev_spoken) < len(prev_turn.text):
+                            prev_turn.text = prev_spoken
+                            prev_turn.barge_in_truncated = True
+                            session.add(prev_turn)
+                            logfire.info(
+                                "turn_barge_in_reconciled",
+                                call_id=call_id,
+                                turn_number=prev_turn.turn_number,
+                                original_len=len(prev_turn.text),
+                                spoken_len=len(prev_spoken),
+                            )
+
                     next_num = turn_number
                     if self._respondent_text:
                         session.add(state.Turn(call_id=call_id, turn_number=next_num, speaker="respondent", text=self._respondent_text))

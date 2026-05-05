@@ -94,6 +94,7 @@ class Turn(SQLModel, table=True):
     tokens_output: Optional[int] = None
     tokens_cache_read: Optional[int] = None
     tokens_cache_write: Optional[int] = None
+    barge_in_truncated: bool = Field(default=False)
     created_at: datetime = Field(default_factory=_utcnow)
 
     call: Call = Relationship(
