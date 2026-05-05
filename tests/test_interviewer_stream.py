@@ -6,6 +6,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import pytest_mock
 from pydantic_ai.usage import RunUsage
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
@@ -17,7 +18,7 @@ from voice_agent.models import InterviewerLLMMeta
 
 
 @pytest.mark.asyncio
-async def test_interviewer_stream_tokens_and_output(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_interviewer_stream_tokens_and_output(mocker: pytest_mock.MockerFixture) -> None:
     # Simulate a model that correctly uses <utterance> tags
     raw_output = (
         "<utterance>What happened next?</utterance>\n"
@@ -50,7 +51,7 @@ async def test_interviewer_stream_tokens_and_output(monkeypatch: pytest.MonkeyPa
         def run_stream(self, prompt_parts, deps=None):
             return FakeRunStreamCtx()
 
-    monkeypatch.setattr(interviewer_module, "interviewer", FakeAgent())
+    mocker.patch.object(interviewer_module, "interviewer", FakeAgent())
 
     deps = SimpleNamespace(session=None, call_id="call-1", turn_number=1)
     prepared = interviewer_module.PreparedInterviewerTurn(
@@ -72,7 +73,7 @@ async def test_interviewer_stream_tokens_and_output(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_interviewer_stream_bare_format(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_interviewer_stream_bare_format(mocker: pytest_mock.MockerFixture) -> None:
     """Bare format (no tags) — model omits <utterance> wrapper but still outputs JSON."""
 
     class FakeStreamed:
@@ -94,7 +95,7 @@ async def test_interviewer_stream_bare_format(monkeypatch: pytest.MonkeyPatch) -
         def run_stream(self, prompt_parts, deps=None):
             return FakeRunStreamCtx()
 
-    monkeypatch.setattr(interviewer_module, "interviewer", FakeAgent())
+    mocker.patch.object(interviewer_module, "interviewer", FakeAgent())
 
     deps = SimpleNamespace(session=None, call_id="call-1", turn_number=1)
     prepared = interviewer_module.PreparedInterviewerTurn(

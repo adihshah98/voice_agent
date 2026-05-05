@@ -9,12 +9,15 @@ Never raises into the live call path — use `run_analyst_safely` from server.py
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
 import logfire
 from opentelemetry import trace
 from dotenv import load_dotenv
 from pydantic_ai import Agent
 from pydantic_ai.models.anthropic import AnthropicModelSettings
+from pydantic_evals.evaluators import Evaluator, EvaluatorContext
+from pydantic_evals.online import evaluate
 from sqlmodel import select
 
 load_dotenv()
@@ -237,13 +240,23 @@ async def run_analyst(deps: AnalystDeps) -> None:
     )
 
 
-async def run_analyst_safely(deps: AnalystDeps) -> None:
+@dataclass
+class ProbesGenerated(Evaluator):
+    def evaluate(self, ctx: EvaluatorContext) -> bool:
+        snapshot = ctx.output
+        return snapshot is not None and bool(snapshot.new_probes)
+
+
+@evaluate(ProbesGenerated())
+async def run_analyst_safely(deps: AnalystDeps) -> AnalysisUpdate | None:
     """Swallow exceptions so a crashing analyst never affects the live call."""
     try:
         await run_analyst(deps)
+        return load_latest_analysis(deps.engine, deps.call_id)
     except Exception:
         logfire.exception("analyst_error", call_id=deps.call_id)
         logfire.warning("analyst_skipped_no_probes_generated", call_id=deps.call_id)
+        return None
 
 
 def load_latest_analysis(engine, call_id: str) -> AnalysisUpdate | None:

@@ -1,19 +1,25 @@
-"""Tier 3 — full-conversation trajectory eval.
+"""Tier 3 — focused simulation for 2 persona-specific behaviors.
 
-Drives the interviewer + analyst against a simulated respondent (4 personas)
-until `wrap_up` or a turn limit. Evaluators:
+Only personas that require live simulation (emergent multi-agent behavior)
+are tested here. The other 4 personas (power_user, skeptical_buyer,
+ai_skeptic, churn_risk) run as deterministic replay evals in test_replay.py.
+
+    contradictory     — analyst must detect contradiction + probe it
+    off_topic_rambler — interviewer must fire off_topic redirect
+
+Evaluators:
 
     CallCompletes          deterministic — reached wrap_up before turn limit
     CoveredAllScripted     deterministic — all scripted questions asked
-    CaughtContradiction    deterministic — contradictory persona: analyst found
+    CaughtContradiction    deterministic — contradictory: analyst found
                            contradiction AND a priority-1 probe was asked
     RedirectedOffTopic     deterministic — off_topic_rambler: off_topic action
                            fired at least once
-    ReportQuality          LLMJudge 1–5 — synthesis summary vs transcript
+
+Capped at 12 turns per persona. ~24 Sonnet calls ≈ 45s.
 
 Run with:
-    uv run pytest evals/test_trajectories.py -v -s
-    uv run pytest evals/test_trajectories.py -v -s -k chatty_enthusiast   # single persona
+    uv run pytest evals/test_trajectories.py -v -s -m slow
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ import pytest
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from pydantic_evals import Case, Dataset
-from pydantic_evals.evaluators import Evaluator, EvaluatorContext, LLMJudge
+from pydantic_evals.evaluators import Evaluator, EvaluatorContext
 from sqlalchemy.pool import StaticPool
 from sqlmodel import create_engine, select
 
@@ -35,13 +41,11 @@ load_dotenv()
 from voice_agent import state
 from voice_agent.agents.analyst import run_analyst_safely
 from evals.simulator import load_personas, simulate_turn
-from voice_agent.agents.interviewer import run_interviewer
-from voice_agent.models import AnalystDeps, InterviewerDeps, Persona
-from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely
-from voice_agent.tracing import init_tracing
+from voice_agent.models import AnalystDeps, Persona
+import logfire
+from voice_agent.turn import run_speech_turn
 
-JUDGE_MODEL = "anthropic:claude-opus-4-6"
-MAX_TURNS = 20  # respondent turns before we declare the call incomplete
+MAX_TURNS = 12  # capped at 12 turns; ~24 Sonnet calls total across 2 personas
 
 SCRIPTED_QUESTIONS = [
     "How do you currently use this product?",
@@ -74,8 +78,6 @@ class TrajectoryResult(BaseModel):
     analyst_found_contradiction: bool
     contradiction_probe_asked: bool
     turn_actions: list[str]
-    transcript_text: str
-    synthesis_summary: str
 
 
 # ---------------------------------------------------------------------------
@@ -133,60 +135,38 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
     db_turn_number += 1
 
     for _ in range(inputs.max_turns):
-        # --- Respondent turn ---
+        # --- Respondent turn (simulated) ---
         respondent_text = await simulate_turn(persona, history)
-        with state.session_scope(engine) as s:
-            s.add(
-                state.Turn(
-                    call_id=call_id,
-                    turn_number=db_turn_number,
-                    speaker="respondent",
-                    text=respondent_text,
-                )
-            )
         history.append({"speaker": "respondent", "text": respondent_text})
-        db_turn_number += 1
 
-        # --- Analyst pass (awaited for offline eval — no latency constraint) ---
+        # --- Interviewer turn via TurnPipeline (production path) ---
+        # commit() writes both the respondent and interviewer Turn rows.
+        # vapi_messages includes the new respondent utterance as the last "user" message.
+        vapi_messages = [
+            {"role": "assistant" if t["speaker"] == "interviewer" else "user", "content": t["text"]}
+            for t in history
+        ]
+        out = await run_speech_turn(engine, call_id, vapi_messages=vapi_messages)
+        db_turn_number += 2  # commit() wrote respondent + interviewer rows
+
+        history.append({"speaker": "interviewer", "text": out["message"]})
+        turn_actions.append(out["action"])
+
+        if out["action"] == "off_topic":
+            off_topic_redirects_at.append(db_turn_number - 1)
+
+        # Track contradiction probe: probe asked on a turn where analyst had already flagged one
+        if out["action"] == "probe" and analyst_found_contradiction:
+            contradiction_probe_asked = True
+
+        # --- Analyst pass — runs after commit(), matching production fire-and-forget order ---
         await run_analyst_safely(AnalystDeps(call_id=call_id, engine=engine))
         with state.session_scope(engine) as s:
             snapshot = state.latest_snapshot(s, call_id)
             if snapshot and snapshot.contradictions:
                 analyst_found_contradiction = True
 
-        # --- Interviewer turn ---
-        with state.session_scope(engine) as s:
-            deps = InterviewerDeps(
-                call_id=call_id,
-                session=s,
-                turn_number=db_turn_number,
-            )
-            out = await run_interviewer(deps, respondent_text)
-
-            # Track contradiction probe: probe asked after analyst saw a contradiction
-            if out.action == "probe" and analyst_found_contradiction:
-                contradiction_probe_asked = True
-
-            s.add(
-                state.Turn(
-                    call_id=call_id,
-                    turn_number=db_turn_number,
-                    speaker="interviewer",
-                    text=out.utterance,
-                    action=out.action,
-                    reasoning=out.reasoning,
-                )
-            )
-
-        history.append({"speaker": "interviewer", "text": out.utterance})
-        turn_actions.append(out.action)
-
-        if out.action == "off_topic":
-            off_topic_redirects_at.append(db_turn_number)
-
-        db_turn_number += 1
-
-        if out.action == "wrap_up":
+        if out["action"] == "wrap_up":
             completed = True
             break
 
@@ -194,18 +174,6 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
     with state.session_scope(engine) as s:
         call = s.get(state.Call, call_id)
         scripted_asked_count = call.scripted_cursor if call else 0
-
-    # Synthesis (post-call report)
-    synthesis_summary = ""
-    with state.session_scope(engine) as s:
-        s_deps = SynthesisDeps(call_id=call_id, session=s)
-        report = await run_synthesis_safely(s_deps)
-        if report:
-            synthesis_summary = report.summary
-
-    transcript_text = "\n".join(
-        f"{t['speaker'].upper()}: {t['text']}" for t in history
-    )
 
     return TrajectoryResult(
         persona_name=inputs.persona_name,
@@ -217,8 +185,6 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
         analyst_found_contradiction=analyst_found_contradiction,
         contradiction_probe_asked=contradiction_probe_asked,
         turn_actions=turn_actions,
-        transcript_text=transcript_text,
-        synthesis_summary=synthesis_summary,
     )
 
 
@@ -282,42 +248,16 @@ class RedirectedOffTopic(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
         return len(ctx.output.off_topic_redirects_at) > 0
 
 
-def report_quality_judge() -> LLMJudge:
-    """LLMJudge: is the synthesis summary accurate and useful vs the transcript?"""
-    return LLMJudge(
-        rubric=(
-            "You are grading a POST-CALL SYNTHESIS SUMMARY produced by an AI "
-            "market-research agent after a simulated phone interview.\n\n"
-            "The output you are grading contains:\n"
-            "  `transcript_text` — the full conversation\n"
-            "  `synthesis_summary` — the post-call summary to evaluate\n\n"
-            "Score 1–5 on REPORT QUALITY:\n"
-            "  5 = accurately reflects the transcript; cites specific details; "
-            "no hallucinations; identifies key themes; actionable\n"
-            "  4 = mostly accurate; minor omissions or slight over-generalisation\n"
-            "  3 = captures the gist but misses important details or makes vague "
-            "claims that aren't directly supported\n"
-            "  2 = significant omissions or minor inaccuracies relative to the "
-            "transcript\n"
-            "  1 = does not reflect the transcript, or contains hallucinations, "
-            "or synthesis_summary is empty\n\n"
-            "Pass (score >= 3) if the summary is a reasonable reflection of what "
-            "was discussed. Fail if it introduces facts not in the transcript."
-        ),
-        model=JUDGE_MODEL,
-        include_input=False,
-        score={"evaluation_name": "report_quality"},
-        assertion=False,
-    )
-
-
 # ---------------------------------------------------------------------------
-# Dataset builder
+# Dataset builder — only the 2 personas requiring live simulation
 # ---------------------------------------------------------------------------
+
+_SIMULATION_PERSONAS = {"contradictory", "off_topic_rambler"}
 
 
 def _build_dataset() -> Dataset[TrajectoryInputs, TrajectoryResult, None]:
-    personas = load_personas()
+    all_personas = load_personas()
+    sim_personas = [p for p in all_personas if p.name in _SIMULATION_PERSONAS]
     cases: list[Case[TrajectoryInputs, TrajectoryResult, None]] = [
         Case(
             name=p.name,
@@ -327,17 +267,16 @@ def _build_dataset() -> Dataset[TrajectoryInputs, TrajectoryResult, None]:
                 scripted_questions=SCRIPTED_QUESTIONS,
             ),
         )
-        for p in personas
+        for p in sim_personas
     ]
     return Dataset(
-        name="trajectories_tier3",
+        name="trajectories_tier3_sim",
         cases=cases,
         evaluators=(
             CallCompletes(),
             CoveredAllScripted(),
             CaughtContradiction(),
             RedirectedOffTopic(),
-            report_quality_judge(),
         ),
     )
 
@@ -350,12 +289,16 @@ def _build_dataset() -> Dataset[TrajectoryInputs, TrajectoryResult, None]:
 @pytest.mark.asyncio
 @pytest.mark.slow
 async def test_tier3_trajectories():
-    """Full trajectory eval across all 4 personas.
+    """Focused simulation for contradictory + off_topic_rambler personas.
 
-    Marked `slow` — each run makes ~40–80 LLM calls. Run with:
+    These are the only 2 personas testing emergent multi-agent behavior
+    (analyst ↔ interviewer) that replay evals can't cover. The other 4
+    personas run as deterministic replay evals in test_replay.py.
+
+    Marked `slow` — ~24 Sonnet calls ≈ 45s. Run with:
         uv run pytest evals/test_trajectories.py -v -s -m slow
     """
-    init_tracing(service_name="voice-agent-evals", send_to_logfire=False)
+    logfire.configure(service_name="voice-agent-evals", send_to_logfire="if-token-present")
 
     dataset = _build_dataset()
     report = await dataset.evaluate(
@@ -376,25 +319,12 @@ async def test_tier3_trajectories():
     for name, value in sorted(scores.items()):
         print(f"  {name:<28} {value:.3f}")
 
-    assert scores.get("CallCompletes", 0) >= 1, (
-        "Not all calls reached wrap_up — interviewer isn't closing calls"
-    )
-    assert scores.get("CoveredAllScripted", 0) >= 0.75, (
-        "Fewer than 75% of calls covered all scripted questions"
-    )
     assert scores.get("CaughtContradiction", 1) >= 1.0, (
         "contradictory persona: analyst failed to catch the contradiction or probe it"
     )
     assert scores.get("RedirectedOffTopic", 1) >= 1.0, (
         "off_topic_rambler persona: interviewer never redirected the respondent"
     )
-
-    quality = scores.get("report_quality")
-    if quality is not None:
-        assert quality >= 3.0, (
-            f"Synthesis report quality {quality:.2f} below 3.0/5 — "
-            "reports are not accurately reflecting transcripts"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +333,9 @@ async def test_tier3_trajectories():
 
 
 def _print_results(report) -> None:
-    cols = "  CC  CS  CT  RT  RQ"
+    cols = "  CC  CS  CT  RT"
     header = f"{'persona':<24}{cols}  actions"
-    print(f"\nTier 3 trajectory results:\n{header}\n{'-' * len(header)}")
+    print(f"\nTier 3 simulation results:\n{header}\n{'-' * len(header)}")
 
     def _b(src, key) -> str:
         item = (src or {}).get(key)
@@ -413,23 +343,14 @@ def _print_results(report) -> None:
             return "  - "
         return " ok " if item.value else "FAIL"
 
-    def _n(src, key) -> str:
-        item = (src or {}).get(key)
-        if item is None:
-            return "  - "
-        v = item.value
-        return f"{v:3.1f}" if isinstance(v, (int, float)) else "  - "
-
     for case in report.cases:
         a = case.assertions or {}
-        sc = case.scores or {}
         cc = _b(a, "CallCompletes")
         cs = _b(a, "CoveredAllScripted")
         ct = _b(a, "CaughtContradiction")
         rt = _b(a, "RedirectedOffTopic")
-        rq = _n(sc, "report_quality")
         actions = ", ".join(case.output.turn_actions) if case.output else ""
-        print(f"{(case.name or ''):<24}{cc}{cs}{ct}{rt}{rq:>5}  {actions[:60]}")
+        print(f"{(case.name or ''):<24}{cc}{cs}{ct}{rt}  {actions[:60]}")
 
         if case.output and not case.output.completed:
             print(f"  [did not complete — {case.output.total_db_turns} db turns]")

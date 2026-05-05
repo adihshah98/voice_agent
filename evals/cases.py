@@ -91,12 +91,18 @@ def load_analyst_cases(
     return cases
 
 
+def get_dataset_version(path: str | Path) -> str:
+    raw = yaml.safe_load(Path(path).read_text())
+    return raw.get("version", "unversioned")
+
+
 __all__ = [
     "AnalystCaseInputs",
     "InterviewerCaseInputs",
     "InterviewerOutput",
     "ProbeSeed",
     "TurnLine",
+    "get_dataset_version",
     "load_analyst_cases",
     "load_cases",
 ]

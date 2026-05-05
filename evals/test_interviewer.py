@@ -33,10 +33,10 @@ from evals.evaluators import (
     no_leading_questions_judge,
     utterance_warmth_judge,
 )
-from voice_agent.agents.interviewer import run_interviewer
-from voice_agent.models import InterviewerDeps, InterviewerOutput
+from voice_agent.models import InterviewerOutput
+from voice_agent.turn import run_speech_turn
+import logfire
 from pydantic_evals import Dataset
-from voice_agent.tracing import init_tracing
 
 
 DATASET_PATH = Path(__file__).parent / "datasets" / "interviewer_turns.yaml"
@@ -100,28 +100,28 @@ def _seed_engine(inputs: InterviewerCaseInputs):
 async def run_interviewer_on_case(
     inputs: InterviewerCaseInputs,
 ) -> InterviewerOutput:
-    engine, call_id, prior_count = _seed_engine(inputs)
+    engine, call_id, _ = _seed_engine(inputs)
 
-    # Build the vapi_messages list from prior_turns + the current respondent utterance,
-    # mirroring what Vapi would send as body["messages"] to the LLM endpoint.
-    vapi_messages: list[dict] = []
-    for t in inputs.prior_turns:
-        role = "assistant" if t.speaker == "interviewer" else "user"
-        vapi_messages.append({"role": role, "content": t.text})
+    # Mirror what Vapi sends as body["messages"] to the LLM endpoint.
+    # TurnPipeline.commit() will write the respondent + interviewer Turn rows —
+    # do not add last_respondent to prior_turns in _seed_engine.
+    vapi_messages: list[dict] = [
+        {"role": "assistant" if t.speaker == "interviewer" else "user", "content": t.text}
+        for t in inputs.prior_turns
+    ]
     vapi_messages.append({"role": "user", "content": inputs.last_respondent})
 
-    with state.session_scope(engine) as session:
-        deps = InterviewerDeps(
-            call_id=call_id,
-            session=session,
-            turn_number=prior_count + 2,
-        )
-        return await run_interviewer(deps, inputs.last_respondent, vapi_messages=vapi_messages)
+    result = await run_speech_turn(engine, call_id, vapi_messages=vapi_messages)
+    return InterviewerOutput(
+        utterance=result["message"],
+        action=result["action"],
+        reasoning=result["reasoning"],
+    )
 
 
 @pytest.mark.asyncio
 async def test_tier1_interviewer_decisions():
-    init_tracing(service_name="voice-agent-evals", send_to_logfire=False)
+    logfire.configure(service_name="voice-agent-evals", send_to_logfire="if-token-present")
 
     dataset: Dataset[InterviewerCaseInputs, InterviewerOutput, None] = Dataset(
         name="interviewer_tier1",

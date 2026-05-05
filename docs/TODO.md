@@ -7,32 +7,29 @@
 
 ## My questions/Future improvements
 
-- Eval Infra
-  - Online evals
-  - E2E Evals
-    - **The single most underrated item on your list:** stopping the REPL path from diverging further. It's already happening and it quietly invalidates your eval results — which are the foundation of everything else.
-    - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
-    - Eventually do something about the non-Vapi path (used only for evals) functions like run_speech_run in turn.py, db_messages_fallback, prepare_interviewer_turn
-    - REPL Path is already diverging from prod
-    - In the hot path (`turn.py`), the session is closed *before* `interviewer.run()` is awaited (hence `Session | None` — the docstring explains this). So `deps.session` is `None` during the actual LLM call in production; it's only non-None in the REPL and evals. run_interviewer & run_interviewer_with_timeout are only called by evals
-  - Versioned datasets/eval runs
-- Conversation Trajectory
-  - Make sure it asks everything
-  - Make sure it probes at the correct depth
-  - Make sure it wraps up with everything covered in a set time
-  - Make sure it doesn't ask again/get stuck in loops/rabbitholes
-  - Make sure it deals with non-happy path behavior
-  - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
-  - When handling a probe from earlier, it should say like you said earlier
+- Look at logs to see what was wrong
+- Evals
+  - For all tiers: See if we are testing appropriate things
+    - Tier 1: Check latest run, some things are failing
+    - Tier 2 (Analyst)
+    - Tier 3: Is this covering enough
+      - Make sure it asks everything
+      - Make sure it probes at the correct depth
+      - Make sure it wraps up with everything covered in a set time
+      - Make sure it doesn't ask again/get stuck in loops/rabbitholes
+      - Make sure it deals with non-happy path behavior
+      - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
+      - When handling a probe from earlier, it should say like you said earlier
+  - Versioned datasets/eval runs: Where are these saved, how to view nicely, is this best practice? Hosted vs Local? Why print? 
+  - Online Evals: See if working fine
 - Infra - Prod Level
   - Render Deployment 
   - Webhook correctness (auth/idempotency)
   - Live DB + Alembic
-  - Dependency Mgmt on pyproject.timl and remove requirements.txt
   - Rate limiting
 - Multi-tenant 
   - See, eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in midn
-    - Tell it it is diligencing which product
+    - Tell it it is diligencing which product & some knowledge abt it
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default
   - Multi-tenant auth

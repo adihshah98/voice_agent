@@ -3,37 +3,48 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
+import pytest_mock
 
 from voice_agent import server, state
 from voice_agent.turn import StreamTurnResult
 
 
-def _call_body(vapi_call_id: str, call_id: str, content: str, stream: bool = True) -> dict:
-    return {
-        "stream": stream,
+def _vapi_llm_body(vapi_call_id: str, call_id: str, content: str) -> server.VapiLLMBody:
+    return server.VapiLLMBody.model_validate({
+        "stream": True,
         "call": {
             "id": vapi_call_id,
             "assistant": {"metadata": {"call_id": call_id}},
         },
         "messages": [{"role": "user", "content": content}],
-    }
+    })
+
+
+async def _collect_sse(response) -> str:
+    """Drain a StreamingResponse body_iterator into a single string."""
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk if isinstance(chunk, str) else chunk.decode())
+    return "".join(chunks)
 
 
 @pytest.mark.asyncio
-async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_vapi_stream_cancelled_error_is_handled(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
-    monkeypatch.setattr(server.settings, "llm_secret_token", "")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
+    mocker.patch.object(server.settings, "llm_secret_token", "")
     with state.session_scope(eng) as session:
         session.add(state.Call(id="call-123", scripted_questions=[], status="pending"))
 
     class FakePipeline:
         filler_injected = False
+        ttft_ms = None
 
         def __init__(self, engine, call_id, vapi_messages=None):
             assert call_id == "call-123"
@@ -46,32 +57,32 @@ async def test_vapi_stream_cancelled_error_is_handled(monkeypatch: pytest.Monkey
         async def commit(self):
             raise AssertionError("commit() should not be called after CancelledError")
 
-    monkeypatch.setattr(server, "TurnPipeline", FakePipeline)
+    mocker.patch.object(server, "TurnPipeline", FakePipeline)
 
-    transport = httpx.ASGITransport(app=server.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/vapi/llm/chat/completions",
-            json=_call_body("vapi-call-1", "call-123", "hello there"),
-        )
+    req = MagicMock()
+    req.state = MagicMock()
+    response = await server.vapi_llm(req, _vapi_llm_body("vapi-call-1", "call-123", "hello there"), None)
+    body = await _collect_sse(response)
 
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert '"content": "hello"' in response.text
-    assert "[DONE]" not in response.text
+    assert response.media_type == "text/event-stream"
+    assert '"content": "hello"' in body
+    assert "[DONE]" not in body
 
 
 @pytest.mark.asyncio
-async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_vapi_stream_completes_with_done_chunk(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
-    monkeypatch.setattr(server.settings, "llm_secret_token", "")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
+    mocker.patch.object(server.settings, "llm_secret_token", "")
     with state.session_scope(eng) as session:
         session.add(state.Call(id="call-456", scripted_questions=[], status="pending"))
 
     class FakePipeline:
+        filler_injected = False
+        ttft_ms = None
+
         def __init__(self, engine, call_id, vapi_messages=None):
             assert call_id == "call-456"
             assert vapi_messages is not None
@@ -91,21 +102,18 @@ async def test_vapi_stream_completes_with_done_chunk(monkeypatch: pytest.MonkeyP
                 llm_usage=None,
             )
 
-    monkeypatch.setattr(server, "TurnPipeline", FakePipeline)
+    mocker.patch.object(server, "TurnPipeline", FakePipeline)
 
-    transport = httpx.ASGITransport(app=server.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/vapi/llm/chat/completions",
-            json=_call_body("vapi-call-2", "call-456", "hi again"),
-        )
+    req = MagicMock()
+    req.state = MagicMock()
+    response = await server.vapi_llm(req, _vapi_llm_body("vapi-call-2", "call-456", "hi again"), None)
+    body = await _collect_sse(response)
 
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert '"content": "partial "' in response.text
-    assert '"content": "reply"' in response.text
-    assert '"finish_reason": "stop"' in response.text
-    assert "data: [DONE]" in response.text
+    assert response.media_type == "text/event-stream"
+    assert '"content": "partial "' in body
+    assert '"content": "reply"' in body
+    assert '"finish_reason": "stop"' in body
+    assert "data: [DONE]" in body
 
 
 def _status_in_progress_body(call_id: str, vapi_call_id: str) -> dict:
@@ -151,11 +159,11 @@ def _speech_update_body(call_id: str, vapi_call_id: str, role: str, status: str)
 
 
 @pytest.mark.asyncio
-async def test_status_update_in_progress_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_status_update_in_progress_is_idempotent(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
 
     with state.session_scope(eng) as session:
         session.add(
@@ -183,19 +191,19 @@ async def test_status_update_in_progress_is_idempotent(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_end_of_call_report_schedules_synthesis_once(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_end_of_call_report_schedules_synthesis_once(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
-    monkeypatch.setattr(server, "ENABLE_SYNTHESIS_REPORT", True)
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
+    mocker.patch.object(server, "ENABLE_SYNTHESIS_REPORT", True)
 
     synthesis_calls: list[str] = []
 
     async def _track_synthesis(cid: str) -> None:
         synthesis_calls.append(cid)
 
-    monkeypatch.setattr(server, "_synthesis_task", _track_synthesis)
+    mocker.patch.object(server, "_synthesis_task", _track_synthesis)
 
     with state.session_scope(eng) as session:
         session.add(
@@ -225,12 +233,12 @@ async def test_end_of_call_report_schedules_synthesis_once(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_delete_call_twice_second_is_already_ended(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_delete_call_twice_second_is_already_ended(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "api_auth_token", "tok")
-    monkeypatch.setattr(server.settings, "vapi_api_key", "")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "api_auth_token", "tok")
+    mocker.patch.object(server.settings, "vapi_api_key", "")
 
     with state.session_scope(eng) as session:
         session.add(
@@ -254,13 +262,13 @@ async def test_delete_call_twice_second_is_already_ended(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
-async def test_extended_silence_marks_call_ended(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_extended_silence_marks_call_ended(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
-    monkeypatch.setattr(server.settings, "vapi_extended_silence_seconds", 0.05)
-    monkeypatch.setattr(server.settings, "vapi_api_key", "")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
+    mocker.patch.object(server.settings, "vapi_extended_silence_seconds", 0.05)
+    mocker.patch.object(server.settings, "vapi_api_key", "")
 
     with state.session_scope(eng) as session:
         session.add(
@@ -288,13 +296,13 @@ async def test_extended_silence_marks_call_ended(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_extended_silence_cancelled_when_user_speaks(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_extended_silence_cancelled_when_user_speaks(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "vapi_webhook_secret", "")
-    monkeypatch.setattr(server.settings, "vapi_extended_silence_seconds", 0.2)
-    monkeypatch.setattr(server.settings, "vapi_api_key", "")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
+    mocker.patch.object(server.settings, "vapi_extended_silence_seconds", 0.2)
+    mocker.patch.object(server.settings, "vapi_api_key", "")
 
     with state.session_scope(eng) as session:
         session.add(
@@ -325,13 +333,13 @@ async def test_extended_silence_cancelled_when_user_speaks(monkeypatch: pytest.M
 
 @pytest.mark.asyncio
 async def test_calls_start_and_delete_require_bearer_when_api_auth_configured(
-    monkeypatch: pytest.MonkeyPatch,
+    mocker: pytest_mock.MockerFixture,
 ) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "api_auth_token", "test-bearer-secret")
-    monkeypatch.setattr(server.settings, "vapi_api_key", "")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "api_auth_token", "test-bearer-secret")
+    mocker.patch.object(server.settings, "vapi_api_key", "")
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -375,19 +383,19 @@ async def test_calls_start_and_delete_require_bearer_when_api_auth_configured(
 
 
 @pytest.mark.asyncio
-async def test_calls_start_async_dial_returns_202(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_calls_start_async_dial_returns_202(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "api_auth_token", "")
-    monkeypatch.setattr(server.settings, "vapi_api_key", "fake-key")
-    monkeypatch.setattr(server.settings, "vapi_phone_number_id", "phone-id")
-    monkeypatch.setattr(server.settings, "webhook_url", "https://example.com")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "api_auth_token", "")
+    mocker.patch.object(server.settings, "vapi_api_key", "fake-key")
+    mocker.patch.object(server.settings, "vapi_phone_number_id", "phone-id")
+    mocker.patch.object(server.settings, "webhook_url", "https://example.com")
 
     async def _noop_dial(_cid: str, _phone: str) -> None:
         return
 
-    monkeypatch.setattr(server, "_dial_vapi", _noop_dial)
+    mocker.patch.object(server, "_dial_vapi", _noop_dial)
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -405,15 +413,15 @@ async def test_calls_start_async_dial_returns_202(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.asyncio
 async def test_calls_start_sync_abort_when_dial_config_incomplete(
-    monkeypatch: pytest.MonkeyPatch,
+    mocker: pytest_mock.MockerFixture,
 ) -> None:
     eng = state.make_engine("sqlite:///:memory:")
     state.init_db(eng)
-    monkeypatch.setattr(server, "engine", eng)
-    monkeypatch.setattr(server.settings, "api_auth_token", "")
-    monkeypatch.setattr(server.settings, "vapi_api_key", "fake-key")
-    monkeypatch.setattr(server.settings, "vapi_phone_number_id", "")
-    monkeypatch.setattr(server.settings, "webhook_url", "https://example.com")
+    mocker.patch.object(server, "engine", eng)
+    mocker.patch.object(server.settings, "api_auth_token", "")
+    mocker.patch.object(server.settings, "vapi_api_key", "fake-key")
+    mocker.patch.object(server.settings, "vapi_phone_number_id", "")
+    mocker.patch.object(server.settings, "webhook_url", "https://example.com")
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

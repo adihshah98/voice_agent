@@ -1,10 +1,13 @@
-# Tier 1 interviewer dataset — 18 single-turn decisions.
+version: "2026-05-05.1"
+description: "Added 7 Tier 1 cases: silence/filler clarify, investor probe triggers (ROI, competitor, expansion, low-rating), skip_scripted"
+
+# Tier 1 interviewer dataset — 25 single-turn decisions.
 #
 # Each case seeds a minimal DB (scripted_questions, prior_turns, probes) and
 # hands the agent a `last_respondent` utterance. `expected_output.action` is
 # what a well-behaved interviewer should choose.
 #
-# Coverage: probe x5, scripted x5, clarify x3, wrap_up x3, off_topic x2.
+# Coverage: probe x9, scripted x6, clarify x5, wrap_up x3, off_topic x2.
 # `acknowledge` is intentionally not tested here — it's context-dependent and
 # rarely the unique right answer, so it belongs in Tier 3 trajectory evals.
 
@@ -253,3 +256,101 @@ cases:
       last_respondent: "And don't get me started on what the current administration is doing to small businesses — it's absolutely outrageous, let me tell you about my cousin's bakery..."
     expected_output:
       action: off_topic
+
+  # --- clarify (silence / filler — no substantive content) -----------------
+
+  - name: true_silence_clarify
+    inputs:
+      scripted_questions:
+        - How do you currently use the product?
+        - What would you change about it?
+      prior_turns:
+        - {speaker: interviewer, text: "How do you currently use the product?", action: scripted}
+      probes: []
+      last_respondent: "[silence]"
+    expected_output:
+      action: clarify
+
+  - name: thinking_filler_clarify
+    inputs:
+      scripted_questions:
+        - What do you value most about it?
+        - Has anything frustrated you?
+      prior_turns:
+        - {speaker: interviewer, text: "What do you value most about it?", action: scripted}
+      probes: []
+      last_respondent: "Um... uh... hmm."
+    expected_output:
+      action: clarify
+
+  # --- probe (investor-relevant triggers) -----------------------------------
+
+  - name: roi_quantification_probe
+    inputs:
+      scripted_questions:
+        - What would you change about it?
+        - Would you recommend it?
+      prior_turns:
+        - {speaker: interviewer, text: "What keeps you coming back?", action: scripted}
+        - {speaker: respondent, text: "It saves us a ton of time and money, honestly."}
+      probes:
+        - {question: "You mentioned saving time and money — can you put a rough number on that?", priority: 1, rationale: "ROI quantification is a key investor signal; the claim is unsubstantiated."}
+      last_respondent: "Yeah, we've saved a lot. Hard to put a number on it."
+    expected_output:
+      action: probe
+
+  - name: competitor_mention_probe
+    inputs:
+      scripted_questions:
+        - What would make you switch?
+        - Any final thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "Have you tried alternatives?", action: scripted}
+        - {speaker: respondent, text: "We evaluated Salesforce but it was way overkill for our team size."}
+      probes:
+        - {question: "When you evaluated Salesforce, what specific capabilities did you compare?", priority: 1, rationale: "Named competitor evaluation is a strong buying-behavior signal worth unpacking."}
+      last_respondent: "We did a 30-day trial but the implementation cost was too high."
+    expected_output:
+      action: probe
+
+  - name: expansion_signal_probe
+    inputs:
+      scripted_questions:
+        - What would make you use it more?
+        - Who else might benefit?
+      prior_turns:
+        - {speaker: interviewer, text: "How is adoption across your team?", action: scripted}
+        - {speaker: respondent, text: "Just our small ops team right now, but I've been thinking about rolling it out to the whole company."}
+      probes:
+        - {question: "What would need to be true for you to roll it out company-wide?", priority: 1, rationale: "Expansion intent is a key signal; unpack the blocker or trigger."}
+      last_respondent: "If the enterprise tier had better SSO support, I'd push for it tomorrow."
+    expected_output:
+      action: probe
+
+  - name: low_rating_probe
+    inputs:
+      scripted_questions:
+        - Any other thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "On a scale of 1 to 10, how likely are you to recommend this to a colleague?", action: scripted}
+        - {speaker: respondent, text: "Probably a 4."}
+      probes:
+        - {question: "What would need to change for that to be a 7 or 8?", priority: 1, rationale: "Low NPS is a high-priority signal; the gap question surfaces concrete blockers."}
+      last_respondent: "Yeah, 4 out of 10. Maybe a 5 on a good day."
+    expected_output:
+      action: probe
+
+  # --- skip_scripted (scripted topic already covered organically) ----------
+
+  - name: skip_scripted_already_covered
+    inputs:
+      scripted_questions:
+        - Would you recommend it to a colleague?
+        - Any final thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "What keeps you coming back?", action: scripted}
+        - {speaker: respondent, text: "Honestly the fact that I've already recommended it to six people on my team and they all use it daily."}
+      probes: []
+      last_respondent: "Yeah, I'm basically the unofficial product evangelist for it in our company."
+    expected_output:
+      action: skip_scripted

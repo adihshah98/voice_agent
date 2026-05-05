@@ -1,0 +1,117 @@
+version: "2026-05-05.1"
+description: "3 canned replay transcripts replacing live simulation for power_user, skeptical_buyer, churn_risk personas. Respondent lines are fixed; only the interviewer runs live. Tests multi-turn state: covered_subtopics accumulation, probe staleness, scripted cursor advancement."
+
+transcripts:
+  - name: power_user_arc
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you about it recently?"
+      - "Would you recommend it to someone else?"
+      - "What would make you use it more often?"
+    turns:
+      # Turn 1: enthusiastic answer to "How do you currently use this product?"
+      - speaker: respondent
+        text: "We use it for every external call, about 30 a week. I check the AI summaries before every important customer meeting — honestly I couldn't imagine going back. I discovered it through a friend at a former employer who said their whole sales team adopted it within weeks."
+        expected_actions: [scripted, probe]
+
+      # Turn 2: answer to value question — strong endorsement, mention of expansion
+      - speaker: respondent
+        text: "What I value most is the time savings. I was spending maybe 45 minutes after each call writing notes. Now it's zero. I gave an internal demo six months ago and convinced leadership to buy 40 seats, and two other teams have actually asked to get access since then."
+        expected_actions: [scripted, probe]
+
+      # Turn 3: frustration question — minor gap (Slack integration)
+      - speaker: respondent
+        text: "Nothing major, honestly. The one thing that would make it a 10 out of 10 is a Slack integration so summaries auto-post to the deal channel. Right now I copy-paste them in manually, which is a small annoyance."
+        expected_actions: [scripted, probe]
+
+      # Turn 4: recommendation — confident yes, competitor comparison
+      - speaker: respondent
+        text: "Absolutely, I'd recommend it. We briefly looked at Gong before buying, but it felt like overkill and was more expensive. This does exactly what we need. Our VP of Engineering approved the annual contract without much pushback."
+        expected_actions: [scripted, probe]
+
+      # Turn 5: use it more — already at max, pivot to feature ask
+      - speaker: respondent
+        text: "I already use it for everything, so I guess my answer is I wouldn't change my usage. But I'd love to see that Slack integration — that plus maybe a mobile app so I can pull up summaries on the go before walking into an office building."
+        expected_actions: [scripted, probe, wrap_up]
+
+      # Turn 6: natural wind-down
+      - speaker: respondent
+        text: "Yeah, that pretty much covers it. Nine out of ten, strong recommend. Really appreciate you asking — hope the feedback is useful."
+        expected_actions: [wrap_up, scripted, probe]
+
+  - name: skeptical_buyer_arc
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you about it recently?"
+      - "Would you recommend it to someone else?"
+      - "What would make you use it more often?"
+    turns:
+      # Turn 1: formal, measured — personal non-user, team adoption low
+      - speaker: respondent
+        text: "I should be transparent — I approved the contract but I don't personally use the tool. My team of 30 engineers was supposed to adopt it for incident retrospectives. Usage has been slower than expected; maybe 10 of the 30 are using it regularly."
+        expected_actions: [probe, scripted]
+
+      # Turn 2: value — sees the demo value but skeptical
+      - speaker: respondent
+        text: "When I've seen demos it looks fine. The transcript depth seems better than what we saw from Notion AI, which is why we chose it. But I can't point to concrete ROI yet because adoption is so low."
+        expected_actions: [probe, scripted]
+
+      # Turn 3: frustration — no adoption analytics
+      - speaker: respondent
+        text: "The main thing I'd flag is the lack of adoption analytics. I can't see who is and isn't using it, which makes it hard to understand why uptake is low and harder to make the case internally."
+        expected_actions: [probe, scripted]
+
+      # Turn 4: recommendation — on the fence
+      - speaker: respondent
+        text: "Right now I'm on the fence about recommending it. We're coming up for renewal in three months and I'd need to see better utilization numbers to justify the spend. I'd say 6 out of 10 at this point."
+        expected_actions: [probe, scripted]
+
+      # Turn 5: what would make you use it more — usage analytics + change management
+      - speaker: respondent
+        text: "For me personally, probably nothing — I'm a buyer, not a user. For the team, I think better onboarding guidance and usage dashboards would help. Something that shows managers which team members haven't logged in recently."
+        expected_actions: [scripted, probe, wrap_up]
+
+      # Turn 6: wrap-up signal
+      - speaker: respondent
+        text: "I think that covers what I can share. The product seems capable; the problem is organizational. Happy to give you more detail if it's useful."
+        expected_actions: [wrap_up, scripted, probe]
+
+  - name: churn_risk_arc
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you about it recently?"
+      - "Would you recommend it to someone else?"
+      - "What would make you use it more often?"
+    turns:
+      # Turn 1: candid, low adoption context
+      - speaker: respondent
+        text: "Honestly, it's mostly just me using it now. We bought 20 seats eight months ago but only about three people are actively using it. The rollout stalled when IT raised a data security concern — took three months to resolve, and by the time it was cleared people had moved on."
+        expected_actions: [probe, scripted]
+
+      # Turn 2: value — product is fine, but context is bad
+      - speaker: respondent
+        text: "The product itself is fine when I use it for client call prep. It saves me maybe an hour a week. But given the implementation experience we had, it's hard to separate my view of the product from my view of how the rollout went."
+        expected_actions: [probe, scripted]
+
+      # Turn 3: frustration — implementation pain, evaluating competitor
+      - speaker: respondent
+        text: "We didn't have a dedicated onboarding manager — just documentation. That was frustrating. And right now I'm actually evaluating Fireflies as a cheaper alternative because I'm not sure we can justify the cost with this utilization rate."
+        expected_actions: [probe, scripted]
+
+      # Turn 4: recommendation — no, 4/10
+      - speaker: respondent
+        text: "I wouldn't recommend it in our current situation. Four out of ten. The product works, but the implementation experience was painful and we don't have exec buy-in anymore. If you have a dedicated onboarding manager it might be different."
+        expected_actions: [probe, scripted]
+
+      # Turn 5: what would make you use it more — change management support
+      - speaker: respondent
+        text: "A proper change management program — not just documentation. Someone who checks in during the first 90 days, helps with internal champions, maybe an IT fast-track for security reviews. That would have made a big difference for us."
+        expected_actions: [scripted, probe, wrap_up]
+
+      # Turn 6: close
+      - speaker: respondent
+        text: "Yeah I think that's the main story. The product is fine but the experience around it let us down. I hope that feedback is useful."
+        expected_actions: [wrap_up, scripted, probe]

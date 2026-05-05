@@ -766,7 +766,7 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
                 with state.session_scope(engine) as session:
                     skip_pipeline = _call_terminal_for_llm(session, call_id)
                 if skip_pipeline:
-                    logfire.info(
+                    logfire.warning(
                         "vapi_llm_skipped_terminal_call",
                         call_id=call_id,
                         vapi_call_id=vapi_call_id,

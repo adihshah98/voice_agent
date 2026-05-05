@@ -1,8 +1,13 @@
-# Tier 2 analyst dataset — 6 transcripts covering:
+version: "2026-05-05.1"
+description: "Added 2 Tier 2 cases: red_flag_low_adoption (IT blocker), pmf_expansion_signal (word-of-mouth + expansion)"
+
+# Tier 2 analyst dataset — 8 transcripts covering:
 #   - clear contradictions (should generate priority-1 probes)
 #   - specificity signals (named things / events probes must reference)
 #   - clean transcripts (no contradictions → priority 1 should NOT appear)
 #   - surprises (unexpected admissions → priority-1 or priority-2)
+#   - red flags (low adoption + external blocker → priority-1)
+#   - PMF signals (word-of-mouth + expansion intent → priority-1 or priority-2)
 #
 # Each case is a 6–10 turn transcript. No expected_output: quality is judged
 # by LLM scorers (ProbesAreSpecific, ProbesAreNonLeading, PriorityIsCalibrated)
@@ -89,3 +94,33 @@ cases:
         - {speaker: respondent, text: "Maybe the onboarding for new users — my newer colleagues found it a bit confusing at first. Otherwise I genuinely can't think of anything major."}
         - {speaker: interviewer, text: "Any other thoughts?"}
         - {speaker: respondent, text: "Just that it's one of those products where I'd notice immediately if it went away. It's become invisible infrastructure for me."}
+
+  # --- red flag / external blocker -----------------------------------------
+
+  - name: red_flag_low_adoption
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How widely is the product being used across your organization?"}
+        - {speaker: respondent, text: "Honestly, just me and one other person on my team. We were hoping to roll it out to the whole department but it's been sitting at two users for eight months."}
+        - {speaker: interviewer, text: "What's been the blocker?"}
+        - {speaker: respondent, text: "IT security won't approve the data residency requirements. We need everything to stay in the EU and their current setup doesn't support that. We've been waiting on a compliance certification for months."}
+        - {speaker: interviewer, text: "How important is that expansion to the value you get?"}
+        - {speaker: respondent, text: "Critical, honestly. At two users the ROI just isn't there. We'd need at least 20 to justify the seat cost."}
+        - {speaker: interviewer, text: "Have you given them a deadline?"}
+        - {speaker: respondent, text: "We told them Q3 or we're cutting the contract. I've already started evaluating alternatives."}
+
+  # --- PMF signal / word-of-mouth + expansion ------------------------------
+
+  - name: pmf_expansion_signal
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How did you first hear about the product?"}
+        - {speaker: respondent, text: "A friend in a peer CFO group mentioned it. Didn't even know it existed — she just casually brought it up as something she couldn't live without."}
+        - {speaker: interviewer, text: "What made you try it after that?"}
+        - {speaker: respondent, text: "She's not the type to recommend things lightly. If she's that enthusiastic, I pay attention. We had it deployed within a week."}
+        - {speaker: interviewer, text: "How has adoption looked since then?"}
+        - {speaker: respondent, text: "We started with three finance users. Now we're at 40 seats across finance, ops, and half of sales — and that happened entirely bottom-up. Nobody mandated it."}
+        - {speaker: interviewer, text: "What's driving the spread?"}
+        - {speaker: respondent, text: "People see their colleagues using it and just ask to get access. I've had three different team leads come to me in the last month asking when their team can get on it."}
+        - {speaker: interviewer, text: "Any plans to expand further?"}
+        - {speaker: respondent, text: "We're in talks about an enterprise agreement for the whole company — about 200 seats. The main question is whether they can support our SSO setup."}

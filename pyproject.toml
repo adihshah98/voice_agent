@@ -21,11 +21,16 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
+    "pytest-mock>=3.14",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", "evals"]
+markers = [
+    "slow: full simulation evals (~45s, 2 personas, nightly CI or pre-deploy)",
+    "replay: deterministic replay evals (~20s, CI-safe fast path)",
+]
 
 [build-system]
 requires = ["hatchling"]

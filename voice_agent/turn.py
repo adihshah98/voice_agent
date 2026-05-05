@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import logfire
+from dataclasses import dataclass
 from pydantic_ai.usage import RunUsage
+from pydantic_evals.evaluators import Evaluator, EvaluatorContext
+from pydantic_evals.online import evaluate
 from sqlmodel import select
 from voice_agent import state
 from voice_agent.agents.interviewer import (
@@ -58,6 +61,28 @@ class StreamTurnResult:
     llm_usage: RunUsage | None = None
 
 
+_VALID_ACTIONS = {"probe", "scripted", "clarify", "off_topic", "wrap_up", "skip_scripted"}
+
+
+@dataclass
+class ActionIsValid(Evaluator):
+    def evaluate(self, ctx: EvaluatorContext) -> bool:
+        return ctx.output.get("action") in _VALID_ACTIONS
+
+
+@dataclass
+class SingleQuestionOnline(Evaluator):
+    def evaluate(self, ctx: EvaluatorContext) -> bool:
+        return ctx.output.get("message", "").count("?") <= 1
+
+
+@dataclass
+class FillerRate(Evaluator):
+    def evaluate(self, ctx: EvaluatorContext) -> float:
+        return 1.0 if ctx.output.get("filler_injected") else 0.0
+
+
+@evaluate(ActionIsValid(), SingleQuestionOnline(), FillerRate())
 async def run_speech_turn(
     engine,
     call_id: str,
