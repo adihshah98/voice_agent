@@ -447,6 +447,9 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                     perf_keys=list(perf.keys()),
                 )
 
+            with state.session_scope(engine) as session:
+                token_totals = state.call_llm_token_totals(session, call_id)
+
             logfire.info(
                 "call_ended",
                 call_id=call_id,
@@ -455,6 +458,7 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 probes_asked=probes_asked,
                 probes_total=probes_total,
                 probe_utilization_pct=round(100 * probes_asked / probes_total) if probes_total else None,
+                **token_totals,
                 **vapi_latency,
             )
             if ENABLE_SYNTHESIS_REPORT:
@@ -468,38 +472,23 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
             status = msg.get("status")
             vapi_turn = msg.get("turn")
             now = time.time()
-            turnaround_ms: int | None = None
             tts_duration_ms: int | None = None
 
             if call_id:
                 entry = _speech_ts.setdefault(call_id, {})
                 if role == "user" and status == "stopped":
-                    entry["user_stopped_at"] = now
-                    entry["user_stopped_turn"] = vapi_turn
                     _cancel_silence_watch(call_id)
                 elif role == "user" and status == "started":
                     _cancel_silence_watch(call_id)
                 elif role == "assistant" and status == "started":
-                    # Pop so the next turn can't accidentally reuse a stale value when
-                    # speech-update(user, stopped) races or arrives after the LLM call.
-                    user_stopped = entry.pop("user_stopped_at", None)
-                    if user_stopped is not None:
-                        turnaround_ms = int((now - user_stopped) * 1000)
-                        vapi_pipeline_ms = entry.pop("vapi_pipeline_ms", None)
-                        llm_ttft_ms = entry.pop("llm_ttft_ms", None)
-                        filler_injected = entry.pop("filler_injected", False)
-                        if vapi_pipeline_ms is not None and llm_ttft_ms is not None:
-                            tts_ttft_ms = turnaround_ms - vapi_pipeline_ms - llm_ttft_ms
-                            logfire.info(
-                                "turn_latency",
-                                call_id=call_id,
-                                e2e_ms=turnaround_ms,
-                                vapi_pipeline_ms=vapi_pipeline_ms,
-                                llm_ttft_ms=llm_ttft_ms,
-                                tts_ttft_ms=tts_ttft_ms,
-                                filler_injected=filler_injected,
-                            )
-                            entry["e2e_ms"] = turnaround_ms
+                    llm_ttft_ms = entry.pop("llm_ttft_ms", None)
+                    filler_injected = entry.pop("filler_injected", False)
+                    logfire.info(
+                        "turn_latency",
+                        call_id=call_id,
+                        llm_ttft_ms=llm_ttft_ms,
+                        filler_injected=filler_injected,
+                    )
                     entry["assistant_started_at"] = now
                     _cancel_silence_watch(call_id)
                 elif role == "assistant" and status == "stopped":
@@ -517,7 +506,6 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 role=role,
                 turn=vapi_turn,
                 tts_started=(role == "assistant" and status == "started"),
-                turnaround_ms=turnaround_ms,
                 tts_duration_ms=tts_duration_ms,
             )
             return {}
@@ -785,26 +773,11 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
                     )
 
             if not skip_pipeline:
-                # Time from speech-update(user/stopped) to this LLM call. Includes Vapi's
-                # full endpointing silence window + STT finalization + any speculative-call
-                # retry overhead. NOT just STT time — label accordingly.
-                vapi_pipeline_ms: int | None = None
-                entry = _speech_ts.get(call_id, {})
-                if "user_stopped_at" in entry:
-                    vapi_pipeline_ms = int((time.time() - entry["user_stopped_at"]) * 1000)
-
-                # Stash immediately — before any streaming — so the
-                # speech-update(assistant/started) handler finds it even if it fires
-                # before the streaming loop finishes.
-                if vapi_pipeline_ms is not None:
-                    _speech_ts.setdefault(call_id, {})["vapi_pipeline_ms"] = vapi_pipeline_ms
-
                 with logfire.span(
                         "vapi_llm_request",
                         call_id=call_id,
                         vapi_call_id=vapi_call_id,
                         message_count=len(messages),
-                        vapi_pipeline_ms=vapi_pipeline_ms,
                     ) as req_span:
                     reply_chars = 0
                     pipeline = TurnPipeline(engine, call_id, vapi_messages=messages)
@@ -812,12 +785,10 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
                         ttft_stashed = False
                         async for token in pipeline.stream_tokens():
                             reply_chars += len(token)
-                            # Stash llm_ttft_ms + filler_injected on the first token.
-                            # pipeline.ttft_ms is set by stream_tokens() before yielding,
-                            # so it's available here. Stashing here ensures the values are
-                            # in _speech_ts before Vapi fires speech-update(assistant/started),
-                            # which can't arrive until after Vapi receives this first token.
-                            if not ttft_stashed and vapi_pipeline_ms is not None and pipeline.ttft_ms is not None:
+                            # Stash llm_ttft_ms + filler_injected on the first token so the
+                            # speech-update(assistant/started) handler finds them even if it
+                            # fires before the streaming loop finishes.
+                            if not ttft_stashed and pipeline.ttft_ms is not None:
                                 live_entry = _speech_ts.setdefault(call_id, {})
                                 live_entry["llm_ttft_ms"] = pipeline.ttft_ms
                                 live_entry["filler_injected"] = pipeline.filler_injected

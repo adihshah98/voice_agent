@@ -7,25 +7,15 @@
 
 ## My questions/Future improvements
 
-- Clean up Tech Debt
-  - See Cursor Plan
 - Eval Infra
-  - Evals
-    - E2E Evals
-      - **The single most underrated item on your list:** stopping the REPL path from diverging further. It's already happening and it quietly invalidates your eval results — which are the foundation of everything else.
-      - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
-      - Eventually do something about the non-Vapi path (used only for evals) functions like run_speech_run in turn.py, db_messages_fallback, prepare_interviewer_turn
-      - REPL Path is already diverging from prod
-      - In the hot path (`turn.py`), the session is closed *before* `interviewer.run()` is awaited (hence `Session | None` — the docstring explains this). So `deps.session` is `None` during the actual LLM call in production; it's only non-None in the REPL and evals. run_interviewer & run_interviewer_with_timeout are only called by evals
-    - Online Evals
-  - Versioned prompts/datasets/eval runs
-  - Alerts
-    - Alerts created, but no channel added yet
-  - Live Observability
-    - No per-call cost tracking (input/output tokens × rate).
-    - No alerting on `vapi_unknown_call` or `vapi_dial_error` — they just log.
-  - Logging
-    - Should we be logging more stuff so if it fails, you can see it. Also log instead of trace?
+  - Online evals
+  - E2E Evals
+    - **The single most underrated item on your list:** stopping the REPL path from diverging further. It's already happening and it quietly invalidates your eval results — which are the foundation of everything else.
+    - The Evals for Trajectory call - **do E2E evals—but in a *very constrained, layered, and replay-heavy way*.** Not brute-force 1-hour runs.
+    - Eventually do something about the non-Vapi path (used only for evals) functions like run_speech_run in turn.py, db_messages_fallback, prepare_interviewer_turn
+    - REPL Path is already diverging from prod
+    - In the hot path (`turn.py`), the session is closed *before* `interviewer.run()` is awaited (hence `Session | None` — the docstring explains this). So `deps.session` is `None` during the actual LLM call in production; it's only non-None in the REPL and evals. run_interviewer & run_interviewer_with_timeout are only called by evals
+  - Versioned datasets/eval runs
 - Conversation Trajectory
   - Make sure it asks everything
   - Make sure it probes at the correct depth
@@ -46,13 +36,13 @@
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default
   - Multi-tenant auth
+
+---
+
+---
+
 - Fun Stuff
   - Clone my voice on 11labs & use it
-
----
-
----
-
 - Prod Infra
   - Multi-server deployment - cleaning up data that is in-memory worker dependant
   - CI/CD
@@ -64,6 +54,8 @@
   - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
   - The analyst is triggered by polling `should_run_analyst()` on every `conversation-update`. Fine for one call, but with N concurrent calls you get lock contention and polling overhead. Production systems use a task queue (Celery + Redis, SQS, etc.) — the webhook handler enqueues a job instead of calling `asyncio.create_task` inline.
   - The analyst competes with the real-time interviewer for the event loop. A slow Sonnet call during a burst can delay turn responses. In production you'd want the analyst as a separate worker service — the invariant holds, you just move the writes to a different process.
+- Prod Monitoring
+  - Prompt Playground/Versioned Prompts
 - Memory
   - Memory/Improving agents with usage
 - Advanced Voice UX

@@ -224,6 +224,8 @@ class TurnPipeline:
                     if probe is not None:
                         lag = turn_number - (probe.generated_after_turn or 0)
                         logfire.info("probe_used", call_id=call_id, turn_number=turn_number, probe_id=reply.probe_id_used, probe_priority=probe.priority, analyst_lag_turns=lag)
+                    else:
+                        logfire.warning("probe_row_missing", call_id=call_id, turn_number=turn_number, probe_id=reply.probe_id_used)
                     state.mark_probe_asked(session, reply.probe_id_used)
 
                 if vapi_messages is not None:
@@ -242,7 +244,9 @@ class TurnPipeline:
                             .order_by(state.Turn.turn_number.desc())
                             .limit(1)
                         ).first()
-                        if prev_turn and len(prev_spoken) < len(prev_turn.text):
+                        if prev_turn is None:
+                            logfire.warning("barge_in_prev_turn_missing", call_id=call_id, turn_number=turn_number)
+                        elif len(prev_spoken) < len(prev_turn.text):
                             prev_turn.text = prev_spoken
                             prev_turn.barge_in_truncated = True
                             session.add(prev_turn)

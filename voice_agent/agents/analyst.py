@@ -243,6 +243,7 @@ async def run_analyst_safely(deps: AnalystDeps) -> None:
         await run_analyst(deps)
     except Exception:
         logfire.exception("analyst_error", call_id=deps.call_id)
+        logfire.warning("analyst_skipped_no_probes_generated", call_id=deps.call_id)
 
 
 def load_latest_analysis(engine, call_id: str) -> AnalysisUpdate | None:

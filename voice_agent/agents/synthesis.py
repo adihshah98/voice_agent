@@ -123,6 +123,7 @@ async def run_synthesis(deps: SynthesisDeps) -> ReportOutput:
     prompt = _build_prompt(deps.session, deps.call_id)
     result = await synthesis_agent.run(prompt, deps=deps)
     report: ReportOutput = result.output
+    usage = result.usage()
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
     existing = deps.session.exec(
@@ -142,6 +143,10 @@ async def run_synthesis(deps: SynthesisDeps) -> ReportOutput:
         ai_adoption_signals=report.ai_adoption_signals,
         red_flags=report.red_flags,
         investment_thesis_bullets=report.investment_thesis_bullets,
+        tokens_input=usage.input_tokens,
+        tokens_output=usage.output_tokens,
+        tokens_cache_read=usage.cache_read_tokens,
+        tokens_cache_write=usage.cache_write_tokens,
     )
     if existing:
         for k, v in row_data.items():
@@ -157,6 +162,10 @@ async def run_synthesis(deps: SynthesisDeps) -> ReportOutput:
         call_id=deps.call_id,
         themes_count=len(report.themes),
         latency_ms=latency_ms,
+        tokens_input=usage.input_tokens,
+        tokens_output=usage.output_tokens,
+        tokens_cache_read=usage.cache_read_tokens,
+        tokens_cache_write=usage.cache_write_tokens,
     )
     return report
 
@@ -166,4 +175,5 @@ async def run_synthesis_safely(deps: SynthesisDeps) -> ReportOutput | None:
         return await run_synthesis(deps)
     except Exception:
         logfire.exception("synthesis_error", call_id=deps.call_id)
+        logfire.warning("synthesis_report_absent", call_id=deps.call_id)
         return None

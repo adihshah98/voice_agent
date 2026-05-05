@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
+import logfire
 from sqlalchemy import Column, UniqueConstraint, inspect, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
@@ -161,6 +162,10 @@ class SynthesisReport(SQLModel, table=True):
     ai_adoption_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     red_flags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     investment_thesis_bullets: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    tokens_input: Optional[int] = None
+    tokens_output: Optional[int] = None
+    tokens_cache_read: Optional[int] = None
+    tokens_cache_write: Optional[int] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
     call: Call = Relationship(
@@ -200,6 +205,15 @@ def init_db(engine) -> None:
         if "dial_error" not in cols:
             conn.execute(text("ALTER TABLE calls ADD COLUMN dial_error VARCHAR"))
 
+    try:
+        sr_cols = {c["name"] for c in inspect(engine).get_columns("synthesis_reports")}
+    except Exception:
+        return
+    with engine.begin() as conn:
+        for col in ("tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write"):
+            if col not in sr_cols:
+                conn.execute(text(f"ALTER TABLE synthesis_reports ADD COLUMN {col} INTEGER"))
+
 
 @contextmanager
 def session_scope(engine) -> Iterator[Session]:
@@ -209,6 +223,7 @@ def session_scope(engine) -> Iterator[Session]:
         session.commit()
     except Exception:
         session.rollback()
+        logfire.exception("db_session_rollback")
         raise
     finally:
         session.close()
@@ -224,7 +239,10 @@ def next_turn_number(session: Session, call_id: str) -> int:
 
 def next_scripted(session: Session, call_id: str) -> Optional[str]:
     call = session.get(Call, call_id)
-    if call is None or call.scripted_cursor >= len(call.scripted_questions):
+    if call is None:
+        logfire.warning("next_scripted_call_missing", call_id=call_id)
+        return None
+    if call.scripted_cursor >= len(call.scripted_questions):
         return None
     return call.scripted_questions[call.scripted_cursor]
 
@@ -232,6 +250,7 @@ def next_scripted(session: Session, call_id: str) -> Optional[str]:
 def scripted_remaining(session: Session, call_id: str) -> int:
     call = session.get(Call, call_id)
     if call is None:
+        logfire.warning("scripted_remaining_call_missing", call_id=call_id)
         return 0
     return max(0, len(call.scripted_questions) - call.scripted_cursor)
 
@@ -239,6 +258,7 @@ def scripted_remaining(session: Session, call_id: str) -> int:
 def mark_scripted_asked(session: Session, call_id: str) -> None:
     call = session.get(Call, call_id)
     if call is None:
+        logfire.warning("mark_scripted_asked_call_missing", call_id=call_id)
         return
     call.scripted_cursor += 1
     session.add(call)
@@ -267,6 +287,7 @@ def probe_utilization(session: Session, call_id: str) -> tuple[int, int]:
 def mark_probe_asked(session: Session, probe_id: int) -> None:
     probe = session.get(Probe, probe_id)
     if probe is None:
+        logfire.warning("mark_probe_asked_probe_missing", probe_id=probe_id)
         return
     probe.asked = True
     probe.asked_at = _utcnow()
@@ -284,14 +305,16 @@ def latest_snapshot(session: Session, call_id: str) -> Optional["AnalystSnapshot
 
 
 def call_llm_token_totals(session: Session, call_id: str) -> dict[str, int]:
-    """Sum LLM token fields for this call: interviewer (Turn) + analyst (AnalystSnapshot)."""
+    """Sum LLM token fields for this call: interviewer (Turn) + analyst (AnalystSnapshot) + synthesis."""
     out: dict[str, int] = {}
     for key in ("tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write"):
         tcol = getattr(Turn, key)
         acol = getattr(AnalystSnapshot, key)
+        scol = getattr(SynthesisReport, key)
         t = session.exec(select(func.coalesce(func.sum(tcol), 0)).where(Turn.call_id == call_id)).one()
         a = session.exec(select(func.coalesce(func.sum(acol), 0)).where(AnalystSnapshot.call_id == call_id)).one()
-        out[key] = int(t or 0) + int(a or 0)
+        s = session.exec(select(func.coalesce(func.sum(scol), 0)).where(SynthesisReport.call_id == call_id)).one()
+        out[key] = int(t or 0) + int(a or 0) + int(s or 0)
     return out
 
 
@@ -307,6 +330,7 @@ def should_run_analyst(session: Session, call_id: str) -> bool:
     """
     call = session.get(Call, call_id)
     if call is None:
+        logfire.warning("should_run_analyst_call_missing", call_id=call_id)
         return False
     snapshot = latest_snapshot(session, call_id)
     scripted_advanced = call.scripted_cursor > (snapshot.after_scripted_cursor if snapshot else 0)
