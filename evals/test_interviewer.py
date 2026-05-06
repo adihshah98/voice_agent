@@ -33,9 +33,11 @@ from evals.evaluators import (
     no_leading_questions_judge,
     utterance_warmth_judge,
 )
+import logfire
 from voice_agent.models import InterviewerOutput
 from voice_agent.turn import run_speech_turn
-import logfire
+from voice_agent.tracing import init_tracing
+from evals.cases import get_dataset_version
 from pydantic_evals import Dataset
 
 
@@ -121,7 +123,9 @@ async def run_interviewer_on_case(
 
 @pytest.mark.asyncio
 async def test_tier1_interviewer_decisions():
-    logfire.configure(service_name="voice-agent-evals", send_to_logfire="if-token-present")
+    init_tracing(service_name="voice-agent-evals")
+    dataset_version = get_dataset_version(DATASET_PATH)
+    logfire.set_attribute("dataset_version", dataset_version)
 
     dataset: Dataset[InterviewerCaseInputs, InterviewerOutput, None] = Dataset(
         name="interviewer_tier1",

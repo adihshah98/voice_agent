@@ -92,7 +92,7 @@ async def run_analyst_on_case(inputs: AnalystCaseInputs) -> AnalysisUpdate:
 
 @pytest.mark.asyncio
 async def test_tier2_analyst_probe_quality():
-    init_tracing(service_name="voice-agent-evals", send_to_logfire=False)
+    init_tracing(service_name="voice-agent-evals")
 
     dataset: Dataset[AnalystCaseInputs, AnalysisUpdate, None] = Dataset(
         name="analyst_tier2",

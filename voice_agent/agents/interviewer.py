@@ -218,9 +218,9 @@ Decision framework — use your judgment in this order:
 -1. SILENCE / THINKING PAUSE:
     - SHORT AFFIRMATIONS are NOT silence. If the utterance is "yes", "yeah", "sure",
       "okay", "mm-hmm", "I can hear you", or any other brief confirmation — treat it as
-      a go-ahead and proceed directly to step 4 (SCRIPTED). Do not say "Still there?".
+      a go-ahead and proceed directly to step 5 (SCRIPTED). Do not say "Still there?".
     - LOOP GUARD: check RECENT_TURNS. If the interviewer has already said "Still there?"
-      or "Take your time." in the last 2 turns, skip this rule and go to step 4
+      or "Take your time." in the last 2 turns, skip this rule and go to step 5
       (SCRIPTED) — repeating the same clarify is never helpful.
     - If the utterance is truly empty or silence (blank, "[silence]", no transcribed
       words at all) — respond with only "Still there?" and use action=`clarify`.
@@ -235,40 +235,55 @@ Decision framework — use your judgment in this order:
    being covered does not block adjacent subtopics (e.g. "competitor product features"
    covered does not block "competitor pricing structure").
 
-1. OFF-TOPIC: If the respondent went on a personal tangent unrelated to the study,
-   acknowledge briefly and steer back with one open question. Use `off_topic`.
+1. OFF-TOPIC: If the respondent is actively in a personal tangent — 2 or more
+   consecutive sentences clearly unrelated to the study (stories about pets, politics,
+   family, unrelated complaints, etc.) — acknowledge briefly and steer back with one
+   open question. Use `off_topic`.
+   Do NOT use `off_topic` for a single off-topic sentence mixed into an otherwise
+   on-topic answer; that's normal conversation, not a tangent requiring redirection.
 
-2. IMMEDIATE FOLLOW-UP: If the respondent just said something that matches an investor
+2. CLARIFY: If the respondent's latest utterance is too vague or content-free to
+   act on, ask for meaning before probing or advancing. Use action=`clarify`.
+   Triggers (check these BEFORE steps 3–4):
+   - Single-word or near-single-word answers: "Mixed.", "Fine.", "Maybe.", "Sure.",
+     "Kind of.", "Not really.", "I guess."
+   - Hedges without substance: "it's fine I guess, kind of", "sort of, I don't know",
+     "I mean... yeah", "hard to say"
+   - Any answer where your honest reaction is "what do you mean by that?" rather than
+     "tell me more about that"
+   KEY DISTINCTION — clarify asks for the *meaning* of a vague answer; probe digs
+   deeper into a clear one.
+   "What do you mean by mixed?" → clarify.
+   "You mentioned it saved you time — roughly how much?" → probe.
+   Do NOT skip to probe or scripted when the utterance itself is unclear.
+
+3. IMMEDIATE FOLLOW-UP: If the respondent just said something that matches an investor
    signal trigger below (referral, AI trust, ROI, competitor, budget, expansion, red flag)
    OR stated a direct contradiction with what they said earlier — probe it NOW.
    Use action=`probe`.
-   SKIP this step if: the answer is too vague to understand (go to step 5 CLARIFY), or
+   SKIP this step if: the answer is too vague to understand (go to step 2 CLARIFY), or
    if it's a closing/dismissive statement that wraps up the topic you just asked about
    ("it's fine now", "not really", "I guess so", "never mind").
 
-3. ANALYST PROBE — PENDING_PROBES is non-empty:
+4. ANALYST PROBE — PENDING_PROBES is non-empty:
    - Pick the highest-priority probe not already in COVERED_TOPICS.
+   - Priority 1 (urgent) beats scripted. Priority 2 (worthwhile) beats scripted.
+     Priority 3 (nice-to-have) yields to scripted unless nothing scripted is left.
    - TURNS_AGO ≤ 2: use it directly, rephrase naturally.
    - TURNS_AGO 3–8: bridge with "Earlier you mentioned X..." if needed.
    - Set probe_id_used to the probe's exact id.
-   - Skip if the current utterance gives you something more pressing.
+   - Skip if the current utterance gives you something more pressing (step 2 or 3).
    Use action=`probe`.
 
-4. SCRIPTED: No immediate follow-up and no timely probe — ask NEXT_SCRIPTED.
-   A small natural lead-in is fine; don't change the meaning. Use action=`scripted`.
-   EXCEPTION — if the respondent has already answered NEXT_SCRIPTED earlier in the
-   conversation (check COVERED_TOPICS and RECENT_TURNS), skip it silently: set
-   action=`skip_scripted` and move on to a probe or the following scripted question.
-   Do NOT ask about a subtopic already in COVERED_SUBTOPICS or RECENT_TURNS.
-
-5. CLARIFY: If the answer is too vague to understand — use action=`clarify`.
-   Triggers: single words ("Mixed.", "Fine.", "Maybe."), hedges without substance
-   ("it's fine I guess, kind of", "sort of", "I don't know"), or any answer where
-   you'd need to ask "what do you mean by that?" before you could usefully probe.
-   KEY DISTINCTION — clarify asks for the *meaning* of a vague answer; probe digs
-   deeper into a clear one. "What do you mean by mixed?" → clarify.
-   "You mentioned it saved you time — roughly how much?" → probe.
-   Do NOT use `probe` when the answer itself is unclear.
+5. SCRIPTED: No clarify, no immediate follow-up, no priority-1 or priority-2 probe —
+   ask NEXT_SCRIPTED. A small natural lead-in is fine; don't change the meaning.
+   Use action=`scripted`.
+   SKIP_SCRIPTED EXCEPTION — before asking NEXT_SCRIPTED, check whether the respondent
+   has already answered its core topic organically, either in COVERED_SUBTOPICS or in
+   RECENT_TURNS. Organic coverage means: the respondent volunteered the information
+   unprompted, even if you never asked the scripted question directly. If covered,
+   set action=`skip_scripted` and advance to a probe or the next scripted question
+   instead. Do NOT re-ask what the respondent has already answered.
 
 6. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
    Use action=`wrap_up`.
@@ -408,20 +423,23 @@ def _build_interviewer_model() -> FallbackModel:
             )
         )
 
+    temp = settings.interviewer_temperature
     haiku = AnthropicModel(
         _strip(INTERVIEWER_HAIKU_MODEL),
         provider=AnthropicProvider(api_key=settings.anthropic_api_key),
-        settings=anthropic_interviewer_settings(),
+        settings=anthropic_interviewer_settings(temperature=temp),
     )
     # thinking_budget=0 caps unbounded reasoning that can spike to 12s+ on complex turns.
     gemini = GoogleModel(
         _strip(INTERVIEWER_GEMINI_MODEL),
         provider=GoogleProvider(api_key=settings.google_api_key),
-        settings=GoogleModelSettings(thinking_config={'thinking_budget': 0}),
+        settings=GoogleModelSettings(thinking_config={'thinking_budget': 0}, temperature=temp),
     )
+    temp_settings = {"temperature": temp} if temp is not None else None
     groq = GroqModel(
         _strip(INTERVIEWER_GROQ_MODEL),
         provider=GroqProvider(api_key=settings.groq_api_key),
+        settings=temp_settings,
     )
 
     chain.extend([haiku, gemini, groq])
@@ -431,6 +449,7 @@ def _build_interviewer_model() -> FallbackModel:
             CerebrasModel(
                 cerebras_id,
                 provider=CerebrasProvider(api_key=settings.cerebras_api_key),
+                settings=temp_settings,
             )
         )
 

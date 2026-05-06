@@ -75,8 +75,10 @@ class Settings(BaseSettings):
     groq_model: str = "groq:llama-3.3-70b-versatile"
     cerebras_model: str = "cerebras:llama3.1-8b"  # same provider:model form; "" skips Cerebras in the chain
 
-    # Dev
+    # Dev / evals
     log_level: str = "INFO"
+    # Set to 0.0 in eval environments for deterministic outputs. None = provider default.
+    interviewer_temperature: float | None = None
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

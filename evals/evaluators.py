@@ -1,13 +1,16 @@
-"""Evaluators for Tier 1 interviewer single-turn eval.
+"""Evaluators for interviewer and analyst evals.
 
-Two deterministic scorers (ActionMatches, SingleQuestion) and two LLM-as-judge
-scorers (UtteranceWarmth, NoLeadingQuestions). LLMJudge is imported and
-configured with a project-appropriate rubric + judge model; the plan calls for
-Opus as the analyst/synthesizer, so we reuse that class for judging too.
+Deterministic scorers: ActionMatches, SingleQuestion.
+LLM-as-judge scorers: all use Sonnet 4.6 — fast enough for both numeric scores
+and binary assertions at eval scale.
+
+All LLMJudge calls include include_reason=True on score/assertion OutputConfig
+so the Logfire Evals UI shows *why* each case passed/failed, not just the value.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from pydantic_evals.evaluators import Evaluator, EvaluatorContext, LLMJudge
@@ -16,7 +19,20 @@ from evals.cases import AnalystCaseInputs, InterviewerCaseInputs
 from voice_agent.models import AnalysisUpdate, InterviewerOutput
 
 
-JUDGE_MODEL = "anthropic:claude-opus-4-6"
+_JUDGE_MODEL = "anthropic:claude-sonnet-4-6"
+
+# Matches the filler + flush token injected by TurnPipeline when TTS is slow,
+# e.g. "Mm-hm, <flush /> " or "Got it, <flush /> ".
+_FILLER_RE = re.compile(r"^[^<]*<flush\s*/>\s*", re.IGNORECASE)
+
+
+def _clean_utterance(utterance: str) -> str:
+    """Strip the filler-prefix + <flush /> artifact injected by the streaming pipeline.
+
+    The pipeline yields e.g. "Mm-hm, <flush /> " before the real LLM tokens so
+    TTS can start immediately. Evaluators should see only the actual spoken text.
+    """
+    return _FILLER_RE.sub("", utterance).strip()
 
 
 @dataclass
@@ -27,9 +43,7 @@ class ActionMatches(
 
     def evaluate(
         self,
-        ctx: EvaluatorContext[
-            InterviewerCaseInputs, InterviewerOutput, None
-        ],
+        ctx: EvaluatorContext[InterviewerCaseInputs, InterviewerOutput, None],
     ) -> bool:
         if ctx.expected_output is None:
             return False
@@ -40,27 +54,27 @@ class ActionMatches(
 class SingleQuestion(
     Evaluator[InterviewerCaseInputs, InterviewerOutput, None]
 ):
-    """Utterance must contain at most one `?`.
+    """Cleaned utterance must contain at most one `?`.
 
-    Stacking questions in one breath is the single most common interviewer
-    failure mode and is trivial to check deterministically.
+    Filler prefix and <flush /> are stripped first so "Still there?" from a
+    clarify case isn't double-counted and filler phrases like "Mm-hm," don't
+    skew the count.
     """
 
     def evaluate(
         self,
-        ctx: EvaluatorContext[
-            InterviewerCaseInputs, InterviewerOutput, None
-        ],
+        ctx: EvaluatorContext[InterviewerCaseInputs, InterviewerOutput, None],
     ) -> bool:
-        return ctx.output.utterance.count("?") <= 1
+        return _clean_utterance(ctx.output.utterance).count("?") <= 1
 
 
 def utterance_warmth_judge() -> LLMJudge:
-    """LLMJudge on conversational warmth of the spoken utterance."""
+    """LLMJudge on conversational warmth — numeric 1-5 score."""
     return LLMJudge(
         rubric=(
             "You are grading a single spoken line from a phone-call market "
-            "researcher. Score 1–5 on conversational warmth:\n"
+            "researcher. The line has already had any filler prefix stripped. "
+            "Score 1–5 on conversational warmth:\n"
             "  5 = warm, natural, acknowledges what the respondent said\n"
             "  4 = friendly but slightly formal\n"
             "  3 = neutral / businesslike\n"
@@ -69,10 +83,37 @@ def utterance_warmth_judge() -> LLMJudge:
             "Grade only the `utterance` field; ignore `reasoning`. Pass the "
             "line if the score is >= 3."
         ),
-        model=JUDGE_MODEL,
+        model=_JUDGE_MODEL,
         include_input=False,
-        score={"evaluation_name": "utterance_warmth"},
+        score={"evaluation_name": "utterance_warmth", "include_reason": True},
         assertion=False,
+    )
+
+
+def no_leading_questions_judge() -> LLMJudge:
+    """Pass/fail: does the utterance contain a leading question?"""
+    return LLMJudge(
+        rubric=(
+            "Grade whether the interviewer's utterance contains a LEADING "
+            "question. A leading question presupposes the answer (e.g. "
+            "'So you loved it, right?', 'That was frustrating, wasn't it?') "
+            "or funnels the respondent toward a particular view. Pass if the "
+            "question is open and non-leading. Fail if it is leading or "
+            "obviously biased. If the utterance contains no question (e.g. "
+            "pure acknowledgement or wrap-up), pass.\n"
+            "The case input contains the prior transcript so you can verify "
+            "whether the interviewer is echoing the respondent's own words "
+            "(which is fine) versus introducing a framing the respondent never "
+            "expressed (which is leading).\n"
+            "Pass neutral research patterns: inviting detail on a hedge "
+            "('fine I guess'), gentle off-topic redirects with an open "
+            "follow-up, and probes that reuse the respondent's own words "
+            "without adding unstated emotion or blame."
+        ),
+        model=_JUDGE_MODEL,
+        include_input=True,
+        score=False,
+        assertion={"evaluation_name": "non_leading", "include_reason": True},
     )
 
 
@@ -139,9 +180,9 @@ def probes_specific_judge() -> LLMJudge:
             "Judge the `new_probes` list. The transcript is provided as the "
             "input. Pass (score >= 3) if specificity is adequate."
         ),
-        model=JUDGE_MODEL,
+        model=_JUDGE_MODEL,
         include_input=True,
-        score={"evaluation_name": "probes_specific"},
+        score={"evaluation_name": "probes_specific", "include_reason": True},
         assertion=False,
     )
 
@@ -163,10 +204,10 @@ def probes_non_leading_judge() -> LLMJudge:
             "didn't express. Probes that echo the respondent's own words "
             "without adding blame or emotion are fine."
         ),
-        model=JUDGE_MODEL,
+        model=_JUDGE_MODEL,
         include_input=True,
         score=False,
-        assertion={"evaluation_name": "probes_non_leading"},
+        assertion={"evaluation_name": "probes_non_leading", "include_reason": True},
     )
 
 
@@ -195,31 +236,8 @@ def priority_calibrated_judge() -> LLMJudge:
             "The transcript is provided as the input. Judge both directions: "
             "priority-1 when warranted, and not when unwarranted."
         ),
-        model=JUDGE_MODEL,
+        model=_JUDGE_MODEL,
         include_input=True,
         score=False,
-        assertion={"evaluation_name": "priority_calibrated"},
-    )
-
-
-def no_leading_questions_judge() -> LLMJudge:
-    """LLMJudge on whether the question biases the respondent."""
-    return LLMJudge(
-        rubric=(
-            "Grade whether the interviewer's utterance contains a LEADING "
-            "question. A leading question presupposes the answer (e.g. "
-            "'So you loved it, right?', 'That was frustrating, wasn't it?') "
-            "or funnels the respondent toward a particular view. Pass if the "
-            "question is open and non-leading. Fail if it is leading or "
-            "obviously biased. If the utterance contains no question (e.g. "
-            "pure acknowledgement or wrap-up), pass.\n"
-            "Pass neutral research patterns: inviting detail on a hedge "
-            "('fine I guess'), gentle off-topic redirects with an open "
-            "follow-up, and probes that reuse the respondent's own words "
-            "without adding unstated emotion or blame."
-        ),
-        model=JUDGE_MODEL,
-        include_input=False,
-        score=False,
-        assertion={"evaluation_name": "non_leading"},
+        assertion={"evaluation_name": "priority_calibrated", "include_reason": True},
     )

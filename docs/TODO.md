@@ -7,11 +7,9 @@
 
 ## My questions/Future improvements
 
-
-
 - Evals - We have the base setup for all. We need to go 1 level deeper and se if this is properly targeting what we want
-  - For all tiers: See if we are testing appropriate things
-    - Tier 1: 
+  - For all tiers: Run the evals (See if working & fix what is not), Ask if it's prod grade, See if we are testing appropriate things
+    - Tier 1: (Interviewer)
     - Tier 2 (Analyst)
     - Tier 3: Is this covering enough
       - Make sure it asks everything
@@ -22,7 +20,7 @@
       - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
       - When handling a probe from earlier, it should say like you said earlier
   - Versioned datasets/eval runs: 
-    - Where are these saved, how to view & compare nicely, is this best practice? Hosted vs Local? Why print? 
+    - Where are these saved, how to view & compare nicely, is this best practice? Hosted vs Local? Why print?
   - Online Evals: See if working fine
 - Infra - Prod Level
   - Render Deployment 
@@ -43,6 +41,9 @@
 
 - Fun Stuff
   - Clone my voice on 11labs & use it
+- Evals
+  - Host datasets directly on Logfire (Currently we run it on local and save runs there, now we can host datasets, collab etc. directly on LF)
+  - Hosted prompt & prompt versioning on Logfire
 - Prod Infra
   - Multi-server deployment - cleaning up data that is in-memory worker dependant
   - CI/CD

@@ -42,7 +42,7 @@ from voice_agent import state
 from voice_agent.agents.analyst import run_analyst_safely
 from evals.simulator import load_personas, simulate_turn
 from voice_agent.models import AnalystDeps, Persona
-import logfire
+from voice_agent.tracing import init_tracing
 from voice_agent.turn import run_speech_turn
 
 MAX_TURNS = 12  # capped at 12 turns; ~24 Sonnet calls total across 2 personas
@@ -298,7 +298,7 @@ async def test_tier3_trajectories():
     Marked `slow` — ~24 Sonnet calls ≈ 45s. Run with:
         uv run pytest evals/test_trajectories.py -v -s -m slow
     """
-    logfire.configure(service_name="voice-agent-evals", send_to_logfire="if-token-present")
+    init_tracing(service_name="voice-agent-evals")
 
     dataset = _build_dataset()
     report = await dataset.evaluate(

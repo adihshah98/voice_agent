@@ -34,9 +34,15 @@ def user_message_cache_breakpoint() -> CachePoint:
     return CachePoint(ttl=ANTHROPIC_CACHE_TTL)
 
 
-def anthropic_interviewer_settings() -> AnthropicModelSettings:
-    """Cache system instructions; pairs with :func:`user_message_cache_breakpoint`."""
-    return AnthropicModelSettings(anthropic_cache_instructions=ANTHROPIC_CACHE_TTL)
+def anthropic_interviewer_settings(temperature: float | None = None) -> AnthropicModelSettings:
+    """Cache system instructions; pairs with :func:`user_message_cache_breakpoint`.
+
+    `temperature` is forwarded when set (e.g. 0.0 in eval mode for determinism).
+    """
+    kwargs: dict = {"anthropic_cache_instructions": ANTHROPIC_CACHE_TTL}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    return AnthropicModelSettings(**kwargs)
 
 
 def openai_interviewer_settings(settings: Settings) -> OpenAIChatModelSettings | None:
@@ -44,13 +50,17 @@ def openai_interviewer_settings(settings: Settings) -> OpenAIChatModelSettings |
 
     The effective key is ``{openai_prompt_cache_key}:{interviewer_prompt_cache_version}``
     when both are non-empty so deploys can invalidate grouping without renaming the base key.
+    Temperature is forwarded when set (e.g. 0.0 in eval mode for determinism).
     """
     base = settings.openai_prompt_cache_key.strip()
-    if not base:
+    temp = settings.interviewer_temperature
+    if not base and temp is None:
         return None
-    ver = settings.interviewer_prompt_cache_version.strip()
-    key = f"{base}:{ver}" if ver else base
-    return OpenAIChatModelSettings(
-        openai_prompt_cache_key=key,
-        openai_prompt_cache_retention=settings.openai_prompt_cache_retention,
-    )
+    kwargs: dict = {}
+    if base:
+        ver = settings.interviewer_prompt_cache_version.strip()
+        kwargs["openai_prompt_cache_key"] = f"{base}:{ver}" if ver else base
+        kwargs["openai_prompt_cache_retention"] = settings.openai_prompt_cache_retention
+    if temp is not None:
+        kwargs["temperature"] = temp
+    return OpenAIChatModelSettings(**kwargs)
