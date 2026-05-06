@@ -51,7 +51,7 @@ async def test_interviewer_stream_tokens_and_output(mocker: pytest_mock.MockerFi
         def run_stream(self, prompt_parts, deps=None):
             return FakeRunStreamCtx()
 
-    mocker.patch.object(interviewer_module, "interviewer", FakeAgent())
+    mocker.patch.object(interviewer_module, "_get_interviewer", return_value=FakeAgent())
 
     deps = SimpleNamespace(session=None, call_id="call-1", turn_number=1)
     prepared = interviewer_module.PreparedInterviewerTurn(
@@ -95,7 +95,7 @@ async def test_interviewer_stream_bare_format(mocker: pytest_mock.MockerFixture)
         def run_stream(self, prompt_parts, deps=None):
             return FakeRunStreamCtx()
 
-    mocker.patch.object(interviewer_module, "interviewer", FakeAgent())
+    mocker.patch.object(interviewer_module, "_get_interviewer", return_value=FakeAgent())
 
     deps = SimpleNamespace(session=None, call_id="call-1", turn_number=1)
     prepared = interviewer_module.PreparedInterviewerTurn(

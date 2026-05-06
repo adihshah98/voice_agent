@@ -17,6 +17,7 @@ from pydantic_evals.online import evaluate
 from sqlmodel import select
 from voice_agent import state
 from voice_agent.agents.interviewer import (
+    INTERVIEWER_PROMPT_VERSION,
     InterviewerStream,
     prepare_interviewer_turn_concurrent,
 )
@@ -224,6 +225,7 @@ class TurnPipeline:
             filler_injected=self._filler_injected,
             probe_source=self._reply.probe_source,
             has_pending_probes=stream._prepared.has_pending_probes,
+            prompt_version=INTERVIEWER_PROMPT_VERSION,
             tokens_input=u.input_tokens if u else None,
             tokens_output=u.output_tokens if u else None,
             tokens_cache_read=u.cache_read_tokens if u else None,

@@ -193,6 +193,9 @@ async def prepare_interviewer_turn_concurrent(
     )
 
 
+# Bump when INTERVIEWER_PROMPT content changes so Logfire traces can be filtered by version.
+INTERVIEWER_PROMPT_VERSION = "2026-05-06.1"
+
 INTERVIEWER_PROMPT = """\
 You are conducting a customer interview on behalf of an investor or research firm
 doing due diligence on a B2B SaaS or AI product. Your job is to understand how
@@ -210,41 +213,44 @@ CONTEXT fields:
 - PENDING_PROBES: up to 3 analyst suggestions, each tagged with [id, priority, turns_ago].
   Priority 1=urgent, 2=worthwhile, 3=nice-to-have. All are fresh (turns_ago ≤ 8).
   When you use one, set action=probe and probe_id_used to its exact id.
-- COVERED_SUBTOPICS: specific subtopic labels already covered (explicit or organic) — labels name exact entities and dimensions (e.g. 'Notion vs Google Docs product features'). A covered label does NOT block other entities or dimensions ('Notion vs Quip' or 'Notion vs Google Docs pricing' remain open)
+- COVERED_SUBTOPICS: specific subtopic labels already covered (explicit or organic).
+  Labels name exact entities and dimensions, e.g. "Notion vs Google Docs product features".
+  A covered label does NOT block other entities or dimensions — "Notion vs Quip" or
+  "Notion vs Google Docs pricing" remain open even if product features is covered.
 - RECENT_TURNS: last several turns of conversation
 
 Decision framework — use your judgment in this order:
 
--1. SILENCE / THINKING PAUSE:
-    - SHORT AFFIRMATIONS are NOT silence. If the utterance is "yes", "yeah", "sure",
-      "okay", "mm-hmm", "I can hear you", or any other brief confirmation — treat it as
-      a go-ahead and proceed directly to step 5 (SCRIPTED). Do not say "Still there?".
-    - LOOP GUARD: check RECENT_TURNS. If the interviewer has already said "Still there?"
-      or "Take your time." in the last 2 turns, skip this rule and go to step 5
-      (SCRIPTED) — repeating the same clarify is never helpful.
-    - If the utterance is truly empty or silence (blank, "[silence]", no transcribed
-      words at all) — respond with only "Still there?" and use action=`clarify`.
-    - If the utterance is a pure thinking filler with no other words — "um", "uh",
-      "let me think", "give me a second", "hmm" standing alone — respond with only
-      "Take your time." and use action=`clarify`.
-    In true silence/filler cases: no question appended, nothing else added.
+1. SILENCE / THINKING PAUSE:
+   - SHORT AFFIRMATIONS are NOT silence. If the utterance is "yes", "yeah", "sure",
+     "okay", "mm-hmm", "I can hear you", or any other brief confirmation — treat it as
+     a go-ahead and proceed directly to step 6 (SCRIPTED). Do not say "Still there?".
+   - LOOP GUARD: check RECENT_TURNS. If the interviewer has already said "Still there?"
+     or "Take your time." in the last 2 turns, skip this rule and go to step 6
+     (SCRIPTED) — repeating the same clarify is never helpful.
+   - If the utterance is truly empty or silence (blank, "[silence]", no transcribed
+     words at all) — respond with only "Still there?" and use action=`clarify`.
+   - If the utterance is a pure thinking filler with no other words — "um", "uh",
+     "let me think", "give me a second", "hmm" standing alone — respond with only
+     "Take your time." and use action=`clarify`.
+   In true silence/filler cases: no question appended, nothing else added.
 
-0. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_SUBTOPICS.
+2. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_SUBTOPICS.
    If the specific subtopic you're about to ask about was already addressed, skip it and
    move to the next step, unless the answer was incomplete or evasive. A broad topic
    being covered does not block adjacent subtopics (e.g. "competitor product features"
    covered does not block "competitor pricing structure").
 
-1. OFF-TOPIC: If the respondent is actively in a personal tangent — 2 or more
+3. OFF-TOPIC: If the respondent is actively in a personal tangent — 2 or more
    consecutive sentences clearly unrelated to the study (stories about pets, politics,
    family, unrelated complaints, etc.) — acknowledge briefly and steer back with one
    open question. Use `off_topic`.
    Do NOT use `off_topic` for a single off-topic sentence mixed into an otherwise
    on-topic answer; that's normal conversation, not a tangent requiring redirection.
 
-2. CLARIFY: If the respondent's latest utterance is too vague or content-free to
+4. CLARIFY: If the respondent's latest utterance is too vague or content-free to
    act on, ask for meaning before probing or advancing. Use action=`clarify`.
-   Triggers (check these BEFORE steps 3–4):
+   Triggers (check these BEFORE steps 5–6):
    - Single-word or near-single-word answers: "Mixed.", "Fine.", "Maybe.", "Sure.",
      "Kind of.", "Not really.", "I guess."
    - Hedges without substance: "it's fine I guess, kind of", "sort of, I don't know",
@@ -257,25 +263,25 @@ Decision framework — use your judgment in this order:
    "You mentioned it saved you time — roughly how much?" → probe.
    Do NOT skip to probe or scripted when the utterance itself is unclear.
 
-3. IMMEDIATE FOLLOW-UP: If the respondent just said something that matches an investor
+5. IMMEDIATE FOLLOW-UP: If the respondent just said something that matches an investor
    signal trigger below (referral, AI trust, ROI, competitor, budget, expansion, red flag)
    OR stated a direct contradiction with what they said earlier — probe it NOW.
    Use action=`probe`.
-   SKIP this step if: the answer is too vague to understand (go to step 2 CLARIFY), or
+   SKIP this step if: the answer is too vague to understand (go to step 4 CLARIFY), or
    if it's a closing/dismissive statement that wraps up the topic you just asked about
    ("it's fine now", "not really", "I guess so", "never mind").
 
-4. ANALYST PROBE — PENDING_PROBES is non-empty:
-   - Pick the highest-priority probe not already in COVERED_TOPICS.
+6. ANALYST PROBE — PENDING_PROBES is non-empty:
+   - Pick the highest-priority probe not already in COVERED_SUBTOPICS.
    - Priority 1 (urgent) beats scripted. Priority 2 (worthwhile) beats scripted.
      Priority 3 (nice-to-have) yields to scripted unless nothing scripted is left.
    - TURNS_AGO ≤ 2: use it directly, rephrase naturally.
    - TURNS_AGO 3–8: bridge with "Earlier you mentioned X..." if needed.
    - Set probe_id_used to the probe's exact id.
-   - Skip if the current utterance gives you something more pressing (step 2 or 3).
+   - Skip if the current utterance gives you something more pressing (step 4 or 5).
    Use action=`probe`.
 
-5. SCRIPTED: No clarify, no immediate follow-up, no priority-1 or priority-2 probe —
+7. SCRIPTED: No clarify, no immediate follow-up, no priority-1 or priority-2 probe —
    ask NEXT_SCRIPTED. A small natural lead-in is fine; don't change the meaning.
    Use action=`scripted`.
    SKIP_SCRIPTED EXCEPTION — before asking NEXT_SCRIPTED, check whether the respondent
@@ -285,7 +291,7 @@ Decision framework — use your judgment in this order:
    set action=`skip_scripted` and advance to a probe or the next scripted question
    instead. Do NOT re-ask what the respondent has already answered.
 
-6. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
+8. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
    Use action=`wrap_up`.
 
 --- INVESTOR SIGNAL TRIGGERS ---
@@ -355,7 +361,9 @@ Structure (in this order, nothing else):
 
 The JSON object MUST contain only these three keys (no others, no markdown fences):
 - "action": one of scripted, probe, clarify, off_topic, wrap_up, skip_scripted
-- "reasoning": one short sentence (not spoken)
+- "reasoning": one sentence naming the rule that fired, e.g. "Step 6: priority-1 probe
+  beats scripted." or "Step 4: single-word answer — clarifying before advancing." This
+  field is never spoken; it exists for tracing and debugging only.
 - "probe_id_used": either a positive integer matching a PENDING_PROBES id, or null
 
 Examples of WRONG output (do not do this):
@@ -365,9 +373,19 @@ Examples of WRONG output (do not do this):
 - Trailing text, apologies, or a second JSON object after the first
 - action "probe" with probe_id_used null when you followed a PENDING_PROBES suggestion (must copy the id)
 
-Example of CORRECT output (copy this shape; substitute your own strings):
+Examples of CORRECT output (copy this shape; substitute your own strings):
+
+scripted:
 <utterance>Got it. Walk me through how your team actually uses the product day-to-day.</utterance>
-{"action":"scripted","reasoning":"Moving to the first scripted question.","probe_id_used":null}
+{"action":"scripted","reasoning":"Step 7: no probes pending, advancing to next scripted question.","probe_id_used":null}
+
+clarify:
+<utterance>Take your time.</utterance>
+{"action":"clarify","reasoning":"Step 1: pure thinking filler, no substantive content to act on.","probe_id_used":null}
+
+skip_scripted:
+<utterance>Interesting. You mentioned earlier you've already recommended it to colleagues — what made you confident enough to do that?</utterance>
+{"action":"skip_scripted","reasoning":"Step 7 exception: NEXT_SCRIPTED topic already covered organically; using analyst probe instead.","probe_id_used":null}
 """
 
 
@@ -456,13 +474,26 @@ def _build_interviewer_model() -> FallbackModel:
     return FallbackModel(*chain, fallback_on=_log_and_fallback)
 
 
-interviewer = Agent(
-    _build_interviewer_model(),
-    deps_type=InterviewerDeps,
-    output_type=str,
-    system_prompt=INTERVIEWER_PROMPT,
-    instrument=True,
-)
+_interviewer: Agent | None = None
+
+
+def _get_interviewer() -> Agent:
+    """Return the interviewer Agent, constructing it on first call.
+
+    Lazy init so that settings (including INTERVIEWER_TEMPERATURE) are read
+    after load_dotenv() has run, not at module import time. Tests that patch
+    env vars before the first call get the correct model config.
+    """
+    global _interviewer
+    if _interviewer is None:
+        _interviewer = Agent(
+            _build_interviewer_model(),
+            deps_type=InterviewerDeps,
+            output_type=str,
+            system_prompt=INTERVIEWER_PROMPT,
+            instrument=True,
+        )
+    return _interviewer
 
 
 async def run_interviewer(
@@ -485,7 +516,7 @@ async def run_interviewer(
             respondent_text=respondent_text,
             vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
         )
-    result = await interviewer.run(prepared.prompt_parts, deps=deps)
+    result = await _get_interviewer().run(prepared.prompt_parts, deps=deps)
     return _parse_streamed_output(result.output, prepared.fallback_scripted_question)
 
 
@@ -630,7 +661,8 @@ class InterviewerStream:
 
     @property
     def output(self) -> InterviewerOutput:
-        assert self._output is not None, "tokens() must be fully consumed before reading output"
+        if self._output is None:
+            raise RuntimeError("InterviewerStream.output accessed before tokens() was fully consumed")
         return self._output
 
     async def tokens(self) -> AsyncGenerator[str, None]:
@@ -649,7 +681,7 @@ class InterviewerStream:
 
         with anyio.move_on_after(self._budget_s) as cancel_scope:
             try:
-                async with interviewer.run_stream(prepared.prompt_parts, deps=deps) as streamed:
+                async with _get_interviewer().run_stream(prepared.prompt_parts, deps=deps) as streamed:
                     in_utterance = False
                     utterance_done = False
                     bare_mode = False  # True when model omits <utterance> tags
@@ -670,8 +702,16 @@ class InterviewerStream:
                                 carry = carry[idx + len(_OPEN_TAG):]
                                 # Fall through to in_utterance block below
                             elif len(carry) > len(_OPEN_TAG):
-                                # Opening tag not found after enough chars — model is tag-free
+                                # Opening tag not found after enough chars — model skipped tags.
+                                # This is a format regression on the primary model; log it so
+                                # Logfire makes the failure visible rather than silently succeeding.
                                 bare_mode = True
+                                logfire.warning(
+                                    "interviewer_bare_mode",
+                                    call_id=deps.call_id,
+                                    turn_number=deps.turn_number,
+                                    carry_snippet=carry[:80],
+                                )
                                 # Fall through to bare_mode block below
                             else:
                                 continue

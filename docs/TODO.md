@@ -39,8 +39,6 @@
 
 ---
 
-- Fun Stuff
-  - Clone my voice on 11labs & use it
 - Evals
   - Host datasets directly on Logfire (Currently we run it on local and save runs there, now we can host datasets, collab etc. directly on LF)
   - Hosted prompt & prompt versioning on Logfire
@@ -55,8 +53,6 @@
   - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
   - The analyst is triggered by polling `should_run_analyst()` on every `conversation-update`. Fine for one call, but with N concurrent calls you get lock contention and polling overhead. Production systems use a task queue (Celery + Redis, SQS, etc.) — the webhook handler enqueues a job instead of calling `asyncio.create_task` inline.
   - The analyst competes with the real-time interviewer for the event loop. A slow Sonnet call during a burst can delay turn responses. In production you'd want the analyst as a separate worker service — the invariant holds, you just move the writes to a different process.
-- Prod Monitoring
-  - Prompt Playground/Versioned Prompts
 - Memory
   - Memory/Improving agents with usage
 - Advanced Voice UX
@@ -72,4 +68,6 @@
   - Synthesis Report
     - Reinstate synthesis report once this works
     - Maybe use async queues for this (learn to use async queues either way)
+  - Fun Stuff
+    - Clone my voice on 11labs & use it
 
