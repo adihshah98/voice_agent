@@ -14,7 +14,7 @@ Package manager is `uv`; env vars load from `.env` (see `.env.example`). Minimum
 uv sync                                               # install deps
 uv run uvicorn voice_agent.server:app --reload        # run FastAPI server (webhooks + custom-LLM endpoint)
 uv run python scripts/play.py                         # local terminal REPL — drives a call in-process, no server needed
-uv run python scripts/play.py "Notion AI"             # same, substitutes [product] token in investor_questions.yaml
+uv run python scripts/play.py "Notion AI"             # same, substitutes [product] token in data/investor_questions.yaml
 uv run python scripts/play.py "Notion AI" --phone +14155551234  # real outbound Vapi call (needs server running)
 
 uv run pytest                                         # all tests + evals
@@ -99,4 +99,4 @@ Three tiers under `evals/`, all using `pydantic_evals`:
 
 ### Scripted question source
 
-`scripts/play.py` loads scripted questions from `evals/datasets/investor_questions.yaml` and substitutes `[product]` with the CLI arg. This is the canonical question list; the server's `/calls/start` takes arbitrary `scripted_questions` from the caller.
+`scripts/play.py` loads scripted questions from `data/investor_questions.yaml` and substitutes `[product]` with the CLI arg. This is the canonical question list; the server's `/calls/start` takes arbitrary `scripted_questions` from the caller.

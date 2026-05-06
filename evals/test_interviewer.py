@@ -7,11 +7,12 @@ Requires ANTHROPIC_API_KEY in .env. Run with:
 
     uv run pytest evals/test_interviewer.py -v
 
-Pass criteria (from the plan):
-    - ActionMatches >= 90%
+Pass criteria:
+    - ActionMatches >= 90%  (action + probe_source when specified)
     - UtteranceWarmth average >= 4 / 5
     - SingleQuestion 100% (deterministic)
-    - NoLeadingQuestions 100% pass
+    - NoLeadingQuestions >= 90%
+    - ResponseRelevant >= 90%
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from evals.evaluators import (
     ActionMatches,
     SingleQuestion,
     no_leading_questions_judge,
+    response_relevance_judge,
     utterance_warmth_judge,
 )
 import logfire
@@ -45,6 +47,7 @@ DATASET_PATH = Path(__file__).parent / "datasets" / "interviewer_turns.yaml"
 ACTION_MATCH_THRESHOLD = 0.90
 WARMTH_THRESHOLD = 4.0
 NON_LEADING_THRESHOLD = 0.90
+RESPONSE_RELEVANT_THRESHOLD = 0.90
 SINGLE_QUESTION_THRESHOLD = 1.0
 
 
@@ -135,6 +138,7 @@ async def test_tier1_interviewer_decisions():
             SingleQuestion(),
             utterance_warmth_judge(),
             no_leading_questions_judge(),
+            response_relevance_judge(),
         ),
     )
 
@@ -172,11 +176,17 @@ async def test_tier1_interviewer_decisions():
             f"Non-leading pass rate {non_leading:.2%} below "
             f"{NON_LEADING_THRESHOLD:.0%}"
         )
+    relevant = scores.get("response_relevant")
+    if relevant is not None:
+        assert relevant >= RESPONSE_RELEVANT_THRESHOLD, (
+            f"Response relevance pass rate {relevant:.2%} below "
+            f"{RESPONSE_RELEVANT_THRESHOLD:.0%}"
+        )
 
 
 def _print_per_case(report) -> None:
     """Print a table: case | expected | actual | scores | utterance, then failures."""
-    header = f"{'case':<40} {'exp':>8} {'got':>8} {'AM':>4} {'SQ':>4} {'NL':>4} {'W':>5}  utterance"
+    header = f"{'case':<40} {'exp':>12} {'got':>12} {'AM':>4} {'SQ':>4} {'NL':>4} {'RR':>4} {'W':>5}  utterance"
     print(f"\nTier 1 per-case results:\n{header}\n{'-' * len(header)}")
 
     def _bool(src, key) -> str:
@@ -192,22 +202,29 @@ def _print_per_case(report) -> None:
         v = item.value
         return f"{v:4.1f}" if isinstance(v, (int, float)) else "   -"
 
+    def _action_label(output) -> str:
+        if output is None:
+            return "?"
+        src = output.probe_source
+        return f"{output.action}/{src}" if src else output.action
+
     for case in report.cases:
-        exp = case.expected_output.action if case.expected_output else "?"
-        got = case.output.action if case.output else "?"
+        exp = _action_label(case.expected_output)
+        got = _action_label(case.output)
         utterance = case.output.utterance if case.output else ""
-        if len(utterance) > 55:
-            utterance = utterance[:55] + "…"
+        if len(utterance) > 50:
+            utterance = utterance[:50] + "…"
         am = _bool(case.assertions, "ActionMatches")
         sq = _bool(case.assertions, "SingleQuestion")
         nl = _bool(case.assertions, "non_leading")
+        rr = _bool(case.assertions, "response_relevant")
         w  = _num(case.scores, "utterance_warmth")
-        print(f"{(case.name or ''):<40} {exp:>8} {got:>8} {am} {sq} {nl} {w}  {utterance}")
+        print(f"{(case.name or ''):<40} {exp:>12} {got:>12} {am} {sq} {nl} {rr} {w}  {utterance}")
 
     for fail in report.failures:
-        exp = fail.expected_output.action if fail.expected_output else "?"
+        exp = _action_label(fail.expected_output)
         msg = fail.error_message.splitlines()[0][:60] if fail.error_message else "unknown error"
-        print(f"{(fail.name or ''):<40} {exp:>8} {'ERROR':>8}                        {msg}")
+        print(f"{(fail.name or ''):<40} {exp:>12} {'ERROR':>12}                          {msg}")
 
 
 def _aggregate(report) -> dict[str, float]:

@@ -1,89 +1,187 @@
-version: "2026-05-05.1"
-description: "Added 7 Tier 1 cases: silence/filler clarify, investor probe triggers (ROI, competitor, expansion, low-rating), skip_scripted"
+version: "2026-05-06.3"
+description: "Analyst probe cases now have realistic lag: signal in older turn, 2-4 turns of normal conversation after, probe surfaces at latest turn"
 
-# Tier 1 interviewer dataset — 25 single-turn decisions.
+# Tier 1 interviewer dataset — 35 single-turn decisions.
 #
 # Each case seeds a minimal DB (scripted_questions, prior_turns, probes) and
 # hands the agent a `last_respondent` utterance. `expected_output.action` is
 # what a well-behaved interviewer should choose.
 #
-# Coverage: probe x9, scripted x6, clarify x5, wrap_up x3, off_topic x2.
-# `acknowledge` is intentionally not tested here — it's context-dependent and
-# rarely the unique right answer, so it belongs in Tier 3 trajectory evals.
+# STRUCTURAL INVARIANT: `last_respondent` MUST equal the text of the last
+# respondent entry in `prior_turns`. In the live Vapi webhook, the custom-LLM
+# endpoint receives body["messages"] which is the full transcript including the
+# respondent's latest turn — the last message IS already in the history.
+# Violating this produces a state the real interviewer never sees.
+#
+# ANALYST LAG PATTERN (analyst probe cases):
+# Analyst runs async after the scripted cursor advances or every ~10 turns.
+# It reads the transcript at time T, generates probes, then writes them to DB.
+# By the time probes appear, the interviewer has already taken 2-4 more turns.
+# So: probe question references an OLDER turn (the signal), while
+# `last_respondent` is the LATEST turn (unrelated to the probe topic).
+# The interviewer must break from the current thread to use the probe.
+#
+# probe_source field on expected_output:
+#   "analyst"     — model must pick a probe from the pre-seeded PENDING_PROBES
+#   "interviewer" — model must fire a spontaneous probe (probes: [] in inputs)
+#   (omitted)     — source not checked; used for non-probe actions
+#
+# Coverage: probe x16 (analyst x10, interviewer x6), scripted x5, clarify x5,
+#           wrap_up x5, off_topic x2, skip_scripted x2.
 
 cases:
   # --- probe (analyst flagged something worth digging into) ---------------
+  # Signal is 3-5 turns back. The conversation continued on a different thread.
+  # The interviewer must recognize the waiting probe and pivot to it.
 
   - name: priority_1_probe_beats_scripted
+    # Signal: "lost visibility on a key metric for three weeks" (turn 6)
+    # Analyst ran after scripted cursor advanced at turn 6, probe arrived ~turn 8
+    # Turns 7-10: interviewer moved to day-to-day usage thread
+    # Now at turn 10: last respondent answered the workflow question
     inputs:
       scripted_questions:
-        - How do you currently use the product?
-        - What would you change about it?
-        - Who else might benefit from it?
-        - How much would you pay for a premium version?
+        - Can you tell me about your role and what your team does?
+        - How long has your team been using the product?
+        - Before this, what were you using and what prompted the switch?
+        - Walk me through how your team actually uses it day-to-day.
+        - What's been the biggest impact on your workflow?
+        - What do you wish it did better?
+        - On a scale of 1 to 10, how likely are you to recommend it to a colleague?
+        - Who else at your company might benefit from it?
       prior_turns:
-        - {speaker: interviewer, text: "How do you currently use the product?", action: scripted}
-        - {speaker: respondent, text: "Mostly for planning my morning commute. I stopped trusting it a few months ago though."}
+        - {speaker: interviewer, text: "Can you tell me about your role and what your team does?", action: scripted}
+        - {speaker: respondent, text: "I'm a product manager at a mid-size SaaS company. My team owns the core product analytics workflow."}
+        - {speaker: interviewer, text: "How long has your team been using the product?", action: scripted}
+        - {speaker: respondent, text: "About eight months now, around twelve people use it regularly."}
+        - {speaker: interviewer, text: "Before this, what were you using and what prompted the switch?", action: scripted}
+        - {speaker: respondent, text: "Spreadsheets and a homegrown Notion setup. The switch happened after a bad quarter where we lost visibility on a key metric for three weeks — nobody noticed until a board meeting."}
+        - {speaker: interviewer, text: "Walk me through how your team actually uses it day-to-day.", action: scripted}
+        - {speaker: respondent, text: "Mostly the analytics dashboards. We run a standup every morning off the main dashboard."}
+        - {speaker: interviewer, text: "What's been the biggest impact on your workflow?", action: scripted}
+        - {speaker: respondent, text: "Honestly just having one source of truth. Before, everyone had their own spreadsheet and they never matched."}
       probes:
-        - {question: "You said you stopped trusting it — what happened?", priority: 1, rationale: "Trust break is a strong signal; worth unpacking."}
-      last_respondent: "Yeah, I stopped using it after that routing disaster."
+        - {question: "Earlier you mentioned losing visibility on a key metric for three weeks — what was that metric and what broke?", priority: 1, rationale: "Root cause of the buying trigger; surfaces the specific pain that closed the deal."}
+        - {question: "You said nobody noticed until the board meeting — how did that go?", priority: 2, rationale: "Consequence of the visibility gap; helps size urgency of the original pain."}
+      last_respondent: "Honestly just having one source of truth. Before, everyone had their own spreadsheet and they never matched."
     expected_output:
       action: probe
+      probe_source: analyst
 
   - name: priority_2_probe_still_beats_scripted
+    # Signal: "came from a competitor that got too expensive" (turn 4)
+    # Analyst ran after scripted cursor advanced; probe arrived ~turn 6
+    # Turns 5-8: interviewer moved to feature satisfaction thread
     inputs:
       scripted_questions:
+        - Can you tell me about your role?
+        - How long have you been using it?
         - What do you like most about it?
-        - How often do you use it?
+        - What frustrates you most?
+        - Would you recommend it?
       prior_turns:
+        - {speaker: interviewer, text: "Can you tell me about your role and what your team does?", action: scripted}
+        - {speaker: respondent, text: "I run growth at a B2B startup. Small team — five of us."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About four months. We came from a competitor that got too expensive."}
         - {speaker: interviewer, text: "What do you like most about it?", action: scripted}
-        - {speaker: respondent, text: "The price, honestly. Not much else."}
+        - {speaker: respondent, text: "The price, honestly. Not much else stands out."}
+        - {speaker: interviewer, text: "What frustrates you most?", action: scripted}
+        - {speaker: respondent, text: "The reporting is pretty limited. We end up exporting to spreadsheets a lot."}
       probes:
-        - {question: "You mentioned the price — what else did you compare it to?", priority: 2, rationale: "Pricing is a comparative claim; context matters."}
-      last_respondent: "Yeah, it's the cheapest option I found."
+        - {question: "You mentioned switching from a competitor that got too expensive — what were you paying, roughly?", priority: 2, rationale: "Pricing displacement signal; helps size the competitive cost gap."}
+      last_respondent: "The reporting is pretty limited. We end up exporting to spreadsheets a lot."
     expected_output:
       action: probe
+      probe_source: analyst
 
   - name: contradiction_probe_after_flip
+    # Signal: contradiction between "community integrations sold us" (turn 6)
+    # and "never really cared about the community part" (turn 8)
+    # Analyst caught this contradiction; probe arrived ~turn 10
+    # Turns 9-12: interviewer moved to workflow impact thread
     inputs:
       scripted_questions:
+        - Tell me about your role and team.
+        - How long have you been using the product?
+        - What originally drew you to it?
         - How has your usage changed over time?
+        - What's been the biggest impact?
+        - What do you wish it did better?
       prior_turns:
-        - {speaker: interviewer, text: "First tell me, what drew you to it originally?", action: scripted}
-        - {speaker: respondent, text: "It was the community — everyone I knew used it."}
-        - {speaker: interviewer, text: "And now?", action: scripted}
-        - {speaker: respondent, text: "Honestly? I never really cared about the community part."}
+        - {speaker: interviewer, text: "Tell me about your role and team.", action: scripted}
+        - {speaker: respondent, text: "I'm a CS lead at a fintech startup, team of eight."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About a year and a half now."}
+        - {speaker: interviewer, text: "What originally drew you to it?", action: scripted}
+        - {speaker: respondent, text: "It was the community — all the integrations the community had built. That's what sold us."}
+        - {speaker: interviewer, text: "How has your usage changed over time?", action: scripted}
+        - {speaker: respondent, text: "Honestly? I never really cared about the community part. We barely use any of those integrations."}
+        - {speaker: interviewer, text: "What's been the biggest impact on your team?", action: scripted}
+        - {speaker: respondent, text: "Just the speed. We resolve tickets about thirty percent faster than before."}
+        - {speaker: interviewer, text: "What do you wish it did better?", action: scripted}
+        - {speaker: respondent, text: "The search is pretty weak. Hard to find old tickets."}
       probes:
-        - {question: "Earlier you said the community drew you in — what changed?", priority: 1, rationale: "Direct contradiction between turn 2 and turn 4."}
-      last_respondent: "I guess I'm just in a different place now."
+        - {question: "Earlier you mentioned the community integrations were what sold you — but then said you never really cared about them. What's the story there?", priority: 1, rationale: "Direct contradiction between turns 6 and 8; the stated buying reason doesn't match actual usage."}
+      last_respondent: "The search is pretty weak. Hard to find old tickets."
     expected_output:
       action: probe
+      probe_source: analyst
 
   - name: probe_after_detailed_anecdote
+    # Signal: "rerouted forty drivers in three minutes, used to take two hours" (turn 6)
+    # Analyst ran after scripted cursor advanced; probe arrived ~turn 8
+    # Turns 7-10: interviewer continued with feature satisfaction thread
     inputs:
       scripted_questions:
-        - What else have you tried?
+        - Tell me about your role.
+        - How long have you been using it?
+        - Walk me through the last time you used it.
+        - What features do you use most?
+        - What do you wish it did better?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm an ops manager at a logistics company. We coordinate about forty drivers across three cities."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "Eleven months. We went live after a two-week onboarding."}
         - {speaker: interviewer, text: "Walk me through the last time you used it.", action: scripted}
-        - {speaker: respondent, text: "Last Tuesday my flight got delayed and the app rerouted me to a train, which saved me about four hours. I was honestly shocked."}
+        - {speaker: respondent, text: "Last Tuesday a highway closure came in and the system rerouted all forty drivers automatically within about three minutes. That used to take us two hours on the phone."}
+        - {speaker: interviewer, text: "What features do you rely on most day-to-day?", action: scripted}
+        - {speaker: respondent, text: "Mostly the live map and the alerts. The driver app is good too."}
+        - {speaker: interviewer, text: "What do you wish it did better?", action: scripted}
+        - {speaker: respondent, text: "Better integration with our dispatch software. We still have to manually copy some data."}
       probes:
-        - {question: "The Tuesday rerouting — was that a manual search or did it notify you?", priority: 1, rationale: "Specificity check on the rerouting claim."}
-      last_respondent: "Yeah it was surprisingly smooth."
+        - {question: "You mentioned the Tuesday rerouting happened automatically in three minutes — was that fully automatic or did someone trigger it?", priority: 1, rationale: "Automation vs. manual trigger changes the ROI story significantly."}
+      last_respondent: "Better integration with our dispatch software. We still have to manually copy some data."
     expected_output:
       action: probe
+      probe_source: analyst
 
   - name: probe_available_vague_answer
+    # Signal: "switched from a competitor" — vague, unnamed (turn 4)
+    # Analyst flagged the unnamed competitor; probe arrived ~turn 6
+    # Turns 5-8: interviewer moved to feature/usage thread
     inputs:
       scripted_questions:
+        - Tell me about your role.
+        - How long have you been using the product?
         - What features matter most?
+        - What would you change?
       prior_turns:
-        - {speaker: interviewer, text: "You mentioned switching — from what?", action: probe}
-        - {speaker: respondent, text: "Something else. A competitor."}
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm head of RevOps at a Series B company. We have a sales team of about thirty."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About six months — we switched from something else. A competitor."}
+        - {speaker: interviewer, text: "What features matter most to your team?", action: scripted}
+        - {speaker: respondent, text: "The pipeline visibility and the Salesforce sync. Those two are critical."}
+        - {speaker: interviewer, text: "What would you change about it?", action: scripted}
+        - {speaker: respondent, text: "The reporting customization is limited. I can't build the exact views I need."}
       probes:
-        - {question: "Which competitor specifically did you switch from?", priority: 1, rationale: "Open probe on unnamed competitor."}
-      last_respondent: "Does it matter which one?"
+        - {question: "You mentioned switching from a competitor — which one, and what made you switch?", priority: 1, rationale: "Named competitor + switching rationale is a strong displacement signal."}
+      last_respondent: "The reporting customization is limited. I can't build the exact views I need."
     expected_output:
       action: probe
+      probe_source: analyst
 
   # --- scripted (no probe available; scripted queue has content) ----------
 
@@ -94,19 +192,21 @@ cases:
         - What would you change about it?
         - Who else might benefit from it?
       prior_turns:
+        - {speaker: interviewer, text: "Can you tell me about your role and what your team does?", action: scripted}
+        - {speaker: respondent, text: "I'm a data analyst at a media company. We use it mostly for dashboarding."}
         - {speaker: interviewer, text: "How do you currently use the product?", action: scripted}
-        - {speaker: respondent, text: "I've used it for about a year, mostly on weekdays."}
+        - {speaker: respondent, text: "I've used it for about a year, mostly on weekdays for commute planning."}
       probes: []
-      last_respondent: "Yeah, every weekday for the commute."
+      last_respondent: "I've used it for about a year, mostly on weekdays for commute planning."
     expected_output:
       action: scripted
 
   - name: first_turn_open_scripted
     inputs:
       scripted_questions:
-        - To start, can you tell me a bit about yourself?
-        - How do you currently use the product?
-        - What would you change about it?
+        - To start, can you tell me a bit about yourself and your role?
+        - How long has your team been using the product?
+        - How do you currently use it day-to-day?
       prior_turns: []
       probes: []
       last_respondent: "Hi, yeah — ready when you are."
@@ -116,13 +216,16 @@ cases:
   - name: detailed_answer_no_probe_go_scripted
     inputs:
       scripted_questions:
+        - Tell me about your role.
         - How often do you use it?
         - What else have you tried?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a software engineer at a startup. We're a team of six."}
         - {speaker: interviewer, text: "How often do you use it?", action: scripted}
-        - {speaker: respondent, text: "Most mornings, sometimes evenings when I'm planning a longer trip. Maybe 5 or 6 times a week."}
+        - {speaker: respondent, text: "Most mornings, sometimes evenings when I'm planning a longer trip. Maybe five or six times a week."}
       probes: []
-      last_respondent: "Yeah probably five or six times a week on average."
+      last_respondent: "Most mornings, sometimes evenings when I'm planning a longer trip. Maybe five or six times a week."
     expected_output:
       action: scripted
 
@@ -132,10 +235,12 @@ cases:
         - What would make you recommend it?
         - What's the biggest frustration?
       prior_turns:
-        - {speaker: interviewer, text: "Earlier you mentioned trust — what broke it?", action: probe}
-        - {speaker: respondent, text: "The rerouting got me lost one night. I was late for dinner."}
+        - {speaker: interviewer, text: "Tell me about your role.", action: scripted}
+        - {speaker: respondent, text: "I'm a project manager at a consulting firm."}
+        - {speaker: interviewer, text: "Earlier you mentioned something felt off with the routing — what happened?", action: probe}
+        - {speaker: respondent, text: "The rerouting got me lost one night. I was late for a client dinner. But it's been fine since the update."}
       probes: []
-      last_respondent: "But I mean, it's fine now."
+      last_respondent: "The rerouting got me lost one night. I was late for a client dinner. But it's been fine since the update."
     expected_output:
       action: scripted
 
@@ -145,10 +250,12 @@ cases:
         - What would you change about it?
         - Who else might benefit from it?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role.", action: scripted}
+        - {speaker: respondent, text: "I'm a designer at a product agency. Team of four."}
         - {speaker: interviewer, text: "What would you change about it?", action: scripted}
         - {speaker: respondent, text: "The onboarding. It took me three attempts to finish signup because the email verification kept expiring."}
       probes: []
-      last_respondent: "Yeah, the email verification is the main thing."
+      last_respondent: "The onboarding. It took me three attempts to finish signup because the email verification kept expiring."
     expected_output:
       action: scripted
 
@@ -157,10 +264,14 @@ cases:
   - name: ambiguous_fine_i_guess
     inputs:
       scripted_questions:
+        - Tell me about your role.
         - How do you find the pricing?
         - What would you change?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a founder. Small team — three of us."}
         - {speaker: interviewer, text: "How do you find the pricing?", action: scripted}
+        - {speaker: respondent, text: "It's... fine I guess? kind of."}
       probes: []
       last_respondent: "It's... fine I guess? kind of."
     expected_output:
@@ -169,10 +280,14 @@ cases:
   - name: one_word_vague
     inputs:
       scripted_questions:
+        - Tell me about your role.
         - How do you feel about the recent update?
         - What would you change?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I work in finance at a mid-size company. I use it personally, not for work."}
         - {speaker: interviewer, text: "How do you feel about the recent update?", action: scripted}
+        - {speaker: respondent, text: "Mixed."}
       probes: []
       last_respondent: "Mixed."
     expected_output:
@@ -181,9 +296,13 @@ cases:
   - name: noncommittal_maybe
     inputs:
       scripted_questions:
-        - Would you recommend it to a friend?
+        - Tell me about your role.
+        - Would you recommend it to a colleague?
       prior_turns:
-        - {speaker: interviewer, text: "Would you recommend it to a friend?", action: scripted}
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm an account executive at a SaaS company. Been there two years."}
+        - {speaker: interviewer, text: "Would you recommend it to a colleague?", action: scripted}
+        - {speaker: respondent, text: "Maybe."}
       probes: []
       last_respondent: "Maybe."
     expected_output:
@@ -197,7 +316,7 @@ cases:
         - Any final thoughts?
       prior_turns:
         - {speaker: interviewer, text: "Any final thoughts?", action: scripted}
-        - {speaker: respondent, text: "No, I think that covers it. I should get going."}
+        - {speaker: respondent, text: "I really need to run, sorry."}
       probes: []
       last_respondent: "I really need to run, sorry."
     expected_output:
@@ -208,10 +327,12 @@ cases:
       scripted_questions:
         - What would you change?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role.", action: scripted}
+        - {speaker: respondent, text: "I'm a solo consultant. I use it for personal productivity."}
         - {speaker: interviewer, text: "What would you change?", action: scripted}
-        - {speaker: respondent, text: "Honestly nothing major — it works for me."}
+        - {speaker: respondent, text: "Honestly nothing major — it works for me. That's really all I've got."}
       probes: []
-      last_respondent: "Yeah, that's really all I've got."
+      last_respondent: "Honestly nothing major — it works for me. That's really all I've got."
     expected_output:
       action: wrap_up
 
@@ -220,8 +341,10 @@ cases:
       scripted_questions:
         - Who else might benefit?
       prior_turns:
-        - {speaker: interviewer, text: "Who else might benefit?", action: scripted}
-        - {speaker: respondent, text: "My sister, probably — she commutes further."}
+        - {speaker: interviewer, text: "Tell me about your role.", action: scripted}
+        - {speaker: respondent, text: "I'm an engineer lead at a startup."}
+        - {speaker: interviewer, text: "Who else at your company might benefit from it?", action: scripted}
+        - {speaker: respondent, text: "Hey — I've got a meeting in like one minute, I have to hop off."}
       probes: []
       last_respondent: "Hey — I've got a meeting in like one minute, I have to hop off."
     expected_output:
@@ -235,10 +358,12 @@ cases:
         - What features do you use most?
         - What would you change?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a marketing manager. I use the route planner for client visits."}
         - {speaker: interviewer, text: "What features do you use most?", action: scripted}
         - {speaker: respondent, text: "Mostly the route planner. Oh, and my dog Biscuit hates the new update sound."}
         - {speaker: interviewer, text: "Got it — what is it about the route planner you find most useful?", action: probe}
-        - {speaker: respondent, text: "Biscuit is a border collie, by the way. He's five. I got him from a shelter in Oakland."}
+        - {speaker: respondent, text: "They had this whole adoption event — I was only there for coffee but then I saw him and it was all over."}
       probes: []
       last_respondent: "They had this whole adoption event — I was only there for coffee but then I saw him and it was all over."
     expected_output:
@@ -250,8 +375,10 @@ cases:
         - What would make you pay more?
         - Who else might benefit?
       prior_turns:
-        - {speaker: interviewer, text: "What would make you pay more?", action: scripted}
-        - {speaker: respondent, text: "Honestly? With the economy the way it is, nobody's paying more for anything."}
+        - {speaker: interviewer, text: "Tell me about your role.", action: scripted}
+        - {speaker: respondent, text: "I run a small bakery. Use it for delivery routing."}
+        - {speaker: interviewer, text: "What would make you pay more for the product?", action: scripted}
+        - {speaker: respondent, text: "And don't get me started on what the current administration is doing to small businesses — it's absolutely outrageous, let me tell you about my cousin's bakery..."}
       probes: []
       last_respondent: "And don't get me started on what the current administration is doing to small businesses — it's absolutely outrageous, let me tell you about my cousin's bakery..."
     expected_output:
@@ -265,7 +392,10 @@ cases:
         - How do you currently use the product?
         - What would you change about it?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I work in ops at a manufacturing company."}
         - {speaker: interviewer, text: "How do you currently use the product?", action: scripted}
+        - {speaker: respondent, text: "[silence]"}
       probes: []
       last_respondent: "[silence]"
     expected_output:
@@ -277,68 +407,133 @@ cases:
         - What do you value most about it?
         - Has anything frustrated you?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a developer at a fintech company."}
         - {speaker: interviewer, text: "What do you value most about it?", action: scripted}
+        - {speaker: respondent, text: "Um... uh... hmm."}
       probes: []
       last_respondent: "Um... uh... hmm."
     expected_output:
       action: clarify
 
-  # --- probe (investor-relevant triggers) -----------------------------------
+  # --- probe (investor-relevant triggers, with analyst lag) -----------------
 
   - name: roi_quantification_probe
+    # Signal: "saves us a ton of time and money" (turn 6)
+    # Analyst ran after scripted cursor advanced; probe arrived ~turn 8
+    # Turns 7-10: interviewer moved to feature/frustration thread
     inputs:
       scripted_questions:
+        - Tell me about your role.
+        - How long have you been using it?
+        - What keeps you coming back?
         - What would you change about it?
         - Would you recommend it?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm VP of Sales at a Series A company. Team of fifteen."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About ten months. We rolled it out after a rough Q1."}
         - {speaker: interviewer, text: "What keeps you coming back?", action: scripted}
         - {speaker: respondent, text: "It saves us a ton of time and money, honestly."}
+        - {speaker: interviewer, text: "What would you change about it?", action: scripted}
+        - {speaker: respondent, text: "The mobile app is pretty clunky. My reps complain about it constantly."}
+        - {speaker: interviewer, text: "How likely would you be to recommend it to a colleague?", action: scripted}
+        - {speaker: respondent, text: "Probably an eight. The core product is solid, just the mobile needs work."}
       probes:
-        - {question: "You mentioned saving time and money — can you put a rough number on that?", priority: 1, rationale: "ROI quantification is a key investor signal; the claim is unsubstantiated."}
-      last_respondent: "Yeah, we've saved a lot. Hard to put a number on it."
+        - {question: "A few minutes ago you mentioned it saves time and money — can you put a rough number on that?", priority: 1, rationale: "ROI quantification is a key investor signal; the claim was made but not substantiated."}
+      last_respondent: "Probably an eight. The core product is solid, just the mobile needs work."
     expected_output:
       action: probe
+      probe_source: analyst
 
   - name: competitor_mention_probe
+    # Signal: "evaluated Salesforce, thirty-day trial, too expensive" (turn 6)
+    # Analyst ran; probe arrived ~turn 9
+    # Turns 7-10: interviewer moved to workflow impact thread
     inputs:
       scripted_questions:
-        - What would make you switch?
+        - Tell me about your role.
+        - How long have you been using it?
+        - Have you tried alternatives?
+        - What's been the biggest impact?
+        - What would make you switch away?
         - Any final thoughts?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a CTO at a fifty-person company. We run most of our ops on SaaS tools."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About fourteen months. We renewed once already."}
         - {speaker: interviewer, text: "Have you tried alternatives?", action: scripted}
-        - {speaker: respondent, text: "We evaluated Salesforce but it was way overkill for our team size."}
+        - {speaker: respondent, text: "We evaluated Salesforce but it was way overkill for our team size. Did a thirty-day trial but the implementation cost was too high."}
+        - {speaker: interviewer, text: "What's been the biggest impact for your team?", action: scripted}
+        - {speaker: respondent, text: "Visibility. Our execs can now pull data themselves instead of asking my team."}
+        - {speaker: interviewer, text: "What would make you switch away from it?", action: scripted}
+        - {speaker: respondent, text: "If they raised prices significantly, or if a better-integrated option came along."}
       probes:
-        - {question: "When you evaluated Salesforce, what specific capabilities did you compare?", priority: 1, rationale: "Named competitor evaluation is a strong buying-behavior signal worth unpacking."}
-      last_respondent: "We did a 30-day trial but the implementation cost was too high."
+        - {question: "Earlier you mentioned the Salesforce trial — when you were comparing them, what specific capabilities were you looking at?", priority: 1, rationale: "Named competitor evaluation surfaces differentiation and switching cost."}
+      last_respondent: "If they raised prices significantly, or if a better-integrated option came along."
     expected_output:
       action: probe
+      probe_source: analyst
 
   - name: expansion_signal_probe
+    # Signal: "thinking about rolling it out company-wide, SSO is the blocker" (turn 6)
+    # Analyst ran; probe arrived ~turn 9
+    # Turns 7-10: interviewer continued with satisfaction/frustration thread
     inputs:
       scripted_questions:
-        - What would make you use it more?
+        - Tell me about your role.
+        - How long have you been using it?
+        - How is adoption across your team?
+        - What would you change about it?
         - Who else might benefit?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm the head of operations at a two-hundred-person company."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About seven months. Started as a small pilot."}
         - {speaker: interviewer, text: "How is adoption across your team?", action: scripted}
-        - {speaker: respondent, text: "Just our small ops team right now, but I've been thinking about rolling it out to the whole company."}
+        - {speaker: respondent, text: "Just our small ops team right now, but I've been thinking about rolling it out to the whole company. If the enterprise tier had better SSO support, I'd push for it tomorrow."}
+        - {speaker: interviewer, text: "What would you change about it beyond the SSO?", action: scripted}
+        - {speaker: respondent, text: "The audit logging is thin. Our security team flagged it during the review."}
+        - {speaker: interviewer, text: "Who else at the company do you think would benefit?", action: scripted}
+        - {speaker: respondent, text: "Finance and HR could both use it. They're still on spreadsheets for a lot of this stuff."}
       probes:
-        - {question: "What would need to be true for you to roll it out company-wide?", priority: 1, rationale: "Expansion intent is a key signal; unpack the blocker or trigger."}
-      last_respondent: "If the enterprise tier had better SSO support, I'd push for it tomorrow."
+        - {question: "You mentioned wanting to roll it out company-wide and SSO being the blocker — is that an IT requirement or a personal preference?", priority: 1, rationale: "SSO as a blocker to a 200-person rollout is a high-priority product signal; understanding whether it's IT-mandated or optional changes the urgency."}
+      last_respondent: "Finance and HR could both use it. They're still on spreadsheets for a lot of this stuff."
     expected_output:
       action: probe
+      probe_source: analyst
 
   - name: low_rating_probe
+    # Signal: "four out of ten" NPS (turn 6)
+    # Analyst ran; probe arrived ~turn 9
+    # Turns 7-10: interviewer moved to specific frustrations thread
     inputs:
       scripted_questions:
+        - Tell me about your role.
+        - How long have you been using it?
+        - On a scale of 1 to 10, how likely are you to recommend this?
+        - What's the main thing holding back that score?
         - Any other thoughts?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a customer success manager at a mid-market SaaS company."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About five months. We're still in the trial-to-paid conversion window."}
         - {speaker: interviewer, text: "On a scale of 1 to 10, how likely are you to recommend this to a colleague?", action: scripted}
-        - {speaker: respondent, text: "Probably a 4."}
+        - {speaker: respondent, text: "Four out of ten. Maybe a five on a good day."}
+        - {speaker: interviewer, text: "What's the main thing holding that score back?", action: scripted}
+        - {speaker: respondent, text: "The onboarding was painful. We spent three weeks just getting our data imported correctly."}
+        - {speaker: interviewer, text: "Is that something you'd expect to improve over time, or is it a persistent issue?", action: probe}
+        - {speaker: respondent, text: "I hope it gets better. Right now it just adds friction when we bring on new team members."}
       probes:
-        - {question: "What would need to change for that to be a 7 or 8?", priority: 1, rationale: "Low NPS is a high-priority signal; the gap question surfaces concrete blockers."}
-      last_respondent: "Yeah, 4 out of 10. Maybe a 5 on a good day."
+        - {question: "Going back to that four out of ten — what would need to change for it to be a seven or eight?", priority: 1, rationale: "Low NPS was stated three turns ago; the gap question hasn't been asked yet and surfaces what would move the needle."}
+      last_respondent: "I hope it gets better. Right now it just adds friction when we bring on new team members."
     expected_output:
       action: probe
+      probe_source: analyst
 
   # --- skip_scripted (scripted topic already covered organically) ----------
 
@@ -348,9 +543,213 @@ cases:
         - Would you recommend it to a colleague?
         - Any final thoughts?
       prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm an engineering manager at a product company."}
         - {speaker: interviewer, text: "What keeps you coming back?", action: scripted}
-        - {speaker: respondent, text: "Honestly the fact that I've already recommended it to six people on my team and they all use it daily."}
+        - {speaker: respondent, text: "Honestly the fact that I've already recommended it to six people on my team and they all use it daily. I'm basically the unofficial product evangelist for it in our company."}
       probes: []
-      last_respondent: "Yeah, I'm basically the unofficial product evangelist for it in our company."
+      last_respondent: "Honestly the fact that I've already recommended it to six people on my team and they all use it daily. I'm basically the unofficial product evangelist for it in our company."
     expected_output:
       action: skip_scripted
+
+  # --- skip_scripted + probe available (probe should win after skipping) ----
+
+  - name: skip_scripted_then_probe
+    inputs:
+      scripted_questions:
+        - Have you recommended this to anyone?
+        - Any final thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a team lead at a consulting firm. We use it for project tracking."}
+        - {speaker: interviewer, text: "How has your team taken to the product?", action: scripted}
+        - {speaker: respondent, text: "Everyone uses it — I recommended it to about eight people and they all adopted it immediately. Yeah, basically the whole team is on it now."}
+      probes:
+        - {question: "You mentioned eight people adopted it immediately — how long ago was that and was it organic or did you run a formal rollout?", priority: 2, rationale: "Word-of-mouth velocity and rollout method are strong growth signals."}
+      last_respondent: "Everyone uses it — I recommended it to about eight people and they all adopted it immediately. Yeah, basically the whole team is on it now."
+    expected_output:
+      action: skip_scripted
+
+  # --- spontaneous interviewer probes (probes: [], but LLM should self-generate) ---
+  # These test Step 5 in the interviewer prompt: IMMEDIATE FOLLOW-UP on investor
+  # signal triggers without any analyst probe in the queue.
+
+  - name: spontaneous_churn_signal_probe
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - How long have you been using it?
+        - What features do you use most?
+        - Would you recommend it?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a RevOps lead at a Series B company. Team of eight."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About two years, though we almost didn't renew last quarter. We came really close to cancelling, honestly."}
+      probes: []
+      last_respondent: "About two years, though we almost didn't renew last quarter. We came really close to cancelling, honestly."
+    expected_output:
+      action: probe
+      probe_source: interviewer
+
+  - name: spontaneous_roi_claim_probe
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - What's been the biggest impact on your workflow?
+        - What would make you use it more?
+        - Any final thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a head of finance at a growth-stage startup."}
+        - {speaker: interviewer, text: "What's been the biggest impact on your workflow?", action: scripted}
+        - {speaker: respondent, text: "Yeah the time savings are massive — it used to take us half a day, now it's like an hour. We've probably cut our reporting time by sixty or seventy percent."}
+      probes: []
+      last_respondent: "Yeah the time savings are massive — it used to take us half a day, now it's like an hour. We've probably cut our reporting time by sixty or seventy percent."
+    expected_output:
+      action: probe
+      probe_source: interviewer
+
+  - name: spontaneous_ai_trust_probe
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - How do you use the AI features day-to-day?
+        - What would you change about it?
+        - How do you see your usage evolving?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a senior analyst at a consultancy. I produce a lot of client-facing reports."}
+        - {speaker: interviewer, text: "How do you use the AI features day-to-day?", action: scripted}
+        - {speaker: respondent, text: "I don't fully trust it yet — I verify everything important. I use them, but I always double-check the outputs before I share anything."}
+      probes: []
+      last_respondent: "I don't fully trust it yet — I verify everything important. I use them, but I always double-check the outputs before I share anything."
+    expected_output:
+      action: probe
+      probe_source: interviewer
+
+  - name: spontaneous_budget_path_probe
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - How did the buying process work on your end?
+        - How does the pricing fit your budget?
+        - What would make you expand usage?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a director of engineering at a hundred-person company."}
+        - {speaker: interviewer, text: "How did the buying process work on your end?", action: scripted}
+        - {speaker: respondent, text: "Yeah it was a longer process than expected, but our VP signed off eventually. I had to get VP approval to get it through — it took about three months."}
+      probes: []
+      last_respondent: "Yeah it was a longer process than expected, but our VP signed off eventually. I had to get VP approval to get it through — it took about three months."
+    expected_output:
+      action: probe
+      probe_source: interviewer
+
+  - name: spontaneous_competitor_name_drop_probe
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - Have you looked at any alternatives recently?
+        - What features matter most to you?
+        - Any final thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a growth lead at a B2B SaaS company. We're about forty people."}
+        - {speaker: interviewer, text: "Have you looked at any alternatives recently?", action: scripted}
+        - {speaker: respondent, text: "Our team is in the middle of a HubSpot trial as we speak. We're actively evaluating it right now, actually."}
+      probes: []
+      last_respondent: "Our team is in the middle of a HubSpot trial as we speak. We're actively evaluating it right now, actually."
+    expected_output:
+      action: probe
+      probe_source: interviewer
+
+  - name: spontaneous_rollout_blocker_probe
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - How broadly is the product being used at your company?
+        - Who else might benefit from it?
+        - Any final thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm the IT director at a two-hundred-person manufacturing company."}
+        - {speaker: interviewer, text: "How broadly is the product being used at your company?", action: scripted}
+        - {speaker: respondent, text: "It's still mostly just the five of us in the pilot, twelve months in. We bought it but we haven't really rolled it out beyond the pilot team."}
+      probes: []
+      last_respondent: "It's still mostly just the five of us in the pilot, twelve months in. We bought it but we haven't really rolled it out beyond the pilot team."
+    expected_output:
+      action: probe
+      probe_source: interviewer
+
+  # --- wrap_up (scripted queue exhausted, no probes remaining) -------------
+
+  - name: all_scripted_done_no_probes_wrap_up
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - How do you currently use the product?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm an analyst at a marketing agency."}
+        - {speaker: interviewer, text: "How do you currently use the product?", action: scripted}
+        - {speaker: respondent, text: "Mostly for pipeline reporting — it saves a lot of time."}
+        - {speaker: interviewer, text: "Is there anything else on your mind before we wrap up?", action: scripted}
+        - {speaker: respondent, text: "No, that's everything from my end."}
+      probes: []
+      last_respondent: "No, that's everything from my end."
+    expected_output:
+      action: wrap_up
+
+  - name: scripted_exhausted_respondent_satisfied
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - What would you change?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a founder, solo for now."}
+        - {speaker: interviewer, text: "What would you change about the product?", action: scripted}
+        - {speaker: respondent, text: "Honestly not much — it does what I need."}
+        - {speaker: interviewer, text: "Is there anything else on your mind before we wrap up?", action: scripted}
+        - {speaker: respondent, text: "Nope, I think we're done. This was helpful."}
+      probes: []
+      last_respondent: "Nope, I think we're done. This was helpful."
+    expected_output:
+      action: wrap_up
+
+  # --- multi-probe priority selection (model must pick highest priority) ---
+  # Two analyst probes waiting: priority-1 (seat expansion driver) from 4 turns ago,
+  # priority-2 (API adoption) from same analyst run.
+  # Conversation has continued; last_respondent is on a different thread.
+
+  - name: priority_1_beats_priority_2_probe
+    # Signal: "doubled seats, using the API now" (turn 6)
+    # Analyst ran; two probes arrived ~turn 8
+    # Turns 7-10: interviewer moved to frustrations/wishlist thread
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - How long have you been using it?
+        - How has your usage changed over the last six months?
+        - What do you wish it did better?
+        - What would make you switch to a competitor?
+        - Any other thoughts?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm the head of engineering at a Series C company. About sixty engineers."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About eighteen months. We were an early adopter."}
+        - {speaker: interviewer, text: "How has your usage changed over the last six months?", action: scripted}
+        - {speaker: respondent, text: "It's grown a lot — we've doubled the number of seats, and we're using the API now too. The API integration was a big unlock for us."}
+        - {speaker: interviewer, text: "What do you wish it did better?", action: scripted}
+        - {speaker: respondent, text: "The permissions model is too coarse. We can't give read-only access at the project level."}
+        - {speaker: interviewer, text: "Is that blocking anything specific for you right now?", action: probe}
+        - {speaker: respondent, text: "Yeah, we can't give contractors access without giving them too much visibility into internal roadmaps."}
+      probes:
+        - {question: "Earlier you mentioned doubling seats — was that driven by one team or organic across the org?", priority: 1, rationale: "Seat expansion driver is a direct growth signal; organic vs. top-down matters for investor narrative."}
+        - {question: "What made you start using the API rather than just the UI?", priority: 2, rationale: "API adoption suggests deeper technical integration and higher switching cost."}
+      last_respondent: "Yeah, we can't give contractors access without giving them too much visibility into internal roadmaps."
+    expected_output:
+      action: probe
+      probe_source: analyst

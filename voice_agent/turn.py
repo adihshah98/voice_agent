@@ -298,6 +298,7 @@ class TurnPipeline:
                             speaker="interviewer",
                             text=reply.utterance,
                             action=reply.action,
+                            probe_source=reply.probe_source,
                             latency_ms=self._llm_latency_ms,
                             tokens_input=u.input_tokens if u else None,
                             tokens_output=u.output_tokens if u else None,

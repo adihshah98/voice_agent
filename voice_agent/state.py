@@ -88,6 +88,7 @@ class Turn(SQLModel, table=True):
     speaker: str  # "interviewer" | "respondent"
     text: str
     action: Optional[str] = None  # scripted|skip_scripted|probe|clarify|off_topic|wrap_up
+    probe_source: Optional[str] = None  # "analyst" | "interviewer" | None (non-probe turns)
     reasoning: Optional[str] = None
     latency_ms: Optional[int] = None
     # Interviewer LLM only (null for respondent rows, or if timeout/fallback had no usage)
@@ -204,6 +205,14 @@ def init_db(engine) -> None:
             conn.execute(text("ALTER TABLE calls ADD COLUMN dial_status VARCHAR"))
         if "dial_error" not in cols:
             conn.execute(text("ALTER TABLE calls ADD COLUMN dial_error VARCHAR"))
+
+    try:
+        turn_cols = {c["name"] for c in inspect(engine).get_columns("turns")}
+    except Exception:
+        return
+    with engine.begin() as conn:
+        if "probe_source" not in turn_cols:
+            conn.execute(text("ALTER TABLE turns ADD COLUMN probe_source VARCHAR"))
 
     try:
         sr_cols = {c["name"] for c in inspect(engine).get_columns("synthesis_reports")}

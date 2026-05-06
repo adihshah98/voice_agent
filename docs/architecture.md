@@ -443,7 +443,7 @@ Thresholds: CallCompletes 100% | CoveredAllScripted ≥75% | CaughtContradiction
 | ------------------------- | ----------------------------------------------------------------------------- |
 | `interviewer_turns.yaml`  | 18 single-turn cases (probe×5, scripted×5, clarify×3, wrap_up×3, off_topic×2) |
 | `analyst_probes.yaml`     | 6 transcript cases for analyst quality                                        |
-| `investor_questions.yaml` | 10-question canonical scripted arc with `[product]` token                     |
+| `data/investor_questions.yaml` | 10-question canonical scripted arc with `[product]` token (not an eval fixture — lives in `data/`) |
 | `personas.yaml`           | 6 respondent personas for trajectory evals                                    |
 
 
@@ -453,7 +453,7 @@ LLM judge model: `claude-opus-4-6` (defined in `evals/evaluators.py`).
 
 ## Local Development
 
-**REPL mode** (`scripts/play.py`): Drives a full call in-process — no server, no Vapi. Loads questions from `investor_questions.yaml`, maintains message history, calls `run_speech_turn()` directly; `TurnPipeline.commit()` writes `Turn` rows to the DB like production. Shares the same `voice_agent.db` as the server.
+**REPL mode** (`scripts/play.py`): Drives a full call in-process — no server, no Vapi. Loads questions from `data/investor_questions.yaml`, maintains message history, calls `run_speech_turn()` directly; `TurnPipeline.commit()` writes `Turn` rows to the DB like production. Shares the same `voice_agent.db` as the server.
 
 **Phone mode** (`scripts/play.py --phone +1...`): Requires the server running. POSTs to `/calls/start`, then Vapi handles everything.
 

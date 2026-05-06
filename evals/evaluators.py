@@ -39,7 +39,8 @@ def _clean_utterance(utterance: str) -> str:
 class ActionMatches(
     Evaluator[InterviewerCaseInputs, InterviewerOutput, None]
 ):
-    """Exact match on the `action` field — the headline Tier 1 score."""
+    """Exact match on `action`; also checks `probe_source` when the expected
+    output specifies it (distinguishes analyst vs. interviewer-spontaneous probes)."""
 
     def evaluate(
         self,
@@ -47,7 +48,14 @@ class ActionMatches(
     ) -> bool:
         if ctx.expected_output is None:
             return False
-        return ctx.output.action == ctx.expected_output.action
+        if ctx.output.action != ctx.expected_output.action:
+            return False
+        if (
+            ctx.expected_output.probe_source is not None
+            and ctx.output.probe_source != ctx.expected_output.probe_source
+        ):
+            return False
+        return True
 
 
 @dataclass
@@ -114,6 +122,48 @@ def no_leading_questions_judge() -> LLMJudge:
         include_input=True,
         score=False,
         assertion={"evaluation_name": "non_leading", "include_reason": True},
+    )
+
+
+def response_relevance_judge() -> LLMJudge:
+    """Pass/fail: is the utterance topically on-point given the conversation context?
+
+    Catches cases where action is correct but the spoken content is off — e.g.
+    the model picks `probe` but asks about the wrong thing, or picks `wrap_up`
+    but says something that invites more conversation.
+    """
+    return LLMJudge(
+        rubric=(
+            "You are grading a single spoken response from an investor-style "
+            "B2B SaaS market research interviewer on a 30-minute customer call.\n\n"
+            "You are given:\n"
+            "  - The full conversation so far (prior_turns + last_respondent)\n"
+            "  - The interviewer's chosen action and utterance\n\n"
+            "PASS if the utterance is TOPICALLY APPROPRIATE: it addresses what "
+            "the respondent just said, follows naturally from the conversation, "
+            "and pursues a goal that makes sense at this moment in the interview.\n\n"
+            "FAIL if:\n"
+            "  - The utterance asks about or references something the respondent "
+            "never mentioned and that doesn't flow from the conversation\n"
+            "  - The utterance is a wrap-up but the conversation has clear open "
+            "threads that haven't been addressed\n"
+            "  - The utterance completely ignores a striking thing the respondent "
+            "just said (e.g. a low NPS score, a named competitor, a churn signal) "
+            "and pivots to an unrelated topic\n"
+            "  - For action=probe: the question probes something unrelated to "
+            "what the respondent just said or the recent conversation\n"
+            "  - For action=clarify: the clarification doesn't address the "
+            "specific ambiguity in the respondent's last utterance\n"
+            "  - For action=off_topic: the redirect is abrupt or rude rather "
+            "than warm and professional\n\n"
+            "Do NOT fail on warmth, leading-ness, or whether it's a single "
+            "question — those are graded separately. Grade only topical relevance "
+            "and conversational fit."
+        ),
+        model=_JUDGE_MODEL,
+        include_input=True,
+        score=False,
+        assertion={"evaluation_name": "response_relevant", "include_reason": True},
     )
 
 

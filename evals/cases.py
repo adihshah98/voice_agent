@@ -49,7 +49,7 @@ def load_cases(
 ) -> list[Case[InterviewerCaseInputs, InterviewerOutput, None]]:
     """Load YAML cases. Expected output is coerced into `InterviewerOutput`
     with empty `utterance`/`reasoning` so that the task/expected types match.
-    Evaluators only read `.action` off the expected object."""
+    Evaluators read `.action` and optionally `.probe_source` off the expected object."""
     raw = yaml.safe_load(Path(path).read_text())
     cases: list[Case[InterviewerCaseInputs, InterviewerOutput, None]] = []
     for entry in raw["cases"]:
@@ -62,6 +62,7 @@ def load_cases(
                     utterance=exp.get("utterance", ""),
                     action=exp["action"],
                     reasoning=exp.get("reasoning", ""),
+                    probe_source=exp.get("probe_source"),
                 ),
             )
         )

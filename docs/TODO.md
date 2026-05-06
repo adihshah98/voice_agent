@@ -20,12 +20,13 @@
       - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
       - When handling a probe from earlier, it should say like you said earlier
   - Versioned datasets/eval runs: 
-    - Where are these saved, how to view & compare nicely, is this best practice? Hosted vs Local? Why print?
-  - Online Evals: See if working fine
+    - How to view & compare nicely
+  - Online Evals: 
+    - Only returning that probes were generated - we should add more
 - Infra - Prod Level
   - Render Deployment 
   - Webhook correctness (auth/idempotency)
-  - Live DB + Alembic
+  - Live DB + Alembic (Remove all alter tables)
   - Rate limiting
 - Multi-tenant 
   - See, eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in mind

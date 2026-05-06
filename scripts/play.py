@@ -6,7 +6,7 @@ Usage:
     uv run python scripts/play.py "Notion AI"              # substitute [product]
     uv run python scripts/play.py "Notion AI" --phone +14155551234  # live Vapi call
 
-Loads evals/datasets/investor_questions.yaml.
+Loads data/investor_questions.yaml.
 
 Local REPL mode drives the interviewer in-process against the same SQLite DB
 the server uses — no running server required.
@@ -58,11 +58,11 @@ BASE_URL = "http://localhost:8000"
 def _investor_questions_path() -> Path:
     here = Path(__file__).resolve().parent
     for root in [here.parent, *here.parents]:
-        candidate = root / "evals" / "datasets" / "investor_questions.yaml"
+        candidate = root / "data" / "investor_questions.yaml"
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        "evals/datasets/investor_questions.yaml not found. "
+        "data/investor_questions.yaml not found. "
         f"Searched upward from {here}. Run from the voice_agent repo clone."
     )
 
