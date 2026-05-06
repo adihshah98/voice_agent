@@ -7,10 +7,11 @@
 
 ## My questions/Future improvements
 
-- Look at logs to see what was wrong
-- Evals
+
+
+- Evals - We have the base setup for all. We need to go 1 level deeper and se if this is properly targeting what we want
   - For all tiers: See if we are testing appropriate things
-    - Tier 1: Check latest run, some things are failing
+    - Tier 1: 
     - Tier 2 (Analyst)
     - Tier 3: Is this covering enough
       - Make sure it asks everything
@@ -20,7 +21,8 @@
       - Make sure it deals with non-happy path behavior
       - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
       - When handling a probe from earlier, it should say like you said earlier
-  - Versioned datasets/eval runs: Where are these saved, how to view nicely, is this best practice? Hosted vs Local? Why print? 
+  - Versioned datasets/eval runs: 
+    - Where are these saved, how to view & compare nicely, is this best practice? Hosted vs Local? Why print? 
   - Online Evals: See if working fine
 - Infra - Prod Level
   - Render Deployment 
@@ -28,10 +30,11 @@
   - Live DB + Alembic
   - Rate limiting
 - Multi-tenant 
-  - See, eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in midn
+  - See, eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in mind
     - Tell it it is diligencing which product & some knowledge abt it
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default
+    - Synthesis
   - Multi-tenant auth
 
 ---

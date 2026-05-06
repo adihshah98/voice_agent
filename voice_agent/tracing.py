@@ -17,7 +17,13 @@ from importlib.util import find_spec
 from typing import Any, Iterator, Optional
 
 import logfire
-from pydantic_evals.online import configure as configure_online_evals
+from pydantic_evals.online import (
+    configure as configure_online_evals,
+    EvaluationResult,
+    EvaluatorContext,
+    EvaluatorFailure,
+)
+from typing import Sequence
 from voice_agent.config import settings
 
 # Logfire.configure and pydantic/httpx are one-time; FastAPI and SQLAlchemy
@@ -85,7 +91,7 @@ def init_tracing(
         if find_spec("httpx") is not None:
             logfire.instrument_httpx()
 
-        configure_online_evals(default_sample_rate=1.0)
+        configure_online_evals(default_sample_rate=1.0, emit_otel_events=True)
         _logfire_core = True
 
     if not _fastapi_instrumented and app is not None and find_spec("fastapi") is not None:

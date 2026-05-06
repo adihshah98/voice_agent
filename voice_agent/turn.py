@@ -28,14 +28,14 @@ from voice_agent.models import InterviewerDeps, InterviewerOutput
 # starts on the filler without waiting for more streamed characters from the LLM.
 # Lowercase + trailing comma so they flow into the LLM's opener ("Mm, got it, tell me more...")
 _FILLERS = [
-    "Mm-hm...",
-    "Uh-huh...",
-    "Yeah...",
-    "Mhm...",
-    "Right...",
-    "Okay..",
-    "Gotcha... ",
-    "Got it...",
+    "Mm-hm,",
+    "Uh-huh,",
+    "Yeah,",
+    "Mhm,",
+    "Right,",
+    "Okay,",
+    "Gotcha, ",
+    "Got it,",
     "Good to know,"
 ]
 _recent_fillers: dict[str, list[str]] = {}  # call_id → last 2 fillers used
@@ -222,7 +222,8 @@ class TurnPipeline:
             ttft_ms=self._first_token_ms,
             fallback=self._reply.is_fallback,
             filler_injected=self._filler_injected,
-            probe_source="analyst" if self._reply.probe_id_used else "interviewer" if self._reply.action == "probe" else None,
+            probe_source=self._reply.probe_source,
+            has_pending_probes=stream._prepared.has_pending_probes,
             tokens_input=u.input_tokens if u else None,
             tokens_output=u.output_tokens if u else None,
             tokens_cache_read=u.cache_read_tokens if u else None,

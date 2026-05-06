@@ -64,6 +64,7 @@ PROBE_STALENESS_TURNS = 15    # probes older than this many turns are dropped fr
 class PreparedInterviewerTurn:
     prompt_parts: list[str | CachePoint]
     fallback_scripted_question: str | None
+    has_pending_probes: bool = False
 
 
 @dataclass
@@ -148,6 +149,7 @@ def prepare_interviewer_turn(
     return PreparedInterviewerTurn(
         prompt_parts=prompt_parts,
         fallback_scripted_question=reads.next_scripted_question,
+        has_pending_probes=bool(reads.probes),
     )
 
 
@@ -187,6 +189,7 @@ async def prepare_interviewer_turn_concurrent(
     return PreparedInterviewerTurn(
         prompt_parts=prompt_parts,
         fallback_scripted_question=reads.next_scripted_question,
+        has_pending_probes=bool(reads.probes),
     )
 
 
@@ -489,6 +492,7 @@ _META_BARE_RE = re.compile(r"\n(\{.*)", re.DOTALL)  # tag-free fallback: JSON af
 def _parse_streamed_output(
     text: str,
     fallback_scripted_question: str | None = None,  # noqa: ARG001
+    has_pending_probes: bool = False,
 ) -> InterviewerOutput:
     """Parse <utterance>...</utterance> + trailing JSON from a plain-text model response.
 
@@ -536,11 +540,10 @@ def _parse_streamed_output(
         if not isinstance(raw, dict):
             raise ValueError("metadata JSON must be an object")
         meta = InterviewerLLMMeta.model_validate(raw)
-        if meta.action == "probe" and meta.probe_id_used is None:
-            logfire.warning(
-                "interviewer_probe_action_missing_id",
-                utterance_snippet=(utterance or "")[:80],
-            )
+        if meta.action == "probe":
+            probe_source = "analyst" if meta.probe_id_used is not None else "interviewer"
+        else:
+            probe_source = None
         spoken = utterance.strip()
         if not spoken:
             logfire.warning("interviewer_empty_utterance", wire_delimited=wire_delimited)
@@ -549,12 +552,14 @@ def _parse_streamed_output(
                 action="scripted",
                 reasoning="empty utterance from model",
                 probe_id_used=None,
+                probe_source=None,
             )
         return InterviewerOutput(
             utterance=spoken,
             action=meta.action,
             reasoning=meta.reasoning,
             probe_id_used=meta.probe_id_used,
+            probe_source=probe_source,
         )
     except (json.JSONDecodeError, ValueError, ValidationError) as exc:
         logfire.warning(

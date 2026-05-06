@@ -71,6 +71,10 @@ class InterviewerOutput(BaseModel):
         default=None,
         description="The id of the PENDING_PROBE used, if action=probe. Must match exactly.",
     )
+    probe_source: Literal["analyst", "interviewer"] | None = Field(
+        default=None,
+        description="'analyst' when probe_id_used references a PENDING_PROBE; 'interviewer' for spontaneous follow-ups. None when action != probe.",
+    )
     is_fallback: bool = Field(
         default=False,
         description="True when returned by the timeout fallback path, not the LLM.",
