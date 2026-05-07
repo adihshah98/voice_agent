@@ -69,24 +69,58 @@ def load_cases(
     return cases
 
 
+class PriorSnapshotSeed(BaseModel):
+    """Snapshot established before the new transcript turns.
+
+    Used to test incremental analyst behaviour — the analyst should build on
+    the snapshot and not re-probe topics already covered in it.
+    """
+
+    after_turn: int
+    themes: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    surprises: list[str] = Field(default_factory=list)
+    investor_signals: list[str] = Field(default_factory=list)
+    covered_subtopics: list[str] = Field(default_factory=list)
+
+
 class AnalystCaseInputs(BaseModel):
-    """A transcript to feed to the analyst. No expected_output — quality is
-    judged by LLM scorers and deterministic checks, not output matching."""
+    """A transcript to feed to the analyst.
+
+    `expected_topics` are topics that must be surfaced in at least one generated
+    probe (semantic match via LLMJudge). Missing a topic is a coverage failure.
+
+    `prior_snapshot` seeds an `AnalystSnapshot` row before the transcript turns,
+    forcing the analyst into incremental mode (only the turns after the snapshot
+    are treated as new).
+    """
 
     transcript: list[TurnLine]
+    expected_topics: list[str] = Field(default_factory=list)
+    prior_snapshot: Optional[PriorSnapshotSeed] = None
 
 
 def load_analyst_cases(
     path: str | Path,
 ) -> list[Case[AnalystCaseInputs, AnalysisUpdate, None]]:
-    """Load YAML analyst cases. expected_output is always None."""
+    """Load YAML analyst cases. expected_output is always None.
+
+    `expected_topics` and `prior_snapshot` are top-level siblings of `inputs`
+    in the YAML (to keep the transcript block readable), so we merge them into
+    the inputs dict before validation.
+    """
     raw = yaml.safe_load(Path(path).read_text())
     cases: list[Case[AnalystCaseInputs, AnalysisUpdate, None]] = []
     for entry in raw["cases"]:
+        inputs_data = dict(entry["inputs"])
+        if "expected_topics" in entry:
+            inputs_data["expected_topics"] = entry["expected_topics"]
+        if "prior_snapshot" in entry:
+            inputs_data["prior_snapshot"] = entry["prior_snapshot"]
         cases.append(
             Case(
                 name=entry["name"],
-                inputs=AnalystCaseInputs.model_validate(entry["inputs"]),
+                inputs=AnalystCaseInputs.model_validate(inputs_data),
             )
         )
     return cases
@@ -101,6 +135,7 @@ __all__ = [
     "AnalystCaseInputs",
     "InterviewerCaseInputs",
     "InterviewerOutput",
+    "PriorSnapshotSeed",
     "ProbeSeed",
     "TurnLine",
     "get_dataset_version",

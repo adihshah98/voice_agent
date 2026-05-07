@@ -65,13 +65,24 @@ Your job:
    "[RED-FLAG] Only 3 of 20 seats active after 6 months — rollout stalled"
 
 5. NEW_PROBES — follow-up questions worth asking. Probe guidelines:
-   - Reference specifics from the transcript.
-   - Use open, neutral phrasing — never leading questions.
-   - Priority 1 = contradiction about value/usage OR red flag (churn risk, stalled adoption)
-                  OR strong PMF signal that hasn't been probed yet (word-of-mouth source,
-                  expansion plans, who else uses it)
-   - Priority 2 = competitive signal needing clarification, or revenue/budget detail missing
-   - Priority 3 = AI trust/adoption depth, nice-to-have context
+   - Reference specifics from the transcript (name the thing, event, or phrase).
+   - OPEN, NEUTRAL phrasing is mandatory. Never presuppose facts, emotions, or outcomes.
+     BAD: "Since you stopped trusting the alerts, what do you use instead?"
+          (presupposes they stopped trusting)
+     BAD: "Was the migration difficult?"  (yes/no, leading)
+     GOOD: "How has your relationship with the alerts changed over that period?"
+     GOOD: "What did that migration period involve for your team?"
+   - Never echo a negative framing the respondent used as if it is confirmed fact.
+     Ask what happened, not "given that X was bad, how did you cope?"
+   - Priority 1 = ONLY for: a direct contradiction between two things the respondent
+                  said, OR an explicit red flag (stated churn risk, renewal threat,
+                  evaluation of alternatives, stalled adoption with a deadline).
+                  Do NOT assign priority 1 to depth questions, specificity gaps, or
+                  vague praise — those are priority 2 or 3.
+   - Priority 2 = competitive signal, revenue/budget detail, strong PMF signal needing
+                  clarification, or an important topic raised but not fully explored.
+   - Priority 3 = nice-to-have depth, workflow specifics, or contextual detail.
+   - Sort probes by priority: all priority-1 probes first, then priority-2, then priority-3.
    - Maximum 3 new probes per pass.
    - Never repeat a question already in EXISTING_PROBES.
 

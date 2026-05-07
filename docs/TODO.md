@@ -1,19 +1,15 @@
-## Things to watch out for/might break
+## Todo
 
-- **Race condition:** `vapi_call_id` is written to DB *after* `POST /call/phone` returns, but Vapi can fire `assistant.started` before that write commits. In practice the first event is usually `status-update` (`ringing`) which is long enough — but it's fragile.
-- Probe popping
-- Context compression for topics covered
-- Context drift: agent forgets or misinterprets earlier info
-
-## My questions/Future improvements
-
-- Evals - We have the base setup for all. We need to go 1 level deeper and se if this is properly targeting what we want
-  - For all tiers: Run the evals (See if working & fix what is not), Ask if it's prod grade, See if we are testing appropriate things
-    - Tier 1: (Interviewer)
-    - Tier 2 (Analyst)
-    - Tier 3: Is this covering enough
+- Evals
+  - Tier 3: 
+    - Run the evals (See if working & fix what is not)
+    - Ask if it's prod grade
+    - See if we are testing appropriate things
+    - See if it is covering enough
       - Make sure it asks everything
       - Make sure it probes at the correct depth
+      - Context compression for topics covered
+      - Context drift: agent forgets or misinterprets earlier info
       - Make sure it wraps up with everything covered in a set time
       - Make sure it doesn't ask again/get stuck in loops/rabbitholes
       - Make sure it deals with non-happy path behavior
@@ -25,11 +21,10 @@
     - Only returning that probes were generated - we should add more
 - Infra - Prod Level
   - Render Deployment 
-  - Webhook correctness (auth/idempotency)
   - Live DB + Alembic (Remove all alter tables)
   - Rate limiting
 - Multi-tenant 
-  - See, eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in mind
+  - Eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in mind
     - Tell it it is diligencing which product & some knowledge abt it
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default
@@ -39,6 +34,8 @@
 ---
 
 ---
+
+## Future improvements
 
 - Evals
   - Host datasets directly on Logfire (Currently we run it on local and save runs there, now we can host datasets, collab etc. directly on LF)

@@ -13,7 +13,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from pydantic_evals.evaluators import Evaluator, EvaluatorContext, LLMJudge
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_evals.evaluators import Evaluator, EvaluatorContext, EvaluationReason, LLMJudge
 
 from evals.cases import AnalystCaseInputs, InterviewerCaseInputs
 from voice_agent.models import AnalysisUpdate, InterviewerOutput
@@ -39,23 +41,30 @@ def _clean_utterance(utterance: str) -> str:
 class ActionMatches(
     Evaluator[InterviewerCaseInputs, InterviewerOutput, None]
 ):
-    """Exact match on `action`; also checks `probe_source` when the expected
-    output specifies it (distinguishes analyst vs. interviewer-spontaneous probes)."""
+    """Fraction of action criteria met (0.0–1.0).
+
+    Returns a numeric score so the aggregate is the mean pass rate across all
+    runs rather than a hard bool, making it visible as a continuous metric in
+    the Logfire Evals UI.
+
+    Scores 1.0 when action matches (and probe_source matches when specified),
+    0.0 otherwise.
+    """
 
     def evaluate(
         self,
         ctx: EvaluatorContext[InterviewerCaseInputs, InterviewerOutput, None],
-    ) -> bool:
+    ) -> float:
         if ctx.expected_output is None:
-            return False
+            return 0.0
         if ctx.output.action != ctx.expected_output.action:
-            return False
+            return 0.0
         if (
             ctx.expected_output.probe_source is not None
             and ctx.output.probe_source != ctx.expected_output.probe_source
         ):
-            return False
-        return True
+            return 0.0
+        return 1.0
 
 
 @dataclass
@@ -212,6 +221,54 @@ class NoDuplicateProbes(Evaluator[AnalystCaseInputs, AnalysisUpdate, None]):
         return True
 
 
+@dataclass
+class ProbeUrgencyOrdered(Evaluator[AnalystCaseInputs, AnalysisUpdate, None]):
+    """Priority-1 probes must all appear before any priority-2 or priority-3 probe.
+
+    The interviewer works through probes in order, so a priority-1 churn signal
+    buried after three priority-3 depth questions may never be asked.
+    """
+
+    def evaluate(
+        self, ctx: EvaluatorContext[AnalystCaseInputs, AnalysisUpdate, None]
+    ) -> bool:
+        probes = ctx.output.new_probes
+        if len(probes) <= 1:
+            return True
+        seen_lower = False
+        for p in probes:
+            if p.priority > 1:
+                seen_lower = True
+            elif seen_lower:
+                return False
+        return True
+
+
+@dataclass
+class NoReprobeFromSnapshot(Evaluator[AnalystCaseInputs, AnalysisUpdate, None]):
+    """For incremental cases: no probe should ask about topics already in the
+    prior snapshot's covered_subtopics.
+
+    Uses word-Jaccard overlap against each covered subtopic label. Passes when
+    there is no prior snapshot (non-incremental cases are unconstrained).
+    """
+
+    threshold: float = 0.50
+
+    def evaluate(
+        self, ctx: EvaluatorContext[AnalystCaseInputs, AnalysisUpdate, None]
+    ) -> bool:
+        snapshot = ctx.inputs.prior_snapshot
+        if snapshot is None:
+            return True
+        covered = snapshot.covered_subtopics
+        for probe in ctx.output.new_probes:
+            for subtopic in covered:
+                if _jaccard(probe.question, subtopic) > self.threshold:
+                    return False
+        return True
+
+
 def probes_specific_judge() -> LLMJudge:
     """Score 1–5: do probes reference specifics from the transcript?"""
     return LLMJudge(
@@ -261,30 +318,105 @@ def probes_non_leading_judge() -> LLMJudge:
     )
 
 
+class _TopicCoverageJudgement(BaseModel):
+    covered: list[str]
+    missing: list[str]
+    all_covered: bool
+
+
+_TOPIC_COVERAGE_SYSTEM = (
+    "You are a research QA evaluator checking whether analyst-generated probes "
+    "cover a set of required topics.\n\n"
+    "A probe COVERS a topic if a respondent answering that probe would plausibly "
+    "reveal the information the topic describes. The probe does not need to mention "
+    "the topic explicitly — it just needs to be on a path to elicit it.\n\n"
+    "Be generous: if there is a reasonable reading of the probe under which it "
+    "would surface the topic, count it as covered. Only mark a topic missing if "
+    "none of the probes could plausibly lead to that information.\n\n"
+    "Return:\n"
+    "  covered: list of required topics addressed by at least one probe\n"
+    "  missing: list of required topics with no probe that could surface them\n"
+    "  all_covered: true iff missing is empty\n\n"
+    "If required_topics is empty, return all_covered=true with empty lists."
+)
+
+
+def _get_topic_coverage_agent() -> Agent[None, _TopicCoverageJudgement]:
+    return Agent(
+        _JUDGE_MODEL,
+        output_type=_TopicCoverageJudgement,
+        system_prompt=_TOPIC_COVERAGE_SYSTEM,
+    )
+
+
+@dataclass
+class CoversExpectedTopics(Evaluator[AnalystCaseInputs, AnalysisUpdate, None]):
+    """Pass/fail: do the probes collectively surface every expected_topic?
+
+    Uses a dedicated PydanticAI agent with a focused prompt — just the topic
+    list and probe questions, no transcript noise — for reliable semantic matching.
+    Cases with no expected_topics pass unconditionally.
+    """
+
+    async def evaluate(
+        self, ctx: EvaluatorContext[AnalystCaseInputs, AnalysisUpdate, None]
+    ) -> dict:
+        topics = ctx.inputs.expected_topics
+        if not topics:
+            return {"covers_expected_topics": True}
+
+        probes = ctx.output.new_probes if ctx.output else []
+        probe_lines = "\n".join(
+            f"  [{p.priority}] {p.question}" for p in probes
+        ) or "  (no probes generated)"
+
+        topic_lines = "\n".join(f"  - {t}" for t in topics)
+        user_prompt = (
+            f"REQUIRED TOPICS:\n{topic_lines}\n\n"
+            f"PROBES GENERATED:\n{probe_lines}"
+        )
+
+        result = await _get_topic_coverage_agent().run(user_prompt)
+        judgement = result.output
+
+        score = len(judgement.covered) / len(topics)
+        reason = (
+            f"covered: {judgement.covered}; missing: {judgement.missing}"
+            if judgement.missing
+            else f"all {len(topics)} topics covered"
+        )
+        return {"covers_expected_topics": EvaluationReason(value=score, reason=reason)}
+
+
 def priority_calibrated_judge() -> LLMJudge:
-    """Pass/fail: is priority-1 reserved for real contradictions/surprises?"""
+    """Pass/fail: is priority-1 reserved for real contradictions/surprises/red-flags?"""
     return LLMJudge(
         rubric=(
             "You are grading the priority assignments on PROBES produced by a "
             "qualitative research analyst after reading an interview transcript.\n\n"
             "Priority rules:\n"
-            "  Priority 1 = reserved for a REAL contradiction (respondent "
-            "clearly said two conflicting things) or a MAJOR surprise (an "
-            "admission that fundamentally changes interpretation).\n"
-            "  Priority 2 = interesting thread worth exploring if time allows.\n"
-            "  Priority 3 = nice-to-have depth question.\n\n"
-            "PASS if:\n"
-            "  - Priority-1 probes target genuine contradictions or major "
-            "surprises visible in the transcript, AND\n"
-            "  - No priority-1 probe is assigned to a routine follow-up that "
-            "doesn't involve a contradiction or surprise.\n"
+            "  Priority 1 = reserved for:\n"
+            "    - a REAL contradiction (respondent clearly said two conflicting things)\n"
+            "    - a MAJOR surprise (unexpected admission that changes interpretation)\n"
+            "    - a RED FLAG (explicit churn signal, renewal threat, low adoption with "
+            "      stated deadline, alternatives evaluation underway)\n"
+            "  Priority 2 = competitive signal, revenue detail, or strong PMF thread "
+            "needing clarification.\n"
+            "  Priority 3 = nice-to-have depth or context question.\n\n"
+            "PASS if ALL of the following are true:\n"
+            "  1. Every priority-1 probe targets a genuine contradiction, major surprise, "
+            "or red flag that is clearly visible in the transcript.\n"
+            "  2. No priority-1 probe is assigned to a routine depth question that does "
+            "not involve a contradiction, surprise, or red flag.\n"
+            "  3. If the transcript contains NO contradiction, surprise, or red flag, "
+            "then NO priority-1 probes should appear — and if that is the case, PASS.\n\n"
             "FAIL if:\n"
-            "  - A probe is marked priority 1 when the transcript shows no "
-            "real contradiction or surprise, OR\n"
-            "  - A clear contradiction/surprise in the transcript has no "
-            "priority-1 probe assigned to it.\n\n"
-            "The transcript is provided as the input. Judge both directions: "
-            "priority-1 when warranted, and not when unwarranted."
+            "  - A probe is marked priority 1 when the transcript shows no real "
+            "contradiction, surprise, or red flag to justify it.\n\n"
+            "IMPORTANT: Do NOT fail a case simply because a contradiction/surprise has "
+            "no priority-1 probe — the analyst is capped at 3 probes and may have chosen "
+            "not to probe it. Only fail on mis-assignment (priority-1 where it shouldn't be).\n\n"
+            "The transcript is provided as the input."
         ),
         model=_JUDGE_MODEL,
         include_input=True,

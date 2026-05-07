@@ -1,17 +1,22 @@
-version: "2026-05-05.1"
-description: "Added 2 Tier 2 cases: red_flag_low_adoption (IT blocker), pmf_expansion_signal (word-of-mouth + expansion)"
+version: "2026-05-06.1"
+description: "Added 6 new cases: depth signal, emotional signal, churn signal, implementation timeline, strong-like-no-specifics, incremental (snapshot-aware). Added expected_topics to all cases."
 
-# Tier 2 analyst dataset — 8 transcripts covering:
+# Tier 2 analyst dataset — 14 transcripts covering:
 #   - clear contradictions (should generate priority-1 probes)
 #   - specificity signals (named things / events probes must reference)
 #   - clean transcripts (no contradictions → priority 1 should NOT appear)
 #   - surprises (unexpected admissions → priority-1 or priority-2)
 #   - red flags (low adoption + external blocker → priority-1)
 #   - PMF signals (word-of-mouth + expansion intent → priority-1 or priority-2)
+#   - depth signal (workflow mentioned in passing, not explored)
+#   - unresolved emotional signal (rough period, cause never stated)
+#   - churn signal (explicit renewal threat + alternatives evaluation)
+#   - implementation timeline (long rollout, reason unexplained)
+#   - strong like without specifics (vague praise, no concrete detail)
+#   - incremental (prior snapshot present, new signal in latest turns)
 #
-# Each case is a 6–10 turn transcript. No expected_output: quality is judged
-# by LLM scorers (ProbesAreSpecific, ProbesAreNonLeading, PriorityIsCalibrated)
-# and deterministic scorers (HasProbes, NoDuplicateProbes).
+# expected_topics: topics the analyst MUST surface in probes (semantic match,
+# not string match). Missing a topic is a coverage failure.
 
 cases:
 
@@ -28,6 +33,9 @@ cases:
         - {speaker: respondent, text: "Oh yeah, March was a disaster. It rerouted me onto a closed highway three days in a row."}
         - {speaker: interviewer, text: "How did you handle that?"}
         - {speaker: respondent, text: "I just turned it off and went back to Apple Maps. To be honest, I don't really trust it anymore after that week."}
+    expected_topics:
+      - "contradiction between stated trust and current distrust after March incident"
+      - "impact of March routing failure on ongoing usage"
 
   - name: alert_feature_flip
     inputs:
@@ -40,6 +48,9 @@ cases:
         - {speaker: respondent, text: "I've actually started ignoring the alerts completely. They're always wrong — either late by 20 minutes or reporting accidents that cleared hours ago."}
         - {speaker: interviewer, text: "What made you stop relying on them?"}
         - {speaker: respondent, text: "Three times in one week they sent me into traffic they said was clear. I just filter them out now."}
+    expected_topics:
+      - "contradiction between accident alerts being the top feature and now ignoring them entirely"
+      - "what the respondent relies on instead of the alerts"
 
   - name: usage_frequency_flip
     inputs:
@@ -52,6 +63,9 @@ cases:
         - {speaker: respondent, text: "There was that big update in the fall — it changed the whole layout. I actually just... forgot about the app for like six weeks. Used Google Maps instead without really thinking about it."}
         - {speaker: interviewer, text: "What brought you back?"}
         - {speaker: respondent, text: "A colleague mentioned it. I re-downloaded it and had to relearn where everything was."}
+    expected_topics:
+      - "contradiction between daily habit framing and six-week lapse"
+      - "whether the fall update caused permanent behavior change"
 
   # --- specificity signals --------------------------------------------------
 
@@ -64,6 +78,9 @@ cases:
         - {speaker: respondent, text: "The community map editing. I actually submitted three map corrections in my neighborhood and they all went live within a week."}
         - {speaker: interviewer, text: "What would make you consider switching again?"}
         - {speaker: respondent, text: "If Waze brought back police reporting and improved their traffic layer, I'd probably at least try them again. Or if something else matched the map editing quality."}
+    expected_topics:
+      - "what specifically the community map editing does for the respondent"
+      - "likelihood and conditions for switching back to Waze"
 
   # --- surprise / advocacy gap ---------------------------------------------
 
@@ -78,6 +95,9 @@ cases:
         - {speaker: respondent, text: "I recommended it to my manager and she got routed into a flooded underpass during the storm last November. She was furious. I felt terrible."}
         - {speaker: interviewer, text: "Has that affected how you use it personally?"}
         - {speaker: respondent, text: "No, I still use it every day. But I'd never put my name behind it for someone else now."}
+    expected_topics:
+      - "surprise gap between personal love of product and refusal to recommend"
+      - "whether the November safety incident was reported or resulted in any follow-up"
 
   # --- clean / no contradictions -------------------------------------------
 
@@ -94,6 +114,9 @@ cases:
         - {speaker: respondent, text: "Maybe the onboarding for new users — my newer colleagues found it a bit confusing at first. Otherwise I genuinely can't think of anything major."}
         - {speaker: interviewer, text: "Any other thoughts?"}
         - {speaker: respondent, text: "Just that it's one of those products where I'd notice immediately if it went away. It's become invisible infrastructure for me."}
+    expected_topics:
+      - "what specifically the onboarding confusion looked like for new colleagues"
+      - "how the team-wide adoption happened and who drove it"
 
   # --- red flag / external blocker -----------------------------------------
 
@@ -108,6 +131,9 @@ cases:
         - {speaker: respondent, text: "Critical, honestly. At two users the ROI just isn't there. We'd need at least 20 to justify the seat cost."}
         - {speaker: interviewer, text: "Have you given them a deadline?"}
         - {speaker: respondent, text: "We told them Q3 or we're cutting the contract. I've already started evaluating alternatives."}
+    expected_topics:
+      - "which alternatives are being evaluated and how far along the evaluation is"
+      - "what happens if EU data residency certification is not delivered before Q3"
 
   # --- PMF signal / word-of-mouth + expansion ------------------------------
 
@@ -124,3 +150,142 @@ cases:
         - {speaker: respondent, text: "People see their colleagues using it and just ask to get access. I've had three different team leads come to me in the last month asking when their team can get on it."}
         - {speaker: interviewer, text: "Any plans to expand further?"}
         - {speaker: respondent, text: "We're in talks about an enterprise agreement for the whole company — about 200 seats. The main question is whether they can support our SSO setup."}
+    expected_topics:
+      - "SSO requirements and whether that is a blocker for the enterprise agreement"
+      - "what the CFO peer's use case looked like and whether it maps to this company's use"
+
+  # --- depth signal (workflow mentioned in passing) -------------------------
+
+  - name: depth_workflow_unexplored
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How does your team use the product day-to-day?"}
+        - {speaker: respondent, text: "Mainly for pipeline reporting. We pull numbers every Monday for the leadership standup."}
+        - {speaker: interviewer, text: "How long have you been doing it that way?"}
+        - {speaker: respondent, text: "Since we onboarded, about 14 months ago. We also rebuilt our entire staging process around it — that was a whole thing — but that's mostly behind us now."}
+        - {speaker: interviewer, text: "How satisfied are you with the pipeline reporting?"}
+        - {speaker: respondent, text: "Very. It saves us probably two hours of manual work every week. The leadership team loves how clean the numbers look."}
+        - {speaker: interviewer, text: "What would you change?"}
+        - {speaker: respondent, text: "Honestly not much at this point. Maybe faster load times on large data sets. But it's become a core part of how we operate."}
+    expected_topics:
+      - "what the staging process rebuild involved and why it was needed"
+      - "whether the staging process change created any ongoing dependencies or risks"
+    # The analyst must catch the throwaway mention of a major workflow change
+    # ("rebuilt our entire staging process") that the interviewer never followed up on.
+
+  # --- unresolved emotional signal ------------------------------------------
+
+  - name: emotional_signal_unexplored
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How has the rollout gone overall?"}
+        - {speaker: respondent, text: "Better now. Honestly that period around the migration was pretty rough for us internally, but we got through it."}
+        - {speaker: interviewer, text: "What does the team use it for now?"}
+        - {speaker: respondent, text: "Mostly contract management and approvals. It's become pretty embedded — people would notice if it disappeared."}
+        - {speaker: interviewer, text: "Is there anything you'd change about the product?"}
+        - {speaker: respondent, text: "The audit log could be more granular. Other than that it's solid."}
+        - {speaker: interviewer, text: "Would you recommend it to peers?"}
+        - {speaker: respondent, text: "Yes, with the caveat that the migration requires real planning. We learned that the hard way."}
+    expected_topics:
+      - "what specifically made the migration period rough"
+      - "what the respondent learned the hard way about migration planning"
+    # "pretty rough for us internally" and "learned that the hard way" are clear
+    # emotional signals that were never resolved. The analyst must probe both.
+
+  # --- churn signal (explicit threat + alternatives evaluation) -------------
+
+  - name: churn_signal_renewal_threat
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "How is the product fitting into your workflow today?"}
+        - {speaker: respondent, text: "It's fine. It does what it says. But honestly we're coming up on renewal in October and I'm not sure we're going to re-sign."}
+        - {speaker: interviewer, text: "What's driving that uncertainty?"}
+        - {speaker: respondent, text: "The price went up 30% at the last renewal and the product hasn't materially changed. We're getting the same thing for a lot more money."}
+        - {speaker: interviewer, text: "Are you looking at alternatives?"}
+        - {speaker: respondent, text: "We've had demos with two competitors — one last month, one scheduled for next week. I haven't made a decision but the pressure is real."}
+        - {speaker: interviewer, text: "What would it take to stay?"}
+        - {speaker: respondent, text: "Either a pricing rollback to last year's rate, or a meaningful product update that justifies the increase. Right now neither has happened."}
+    expected_topics:
+      - "which competitors were demoed and how they compared"
+      - "whether any vendor has been given a deadline or made an offer"
+      - "what a meaningful product update would concretely look like to the respondent"
+
+  # --- implementation timeline (long rollout, reason unexplained) -----------
+
+  - name: implementation_timeline_gap
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "When did you first start using the product?"}
+        - {speaker: respondent, text: "We signed in February 2023 but didn't go live until November. So almost nine months from contract to production."}
+        - {speaker: interviewer, text: "Are you satisfied with where you are now?"}
+        - {speaker: respondent, text: "Yes, very. It's fully embedded in our ops workflow now and the team loves it."}
+        - {speaker: interviewer, text: "Would you recommend it to others?"}
+        - {speaker: respondent, text: "Absolutely. It's been worth it. The implementation was longer than we expected but these things take time."}
+        - {speaker: interviewer, text: "What do you use it for primarily?"}
+        - {speaker: respondent, text: "Vendor reconciliation and month-end close. It used to take us three days; now it's an afternoon."}
+    expected_topics:
+      - "what caused the nine-month implementation delay from contract to production"
+      - "what the respondent would do differently to shorten implementation for peers"
+    # "longer than we expected" is never explained. The analyst must probe why.
+
+  # --- strong like without specifics ----------------------------------------
+
+  - name: vague_praise_no_specifics
+    inputs:
+      transcript:
+        - {speaker: interviewer, text: "What do you like most about the product?"}
+        - {speaker: respondent, text: "The analytics. It's genuinely best-in-class. I've used a lot of tools and nothing comes close."}
+        - {speaker: interviewer, text: "How long have you been using it?"}
+        - {speaker: respondent, text: "About two years. It's become my go-to for anything data-related on the ops side."}
+        - {speaker: interviewer, text: "Do others on your team use it?"}
+        - {speaker: respondent, text: "A few people. I'm probably the heaviest user but two of my colleagues use it for reporting."}
+        - {speaker: interviewer, text: "Any downsides?"}
+        - {speaker: respondent, text: "It's expensive. But honestly for what it does it's worth every penny."}
+    expected_topics:
+      - "what specifically the analytics does that no other tool provides"
+      - "concrete example of a decision or outcome the analytics enabled"
+    # "best-in-class analytics" with no specifics is the signal. The analyst
+    # must push for what concretely makes it so, not accept the vague praise.
+
+  # --- incremental (prior snapshot present, new churn signal) ---------------
+  # This case seeds a prior snapshot covering turns 1-6, then provides turns
+  # 7-10 where a new churn signal appears. The analyst must catch the new signal
+  # without re-probing anything already in the snapshot summary.
+
+  - name: incremental_new_churn_signal
+    inputs:
+      prior_snapshot:
+        after_turn: 6
+        themes:
+          - "Daily pipeline reporting habit — saves 2 hrs/week"
+          - "Bottom-up adoption across finance and ops"
+        contradictions: []
+        surprises:
+          - "Deployed within one week of first hearing about it from a peer CFO"
+        investor_signals:
+          - "[PMF] Word-of-mouth referral from CFO peer group — strong credibility signal"
+          - "[PMF] Organic spread to 25 seats with no mandate"
+        covered_subtopics:
+          - "peer CFO referral source"
+          - "weekly pipeline reporting workflow"
+          - "bottom-up adoption finance and ops"
+          - "deployment speed one week"
+      transcript:
+        - {speaker: interviewer, text: "How did you first hear about the product?"}
+        - {speaker: respondent, text: "A colleague in my CFO peer group recommended it. She couldn't stop talking about it."}
+        - {speaker: interviewer, text: "What made you try it?"}
+        - {speaker: respondent, text: "Her enthusiasm was enough. We deployed it within a week."}
+        - {speaker: interviewer, text: "How has adoption grown since then?"}
+        - {speaker: respondent, text: "Started with finance. Now ops is on it too — about 25 seats total, all bottom-up."}
+        - {speaker: interviewer, text: "How are you feeling about the renewal coming up in Q4?"}
+        - {speaker: respondent, text: "Honestly, uncertain. The price jumped significantly and our CFO is asking hard questions about ROI. I'm going to need to justify it in a way I haven't had to before."}
+        - {speaker: interviewer, text: "What's making the ROI case difficult?"}
+        - {speaker: respondent, text: "We don't have a clean way to quantify the time savings. It's real, but I can't put a number on it that will satisfy a CFO who's looking to cut costs."}
+        - {speaker: interviewer, text: "Have you looked at any alternatives?"}
+        - {speaker: respondent, text: "Not seriously yet. But if I can't make the numbers work by August, that conversation starts."}
+    expected_topics:
+      - "what the CFO specifically needs to see to approve renewal"
+      - "whether the respondent has a deadline before alternatives evaluation begins"
+    # The snapshot covers turns 1-6 (referral, deployment, adoption).
+    # Turns 7-10 introduce a new churn signal (price jump, CFO scrutiny, Aug deadline).
+    # Probes must target the new signal, not re-ask about referral or adoption.

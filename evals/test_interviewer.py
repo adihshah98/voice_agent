@@ -38,7 +38,6 @@ from evals.evaluators import (
 import logfire
 from voice_agent.models import InterviewerOutput
 from voice_agent.turn import run_speech_turn
-from voice_agent.tracing import init_tracing
 from evals.cases import get_dataset_version
 from pydantic_evals import Dataset
 
@@ -126,7 +125,6 @@ async def run_interviewer_on_case(
 
 @pytest.mark.asyncio
 async def test_tier1_interviewer_decisions():
-    init_tracing(service_name="voice-agent-evals")
     dataset_version = get_dataset_version(DATASET_PATH)
     logfire.set_attribute("dataset_version", dataset_version)
 
@@ -145,8 +143,11 @@ async def test_tier1_interviewer_decisions():
     report = await dataset.evaluate(
         run_interviewer_on_case,
         max_concurrency=2,
-        progress=False,
+        progress=True,
     )
+
+    import logfire as _logfire
+    _logfire.force_flush()
 
     _print_per_case(report)
     scores = _aggregate(report)
@@ -186,7 +187,7 @@ async def test_tier1_interviewer_decisions():
 
 def _print_per_case(report) -> None:
     """Print a table: case | expected | actual | scores | utterance, then failures."""
-    header = f"{'case':<40} {'exp':>12} {'got':>12} {'AM':>4} {'SQ':>4} {'NL':>4} {'RR':>4} {'W':>5}  utterance"
+    header = f"{'case':<40} {'exp':>12} {'got':>12} {'AM':>5} {'SQ':>4} {'NL':>4} {'RR':>4} {'W':>5}  utterance"
     print(f"\nTier 1 per-case results:\n{header}\n{'-' * len(header)}")
 
     def _bool(src, key) -> str:
@@ -214,7 +215,7 @@ def _print_per_case(report) -> None:
         utterance = case.output.utterance if case.output else ""
         if len(utterance) > 50:
             utterance = utterance[:50] + "…"
-        am = _bool(case.assertions, "ActionMatches")
+        am = _num(case.scores, "ActionMatches")
         sq = _bool(case.assertions, "SingleQuestion")
         nl = _bool(case.assertions, "non_leading")
         rr = _bool(case.assertions, "response_relevant")
