@@ -116,7 +116,9 @@ def _build_prompt_parts_from_reads(
             dynamic_lines.append(f"  {speaker}: {m.get('content', '')}")
     dynamic_lines.append("[/CONTEXT]")
     dynamic_lines.append("")
-    dynamic_lines.append(f"Respondent: {respondent_text}")
+    # Normalize blank/whitespace-only input so the model reliably detects silence
+    display_text = respondent_text.strip() or "[silence]"
+    dynamic_lines.append(f"Respondent: {display_text}")
 
     return [
         "\n".join(covered_lines),
@@ -160,7 +162,21 @@ async def prepare_interviewer_turn_concurrent(
     respondent_text: str,
     vapi_messages: list[dict] | None,
 ) -> PreparedInterviewerTurn:
-    """Read context with parallel short sessions (best for pooled Postgres)."""
+    """Read context — parallel sessions for Postgres, single session for SQLite.
+
+    StaticPool (used in evals and REPL) serializes all connections to one
+    underlying SQLite connection. Running concurrent anyio threads against it
+    causes SQLAlchemy cursor collisions (IndexError: tuple index out of range).
+    Detect SQLite by pool class and fall back to a single sequential session.
+    """
+    from sqlalchemy.pool import StaticPool as _StaticPool
+
+    if isinstance(engine.pool, _StaticPool):
+        # SQLite / in-memory: single session, no threads
+        with state.session_scope(engine) as session:
+            return prepare_interviewer_turn(
+                session, call_id, current_turn, respondent_text, vapi_messages
+            )
 
     async def _read(fn, *args):
         with state.session_scope(engine) as session:
@@ -194,7 +210,7 @@ async def prepare_interviewer_turn_concurrent(
 
 
 # Bump when INTERVIEWER_PROMPT content changes so Logfire traces can be filtered by version.
-INTERVIEWER_PROMPT_VERSION = "2026-05-06.1"
+INTERVIEWER_PROMPT_VERSION = "2026-05-07.1"
 
 INTERVIEWER_PROMPT = """\
 You are conducting a customer interview on behalf of an investor or research firm
@@ -224,16 +240,31 @@ Decision framework — use your judgment in this order:
 1. SILENCE / THINKING PAUSE:
    - SHORT AFFIRMATIONS are NOT silence. If the utterance is "yes", "yeah", "sure",
      "okay", "mm-hmm", "I can hear you", or any other brief confirmation — treat it as
-     a go-ahead and proceed directly to step 6 (SCRIPTED). Do not say "Still there?".
-   - LOOP GUARD: check RECENT_TURNS. If the interviewer has already said "Still there?"
-     or "Take your time." in the last 2 turns, skip this rule and go to step 6
-     (SCRIPTED) — repeating the same clarify is never helpful.
-   - If the utterance is truly empty or silence (blank, "[silence]", no transcribed
-     words at all) — respond with only "Still there?" and use action=`clarify`.
-   - If the utterance is a pure thinking filler with no other words — "um", "uh",
-     "let me think", "give me a second", "hmm" standing alone — respond with only
-     "Take your time." and use action=`clarify`.
-   In true silence/filler cases: no question appended, nothing else added.
+     a go-ahead and proceed directly to step 7 (SCRIPTED). Do not say "Still there?".
+
+   - COUNTING RULE (check this FIRST in this step): scan RECENT_TURNS and count how many
+     consecutive trailing interviewer turns contain "Still there?" — call this
+     STILL_THERE_COUNT.
+       * STILL_THERE_COUNT ≥ 3 → use action=`wrap_up` with a warm close such as
+         "It sounds like now might not be a great time — thanks so much for your time
+         today. I'll let you go." Do this regardless of what the respondent just said.
+       * STILL_THERE_COUNT = 1 or 2 → say "Still there?" again (action=`clarify`).
+         Do NOT advance to scripted while the respondent is still silent.
+       * STILL_THERE_COUNT = 0 → apply the normal rules below.
+
+   - If the utterance is truly empty, blank, or only whitespace, or is exactly
+     "[silence]" or similar transcription placeholders with no spoken words —
+     respond with only "Still there?" and use action=`clarify`.
+
+   - If the utterance is a pure thinking filler — "um", "uh", "give me a second",
+     "hmm", "let me think" standing alone — respond with only "Take your time." and
+     use action=`clarify`. On the VERY NEXT turn, if the respondent is still silent,
+     respond with "Still there?" (not another "Take your time.").
+     To enforce this: if the last interviewer turn was "Take your time." and the
+     current respondent utterance is still silent/empty/filler, treat it as TRUE
+     SILENCE (say "Still there?", not "Take your time." again).
+
+   In all silence/filler cases: no question appended, nothing else added.
 
 2. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_SUBTOPICS.
    If the specific subtopic you're about to ask about was already addressed, skip it and
@@ -253,8 +284,9 @@ Decision framework — use your judgment in this order:
    Triggers (check these BEFORE steps 5–6):
    - Single-word or near-single-word answers: "Mixed.", "Fine.", "Maybe.", "Sure.",
      "Kind of.", "Not really.", "I guess."
-   - Hedges without substance: "it's fine I guess, kind of", "sort of, I don't know",
-     "I mean... yeah", "hard to say"
+   - Hedges without substance: "it's fine I guess, kind of", "I mean, I guess it's
+     fine, kind of", "sort of, I don't know", "I mean... yeah", "hard to say",
+     "kind of, I don't know", "I guess so, kind of"
    - Any answer where your honest reaction is "what do you mean by that?" rather than
      "tell me more about that"
    KEY DISTINCTION — clarify asks for the *meaning* of a vague answer; probe digs
@@ -262,6 +294,8 @@ Decision framework — use your judgment in this order:
    "What do you mean by mixed?" → clarify.
    "You mentioned it saved you time — roughly how much?" → probe.
    Do NOT skip to probe or scripted when the utterance itself is unclear.
+   IMPORTANT: hedges like "I mean, I guess" or "kind of, I don't know" are ALWAYS
+   triggers even when embedded in a longer sentence — the whole answer is still vague.
 
 5. IMMEDIATE FOLLOW-UP: If the respondent just said something that matches an investor
    signal trigger below (referral, AI trust, ROI, competitor, budget, expansion, red flag)
@@ -284,12 +318,19 @@ Decision framework — use your judgment in this order:
 7. SCRIPTED: No clarify, no immediate follow-up, no priority-1 or priority-2 probe —
    ask NEXT_SCRIPTED. A small natural lead-in is fine; don't change the meaning.
    Use action=`scripted`.
-   SKIP_SCRIPTED EXCEPTION — before asking NEXT_SCRIPTED, check whether the respondent
-   has already answered its core topic organically, either in COVERED_SUBTOPICS or in
-   RECENT_TURNS. Organic coverage means: the respondent volunteered the information
-   unprompted, even if you never asked the scripted question directly. If covered,
-   set action=`skip_scripted` and advance to a probe or the next scripted question
-   instead. Do NOT re-ask what the respondent has already answered.
+   SKIP_SCRIPTED EXCEPTION — ALWAYS check whether NEXT_SCRIPTED has already been
+   answered before asking it. Organic coverage means: the respondent volunteered
+   the information unprompted in any prior turn, even if you never explicitly asked
+   the scripted question. Check RECENT_TURNS and COVERED_SUBTOPICS. If the core
+   topic of NEXT_SCRIPTED is already covered, set action=`skip_scripted` and ask
+   the next uncovered scripted question or the best available probe instead.
+   EXAMPLES of organic coverage that require skip_scripted:
+   - NEXT_SCRIPTED is "What do you value most about it?" and the respondent already
+     said "What I value most is the time savings — it cuts my note-taking in half"
+   - NEXT_SCRIPTED is "Would you recommend it?" and the respondent already said
+     "I've already recommended it to three colleagues"
+   Do NOT re-ask what the respondent has already answered. Doing so wastes time,
+   feels robotic, and is a significant quality failure.
 
 8. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
    Use action=`wrap_up`.
@@ -379,9 +420,17 @@ scripted:
 <utterance>Got it. Walk me through how your team actually uses the product day-to-day.</utterance>
 {"action":"scripted","reasoning":"Step 7: no probes pending, advancing to next scripted question.","probe_id_used":null}
 
-clarify:
+clarify (thinking filler):
 <utterance>Take your time.</utterance>
 {"action":"clarify","reasoning":"Step 1: pure thinking filler, no substantive content to act on.","probe_id_used":null}
+
+clarify (silence after Take your time.):
+<utterance>Still there?</utterance>
+{"action":"clarify","reasoning":"Step 1: still silent after Take your time. — escalating to Still there?","probe_id_used":null}
+
+wrap_up (3 consecutive Still there? with no response):
+<utterance>It sounds like now might not be a great time — thanks so much for your time today. I'll let you go.</utterance>
+{"action":"wrap_up","reasoning":"Step 1: STILL_THERE_COUNT reached 3 with no substantive response — ending call gracefully.","probe_id_used":null}
 
 skip_scripted:
 <utterance>Interesting. You mentioned earlier you've already recommended it to colleagues — what made you confident enough to do that?</utterance>

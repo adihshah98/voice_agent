@@ -2,19 +2,23 @@
 
 - Evals
   - Tier 3: 
-    - Run the evals (See if working & fix what is not)
-    - Ask if it's prod grade
-    - See if we are testing appropriate things
     - See if it is covering enough
-      - Make sure it asks everything
-      - Make sure it probes at the correct depth
+      - Make sure it asks everything - Done
+      - When handling a probe from earlier, it should say like you said earlier - Done
+      - 
+      - Silence not working
+      - Scripted Skip not working
       - Context compression for topics covered
       - Context drift: agent forgets or misinterprets earlier info
-      - Make sure it wraps up with everything covered in a set time
-      - Make sure it doesn't ask again/get stuck in loops/rabbitholes
-      - Make sure it deals with non-happy path behavior
-      - Repeated the tell me more abt day to day - "The respondent has provided some information about their role and team, but more context is needed to understand their daily activities and how Notion is used." In this case, ask it to specify exactly what you want to know more about
-      - When handling a probe from earlier, it should say like you said earlier
+      - Make sure it wraps up with everything covered in a set time but probes at correct depth
+      - Make sure it doesn't ask again/get stuck in loops/rabbitholes - ENd if responder is not talking/off-topic. Do'nt wait till all scripted are asked
+  - Misc
+    - Diff btw replay & trajectory
+    - See if we are testing appropriate things
+    - Should test an E2E interview but efficiently
+    - Ask if it's prod grade
+    - Best way to track state transitions etc. of the agents? (Like still there etc.)
+    - Run the evals (See if working & fix what is not)
   - Versioned datasets/eval runs: 
     - How to view & compare nicely
   - Online Evals: 
@@ -51,6 +55,8 @@
   - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
   - The analyst is triggered by polling `should_run_analyst()` on every `conversation-update`. Fine for one call, but with N concurrent calls you get lock contention and polling overhead. Production systems use a task queue (Celery + Redis, SQS, etc.) — the webhook handler enqueues a job instead of calling `asyncio.create_task` inline.
   - The analyst competes with the real-time interviewer for the event loop. A slow Sonnet call during a burst can delay turn responses. In production you'd want the analyst as a separate worker service — the invariant holds, you just move the writes to a different process.
+- Better Agent Loop
+  - State Machine to manage loops/rabbitholes?
 - Memory
   - Memory/Improving agents with usage
 - Advanced Voice UX

@@ -126,7 +126,7 @@ async def run_interviewer_on_case(
 @pytest.mark.asyncio
 async def test_tier1_interviewer_decisions():
     dataset_version = get_dataset_version(DATASET_PATH)
-    logfire.set_attribute("dataset_version", dataset_version)
+    logfire.info("eval_dataset_version", dataset_version=dataset_version)
 
     dataset: Dataset[InterviewerCaseInputs, InterviewerOutput, None] = Dataset(
         name="interviewer_tier1",

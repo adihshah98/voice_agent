@@ -1,5 +1,5 @@
-version: "2026-05-05.1"
-description: "3 canned replay transcripts replacing live simulation for power_user, skeptical_buyer, churn_risk personas. Respondent lines are fixed; only the interviewer runs live. Tests multi-turn state: covered_subtopics accumulation, probe staleness, scripted cursor advancement."
+version: "2026-05-07.1"
+description: "6 canned replay transcripts. Tests multi-turn state: covered_subtopics accumulation, probe staleness, scripted cursor advancement, skip_scripted on organic coverage, non-happy-path silence/vague handling, loop guard."
 
 transcripts:
   - name: power_user_arc
@@ -115,3 +115,99 @@ transcripts:
       - speaker: respondent
         text: "Yeah I think that's the main story. The product is fine but the experience around it let us down. I hope that feedback is useful."
         expected_actions: [wrap_up, scripted, probe]
+
+  # -------------------------------------------------------------------------
+  # skip_scripted arc: respondent volunteers scripted-question content before
+  # being asked. Interviewer must fire skip_scripted (not scripted) to avoid
+  # re-asking something already answered organically.
+  # -------------------------------------------------------------------------
+  - name: skip_scripted_organic_coverage
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you about it recently?"
+      - "Would you recommend it to someone else?"
+      - "What would make you use it more often?"
+    turns:
+      # Turn 1: respondent answers Q1 AND volunteers Q2 answer organically
+      - speaker: respondent
+        text: "We use it every day for customer call summaries — about fifteen calls a week across the team. What I value most is that it cuts my note-taking time in half. I used to spend an hour after every call; now it's maybe five minutes of editing."
+        expected_actions: [skip_scripted, probe]
+
+      # Turn 2: respondent answers Q3 before being asked
+      - speaker: respondent
+        text: "Honestly the main frustration is that the summaries sometimes miss action items when multiple people talk over each other. It's not a dealbreaker but I do have to double-check those. Would I recommend it? Absolutely — I already have, to two colleagues at other companies."
+        expected_actions: [skip_scripted, probe, scripted]
+
+      # Turn 3: respondent wraps up, all scripted covered organically
+      - speaker: respondent
+        text: "To use it more, honestly nothing — I'm already at max usage. Maybe a mobile app so I can pull up summaries before walking into a building. But overall it's a ten out of ten for my workflow."
+        expected_actions: [wrap_up, probe, scripted]
+
+  # -------------------------------------------------------------------------
+  # non_happy_path arc: silence, single-word, and vague answers.
+  # Tests: clarify on silence, clarify on vague, no loop (second silence
+  # should not get another "Still there?" but move on).
+  # -------------------------------------------------------------------------
+  - name: non_happy_path_silence_vague
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you about it recently?"
+    turns:
+      # Turn 1: genuine silence — interviewer must clarify, not advance
+      - speaker: respondent
+        text: "[silence]"
+        expected_actions: [clarify]
+
+      # Turn 2: single-word non-answer — must clarify before advancing
+      - speaker: respondent
+        text: "Mixed."
+        expected_actions: [clarify]
+
+      # Turn 3: substantive answer — now advance
+      - speaker: respondent
+        text: "We use it a few times a week for client call prep. The summaries save me maybe thirty minutes each time."
+        expected_actions: [scripted, probe]
+
+      # Turn 4: hedge without substance — must clarify, not probe or scripted
+      - speaker: respondent
+        text: "I mean, I guess it's fine, kind of."
+        expected_actions: [clarify]
+
+      # Turn 5: real answer after clarify
+      - speaker: respondent
+        text: "The action items are great but the speaker attribution is off sometimes. That's the main frustration."
+        expected_actions: [probe, scripted]
+
+  # -------------------------------------------------------------------------
+  # loop_guard arc: tests that the interviewer does NOT re-ask about a topic
+  # already covered, and does NOT repeat "Still there?" twice in a row.
+  # -------------------------------------------------------------------------
+  - name: loop_guard_no_repeat
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you about it recently?"
+      - "Would you recommend it to someone else?"
+    turns:
+      # Turn 1: answer includes recommendation — Q4 answered organically
+      - speaker: respondent
+        text: "We use it for sales calls, about twenty a week. I've already recommended it to three colleagues — it genuinely saves an hour a day of note-taking."
+        expected_actions: [probe, scripted, skip_scripted]
+
+      # Turn 2: answer covers Q2 (value) organically
+      - speaker: respondent
+        text: "What I value most is the time savings — I mentioned that already. It's really the core thing. Also the search across past transcripts is underrated."
+        expected_actions: [scripted, probe, skip_scripted]
+
+      # Turn 3: silence — gets "Still there?"
+      - speaker: respondent
+        text: ""
+        expected_actions: [clarify]
+
+      # Turn 4: another silence — loop guard fires; must NOT say "Still there?"
+      # again. Must advance to scripted or probe instead.
+      - speaker: respondent
+        text: "[silence]"
+        expected_actions: [scripted, probe, wrap_up]

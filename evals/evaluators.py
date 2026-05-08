@@ -388,6 +388,75 @@ class CoversExpectedTopics(Evaluator[AnalystCaseInputs, AnalysisUpdate, None]):
         return {"covers_expected_topics": EvaluationReason(value=score, reason=reason)}
 
 
+def specific_probe_judge() -> LLMJudge:
+    """Pass/fail: when the interviewer fires a probe, is the question specific enough?
+
+    Catches the "tell me more about your day-to-day" antipattern — vague probes
+    that don't reference anything the respondent actually said. A good probe names
+    a specific thing (a feature, a number, a named person, a concrete event) from
+    the conversation.
+    """
+    return LLMJudge(
+        rubric=(
+            "You are grading a single interviewer utterance from a market research "
+            "phone call. The action was `probe`.\n\n"
+            "PASS if the probe is SPECIFIC: it references at least one concrete detail "
+            "the respondent actually mentioned — a named feature, a number, a person, "
+            "a competitor, a workflow, or a concrete event from the conversation.\n\n"
+            "FAIL if the probe is VAGUE: it could apply to any respondent in any interview "
+            "without reading this conversation. Examples of vague probes that should FAIL:\n"
+            "  - 'Can you tell me more about your day-to-day use?'\n"
+            "  - 'What does that look like for your team?'\n"
+            "  - 'Can you elaborate on that?'\n"
+            "  - 'What do you mean by that exactly?'\n\n"
+            "Examples of specific probes that should PASS:\n"
+            "  - 'You mentioned the action items feature — how often does that attribution error happen?'\n"
+            "  - 'Earlier you said you were evaluating Fireflies — what specifically prompted that?'\n"
+            "  - 'You said it saves about an hour a week — is that per person or across the whole team?'\n\n"
+            "The full conversation is provided as context. Grade only specificity — "
+            "warmth and leading-ness are graded separately."
+        ),
+        model=_JUDGE_MODEL,
+        include_input=True,
+        score=False,
+        assertion={"evaluation_name": "probe_specific", "include_reason": True},
+    )
+
+
+def bridging_judge() -> LLMJudge:
+    """Pass/fail: when picking up an older probe, does the interviewer bridge with 'earlier you mentioned'?
+
+    When `turns_ago >= 3` in PENDING_PROBES, the prompt instructs the interviewer
+    to bridge with 'Earlier you mentioned X...'. This evaluator checks whether
+    that instruction was followed for probes used 3+ turns after generation.
+
+    The input must include the turns_ago value and the utterance.
+    """
+    return LLMJudge(
+        rubric=(
+            "You are grading a single interviewer utterance from a market research "
+            "phone call where the action was `probe` and the probe was generated "
+            "3 or more turns ago.\n\n"
+            "The interviewer's prompt instructs: when a probe is 3–8 turns old, "
+            "bridge with 'Earlier you mentioned X...' before asking the question, "
+            "so it doesn't feel out of nowhere.\n\n"
+            "PASS if the utterance references something the respondent said earlier "
+            "before asking the probe question — e.g. 'You mentioned earlier that...' "
+            "or 'Earlier you brought up...' or 'Going back to what you said about...' "
+            "or any natural bridging that anchors the probe to a prior respondent statement.\n\n"
+            "FAIL if the utterance jumps straight into the probe question with no "
+            "reference to what the respondent said earlier, making it feel disconnected.\n\n"
+            "Also PASS if the probe naturally follows the current turn's content "
+            "without needing a bridge (the respondent just mentioned the topic again).\n\n"
+            "The full conversation is provided as context."
+        ),
+        model=_JUDGE_MODEL,
+        include_input=True,
+        score=False,
+        assertion={"evaluation_name": "probe_bridged", "include_reason": True},
+    )
+
+
 def priority_calibrated_judge() -> LLMJudge:
     """Pass/fail: is priority-1 reserved for real contradictions/surprises/red-flags?"""
     return LLMJudge(

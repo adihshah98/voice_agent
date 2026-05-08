@@ -6,9 +6,11 @@ that Tier 1 can't cover:
   - covered_subtopics accumulation
   - scripted cursor advancement
   - probe staleness
-  - barge-in reconciliation
+  - skip_scripted on organic coverage
+  - non-happy-path: silence and vague answer handling
+  - loop guard: no repeated "Still there?" or re-asked scripted topics
 
-Runtime: ~30 Haiku calls ≈ 20–30s. CI-safe.
+Runtime: ~60 Haiku calls ≈ 40–60s. CI-safe.
 
 Run with:
     uv run pytest evals/test_replay.py -v -m replay
@@ -61,11 +63,15 @@ class ReplayInputs(BaseModel):
 
 class ReplayResult(BaseModel):
     transcript_name: str
-    turn_results: list[dict[str, Any]]  # per-turn: text, action, expected_actions, pass
+    turn_results: list[dict[str, Any]]  # per-turn: text, action, utterance, expected_actions, pass
     all_actions_valid: bool
     scripted_cursor_advanced: bool
     final_scripted_cursor: int
     scripted_total: int
+    # New: did wrap_up happen only after all scripted were covered?
+    wrap_up_after_all_scripted: bool
+    # New: did "Still there?" appear twice in a row (loop violation)?
+    still_there_repeated: bool
 
 
 # ---------------------------------------------------------------------------
@@ -130,21 +136,31 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
     history: list[dict[str, str]] = [{"role": "assistant", "content": opening_text}]
     turn_results: list[dict[str, Any]] = []
 
+    wrap_up_cursor: int | None = None  # scripted_cursor at the turn wrap_up fired
+
     for canned_turn in transcript.turns:
         # Feed canned respondent utterance as the next user message
         history.append({"role": "user", "content": canned_turn.text})
 
         result = await run_speech_turn(engine, call_id, vapi_messages=history)
         action = result["action"]
+        utterance = result["message"]
+
+        # Record cursor at wrap_up moment
+        if action == "wrap_up" and wrap_up_cursor is None:
+            with state.session_scope(engine) as s:
+                call = s.get(state.Call, call_id)
+                wrap_up_cursor = call.scripted_cursor if call else 0
 
         turn_results.append({
             "respondent_text": canned_turn.text[:60],
             "action": action,
+            "utterance": utterance,
             "expected_actions": canned_turn.expected_actions,
             "pass": action in canned_turn.expected_actions,
         })
 
-        history.append({"role": "assistant", "content": result["message"]})
+        history.append({"role": "assistant", "content": utterance})
 
         if action == "wrap_up":
             break
@@ -155,6 +171,25 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
 
     all_pass = all(t["pass"] for t in turn_results)
 
+    # Wrap-up only after all scripted covered
+    if wrap_up_cursor is not None:
+        wrap_up_after_all_scripted = wrap_up_cursor >= len(transcript.scripted_questions)
+    else:
+        # No wrap_up fired — not a violation of this specific check
+        wrap_up_after_all_scripted = True
+
+    # Loop guard: detect consecutive silence-handler utterances ("Still there?" or "Take your time.")
+    # Either phrase repeated in consecutive turns is a loop violation.
+    def _is_silence_handler(u: str) -> bool:
+        lo = u.lower()
+        return "still there" in lo or "take your time" in lo
+
+    utterances = [t["utterance"] for t in turn_results]
+    still_there_repeated = any(
+        _is_silence_handler(utterances[i]) and _is_silence_handler(utterances[i + 1])
+        for i in range(len(utterances) - 1)
+    )
+
     return ReplayResult(
         transcript_name=transcript.name,
         turn_results=turn_results,
@@ -162,6 +197,8 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
         scripted_cursor_advanced=final_cursor > 1,  # opened with cursor=1 already
         final_scripted_cursor=final_cursor,
         scripted_total=len(transcript.scripted_questions),
+        wrap_up_after_all_scripted=wrap_up_after_all_scripted,
+        still_there_repeated=still_there_repeated,
     )
 
 
@@ -192,6 +229,38 @@ class ScriptedCursorAdvanced(Evaluator[ReplayInputs, ReplayResult, None]):
         return ctx.output.scripted_cursor_advanced
 
 
+@dataclass
+class WrapUpOnlyAfterAllScripted(Evaluator[ReplayInputs, ReplayResult, None]):
+    """When wrap_up fires, all scripted questions must have been asked (or skipped).
+
+    A call that wraps up at turn 3 with 3 scripted questions unasked is a failure —
+    the interviewer gave up too early. Returns True (N/A pass) when no wrap_up fired
+    within the transcript's turn limit.
+    """
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
+    ) -> bool:
+        return ctx.output.wrap_up_after_all_scripted
+
+
+@dataclass
+class NoStillThereLoop(Evaluator[ReplayInputs, ReplayResult, None]):
+    """Interviewer must not repeat 'Still there?' on consecutive turns.
+
+    The loop guard in the prompt says: if 'Still there?' was said in the last
+    2 turns, skip clarify and advance to scripted. This evaluator detects when
+    that rule was violated.
+    """
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
+    ) -> bool:
+        return not ctx.output.still_there_repeated
+
+
 # ---------------------------------------------------------------------------
 # Dataset builder
 # ---------------------------------------------------------------------------
@@ -214,6 +283,8 @@ def _build_dataset() -> Dataset[ReplayInputs, ReplayResult, None]:
         evaluators=(
             AllActionsValid(),
             ScriptedCursorAdvanced(),
+            WrapUpOnlyAfterAllScripted(),
+            NoStillThereLoop(),
         ),
     )
 
@@ -228,7 +299,7 @@ def _build_dataset() -> Dataset[ReplayInputs, ReplayResult, None]:
 async def test_replay_transcripts():
     """Replay eval: canned respondent turns, live interviewer.
 
-    Marked `replay` — fast (~20–30s), CI-safe. Run with:
+    Marked `replay` — fast (~40–60s), CI-safe. Run with:
         uv run pytest evals/test_replay.py -v -m replay
     """
     logfire.configure(service_name="voice-agent-evals", send_to_logfire="if-token-present")
@@ -258,6 +329,12 @@ async def test_replay_transcripts():
     assert scores.get("ScriptedCursorAdvanced", 0) >= 1.0, (
         "Replay transcripts: scripted cursor never advanced past the opening question"
     )
+    assert scores.get("WrapUpOnlyAfterAllScripted", 0) >= 1.0, (
+        "Replay transcripts: wrap_up fired before all scripted questions were covered"
+    )
+    assert scores.get("NoStillThereLoop", 0) >= 1.0, (
+        "Replay transcripts: interviewer repeated 'Still there?' on consecutive turns"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +343,7 @@ async def test_replay_transcripts():
 
 
 def _print_results(report) -> None:
-    header = f"{'transcript':<28} {'AV':>4} {'SC':>4}  turn actions"
+    header = f"{'transcript':<30} {'AV':>4} {'SC':>4} {'WU':>4} {'SL':>4}  turn actions"
     print(f"\nReplay eval results:\n{header}\n{'-' * len(header)}")
 
     def _b(src, key) -> str:
@@ -278,17 +355,20 @@ def _print_results(report) -> None:
     for case in report.cases:
         av = _b(case.assertions, "AllActionsValid")
         sc = _b(case.assertions, "ScriptedCursorAdvanced")
+        wu = _b(case.assertions, "WrapUpOnlyAfterAllScripted")
+        sl = _b(case.assertions, "NoStillThereLoop")
         actions = ", ".join(t["action"] for t in (case.output.turn_results if case.output else []))
-        print(f"{(case.name or ''):<28} {av} {sc}  {actions[:60]}")
+        print(f"{(case.name or ''):<30} {av} {sc} {wu} {sl}  {actions[:60]}")
 
         if case.output:
             fails = [t for t in case.output.turn_results if not t["pass"]]
             for f in fails:
                 print(f"  MISMATCH turn: got={f['action']} expected={f['expected_actions']}  [{f['respondent_text']}]")
+                print(f"    utterance: {f['utterance'][:100]}")
 
     for fail in report.failures:
         msg = (fail.error_message or "unknown error").splitlines()[0][:70]
-        print(f"{(fail.name or ''):<28} ERROR  {msg}")
+        print(f"{(fail.name or ''):<30} ERROR  {msg}")
 
 
 def _aggregate(report) -> dict[str, float]:
