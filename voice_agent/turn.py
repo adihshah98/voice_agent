@@ -155,7 +155,7 @@ class TurnPipeline:
                 vapi_messages=vapi_messages,
             )
 
-        deps = InterviewerDeps(call_id=call_id, session=None, turn_number=self._turn_number)
+        deps = InterviewerDeps(call_id=call_id, turn_number=self._turn_number)
         stream = InterviewerStream(deps, prepared)
 
         # The generator uses anyio cancel scopes internally, which can't cross asyncio

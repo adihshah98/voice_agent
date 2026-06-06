@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlmodel import Session
 
 
 Action = Literal[
@@ -49,15 +48,14 @@ class InterviewerLLMMeta(BaseModel):
 
 @dataclass
 class InterviewerDeps:
-    """Deps for the interviewer agent. Dataclass (not BaseModel) so we can
-    carry call metadata through RunContext.
+    """Identity deps for the interviewer agent — call coordinates only.
 
-    session is optional because turn.py preloads DB context in a short-lived
-    session before awaiting the LLM call.
+    All DB state is pre-fetched into a PreparedInterviewerTurn before the LLM
+    call and passed separately. No session handle here; the agent cannot safely
+    use one during the async LLM call anyway (session is closed by then in prod).
     """
 
     call_id: str
-    session: Session | None
     turn_number: int
 
 

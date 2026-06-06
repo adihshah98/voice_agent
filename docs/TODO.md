@@ -4,8 +4,7 @@
   - Tier 3: 
     - See if it is covering enough
       - Make sure it asks everything - Done
-      - When handling a probe from earlier, it should say like you said earlier - Done
-      - 
+      - When handling a probe from earlier, it should say like you said earlier - Done 
       - Silence not working
       - Scripted Skip not working
       - Context compression for topics covered

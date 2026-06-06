@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 voice_agent.db
 .pytest_cache/
+.claude/worktrees

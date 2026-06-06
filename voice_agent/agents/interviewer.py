@@ -550,20 +550,22 @@ async def run_interviewer(
     respondent_text: str,
     vapi_messages: list[dict] | None = None,
     prepared: PreparedInterviewerTurn | None = None,
+    session=None,
 ) -> InterviewerOutput:
     """Pre-fetch context → one LLM call → return output.
 
     vapi_messages: OpenAI-formatted message array from Vapi (body["messages"]).
     When None (evals / play.py), falls back to reading recent_turns from the DB.
+    session: only needed when prepared is None (evals / REPL path).
     """
     if prepared is None:
-        assert deps.session is not None
+        assert session is not None, "session required when prepared is not provided"
         prepared = prepare_interviewer_turn(
-            deps.session,
+            session,
             deps.call_id,
             deps.turn_number,
             respondent_text=respondent_text,
-            vapi_messages=vapi_messages or _db_messages_fallback(deps.session, deps.call_id),
+            vapi_messages=vapi_messages or _db_messages_fallback(session, deps.call_id),
         )
     result = await _get_interviewer().run(prepared.prompt_parts, deps=deps)
     return _parse_streamed_output(result.output, prepared.fallback_scripted_question)
@@ -855,8 +857,6 @@ def _fallback(
     fallback_scripted_question: str | None = None,
 ) -> InterviewerOutput:
     q = fallback_scripted_question
-    if q is None and deps.session is not None:
-        q = state.next_scripted(deps.session, deps.call_id)
     if q is not None:
         return InterviewerOutput(
             utterance=q,
@@ -953,12 +953,10 @@ def _repl() -> None:
             continue
 
         with state.session_scope(engine) as session:
-            deps = InterviewerDeps(
-                call_id=call_id, session=session, turn_number=turn_number
-            )
+            deps = InterviewerDeps(call_id=call_id, turn_number=turn_number)
             with agent_span("interviewer", call_id, turn_number=turn_number, respondent_text=line) as span:
                 t0 = time.perf_counter()
-                out = asyncio.run(run_interviewer(deps, line))
+                out = asyncio.run(run_interviewer(deps, line, session=session))
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 span.set_attribute("action", out.action)
                 span.set_attribute("utterance", out.utterance)
