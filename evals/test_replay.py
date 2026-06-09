@@ -2,7 +2,7 @@
 
 Runs canned full transcripts where respondent lines are fixed. Only the
 interviewer runs live (via `run_speech_turn`). Tests multi-turn state effects
-that Tier 1 can't cover:
+that Tier 1 & 2 can't cover:
   - covered_subtopics accumulation
   - scripted cursor advancement
   - probe staleness
@@ -35,6 +35,8 @@ from sqlmodel import create_engine
 load_dotenv()
 
 from voice_agent import state
+from voice_agent.agents.analyst import run_analyst
+from voice_agent.models import AnalystDeps
 from voice_agent.turn import run_speech_turn
 
 DATASET_PATH = Path(__file__).parent / "datasets" / "replay_transcripts.yaml"
@@ -51,10 +53,18 @@ class ReplayTurn(BaseModel):
     expected_actions: list[str]
 
 
+class ProbeSeed(BaseModel):
+    question: str
+    priority: int = 2
+    rationale: str = ""
+    generated_after_turn: int = 0
+
+
 class ReplayTranscript(BaseModel):
     name: str
     scripted_questions: list[str]
     turns: list[ReplayTurn]
+    probe_seeds: list[ProbeSeed] = []
 
 
 class ReplayInputs(BaseModel):
@@ -68,10 +78,12 @@ class ReplayResult(BaseModel):
     scripted_cursor_advanced: bool
     final_scripted_cursor: int
     scripted_total: int
-    # New: did wrap_up happen only after all scripted were covered?
     wrap_up_after_all_scripted: bool
-    # New: did "Still there?" appear twice in a row (loop violation)?
     still_there_repeated: bool
+    # Probe-turn utterances where action=probe (for BridgingPhrasePresent)
+    probe_utterances: list[str] = []
+    # Index of the turn wrap_up fired (None if never fired)
+    wrap_up_turn_index: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +125,16 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
                 status="active",
             )
         )
+        for ps in transcript.probe_seeds:
+            s.add(
+                state.Probe(
+                    call_id=call_id,
+                    question=ps.question,
+                    priority=ps.priority,
+                    rationale=ps.rationale,
+                    generated_after_turn=ps.generated_after_turn,
+                )
+            )
 
     # Seed the opening scripted question as the first interviewer turn so the
     # history mirrors what a real call would have seen.
@@ -135,22 +157,25 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
     # history is kept as vapi_messages format for run_speech_turn
     history: list[dict[str, str]] = [{"role": "assistant", "content": opening_text}]
     turn_results: list[dict[str, Any]] = []
+    probe_utterances: list[str] = []
+    wrap_up_cursor: int | None = None
+    wrap_up_turn_index: int | None = None
 
-    wrap_up_cursor: int | None = None  # scripted_cursor at the turn wrap_up fired
-
-    for canned_turn in transcript.turns:
-        # Feed canned respondent utterance as the next user message
+    for turn_idx, canned_turn in enumerate(transcript.turns):
         history.append({"role": "user", "content": canned_turn.text})
 
         result = await run_speech_turn(engine, call_id, vapi_messages=history)
         action = result["action"]
         utterance = result["message"]
 
-        # Record cursor at wrap_up moment
         if action == "wrap_up" and wrap_up_cursor is None:
+            wrap_up_turn_index = turn_idx
             with state.session_scope(engine) as s:
                 call = s.get(state.Call, call_id)
                 wrap_up_cursor = call.scripted_cursor if call else 0
+
+        if action == "probe":
+            probe_utterances.append(utterance)
 
         turn_results.append({
             "respondent_text": canned_turn.text[:60],
@@ -161,6 +186,9 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
         })
 
         history.append({"role": "assistant", "content": utterance})
+
+        if result.get("should_run_analyst"):
+            await run_analyst(AnalystDeps(call_id=call_id, engine=engine))
 
         if action == "wrap_up":
             break
@@ -178,17 +206,19 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
         # No wrap_up fired — not a violation of this specific check
         wrap_up_after_all_scripted = True
 
-    # Loop guard: detect consecutive silence-handler utterances ("Still there?" or "Take your time.")
-    # Either phrase repeated in consecutive turns is a loop violation.
-    def _is_silence_handler(u: str) -> bool:
-        lo = u.lower()
-        return "still there" in lo or "take your time" in lo
-
-    utterances = [t["utterance"] for t in turn_results]
-    still_there_repeated = any(
-        _is_silence_handler(utterances[i]) and _is_silence_handler(utterances[i + 1])
-        for i in range(len(utterances) - 1)
-    )
+    # Loop guard: detect more than 3 consecutive silence-handler turns.
+    # Up to 3 re-engagement attempts are allowed (4th silence triggers wrap_up).
+    # A run of 4+ consecutive clarify utterances means the loop guard failed.
+    actions = [t["action"] for t in turn_results]
+    max_consec = 0
+    cur = 0
+    for a in actions:
+        if a == "clarify":
+            cur += 1
+            max_consec = max(max_consec, cur)
+        else:
+            cur = 0
+    still_there_repeated = max_consec > 3
 
     return ReplayResult(
         transcript_name=transcript.name,
@@ -199,6 +229,8 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
         scripted_total=len(transcript.scripted_questions),
         wrap_up_after_all_scripted=wrap_up_after_all_scripted,
         still_there_repeated=still_there_repeated,
+        probe_utterances=probe_utterances,
+        wrap_up_turn_index=wrap_up_turn_index,
     )
 
 
@@ -236,22 +268,29 @@ class WrapUpOnlyAfterAllScripted(Evaluator[ReplayInputs, ReplayResult, None]):
     A call that wraps up at turn 3 with 3 scripted questions unasked is a failure —
     the interviewer gave up too early. Returns True (N/A pass) when no wrap_up fired
     within the transcript's turn limit.
+
+    Skipped (N/A pass) for disengaged_early_exit, where early wrap_up is the
+    correct behaviour — DisengagementWrapsUp covers that case instead.
     """
+
+    _EXEMPT = {"disengaged_early_exit", "extended_silence_wrap_up"}
 
     def evaluate(
         self,
         ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
     ) -> bool:
+        if ctx.inputs.transcript.name in self._EXEMPT:
+            return True
         return ctx.output.wrap_up_after_all_scripted
 
 
 @dataclass
 class NoStillThereLoop(Evaluator[ReplayInputs, ReplayResult, None]):
-    """Interviewer must not repeat 'Still there?' on consecutive turns.
+    """Interviewer must not re-engage more than 3 times consecutively without wrapping up.
 
-    The loop guard in the prompt says: if 'Still there?' was said in the last
-    2 turns, skip clarify and advance to scripted. This evaluator detects when
-    that rule was violated.
+    Up to 3 consecutive clarify turns are allowed (silence 1→clarify, silence 2→clarify,
+    silence 3→clarify, silence 4→wrap_up). A run of 4+ consecutive clarifies means the
+    Python override failed to fire.
     """
 
     def evaluate(
@@ -259,6 +298,74 @@ class NoStillThereLoop(Evaluator[ReplayInputs, ReplayResult, None]):
         ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
     ) -> bool:
         return not ctx.output.still_there_repeated
+
+
+@dataclass
+class BridgingPhrasePresent(Evaluator[ReplayInputs, ReplayResult, None]):
+    """For transcripts with probe_seeds, at least one probe utterance must
+    contain a bridging phrase anchoring back to an earlier respondent statement.
+
+    The interviewer prompt instructs: when turns_ago ≥ 3, bridge with
+    'Earlier you mentioned X...' before asking. This checks the stale_probe_bridging
+    transcript where the probe is seeded at turn 1 and used at turn 5+.
+
+    Returns True (N/A pass) for transcripts with no probe_seeds.
+    """
+
+    _BRIDGE_PHRASES = ("earlier", "you mentioned", "going back", "you said", "you brought up")
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
+    ) -> bool:
+        if ctx.inputs.transcript.name != "stale_probe_bridging":
+            return True
+        if not ctx.output.probe_utterances:
+            return False
+        return any(
+            any(phrase in u.lower() for phrase in self._BRIDGE_PHRASES)
+            for u in ctx.output.probe_utterances
+        )
+
+
+@dataclass
+class WrapUpAfterFourthSilence(Evaluator[ReplayInputs, ReplayResult, None]):
+    """For the extended_silence_wrap_up transcript: wrap_up must fire by turn 5
+    (index 4 — the fourth consecutive silence turn).
+
+    Returns True (N/A pass) for all other transcripts.
+    """
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
+    ) -> bool:
+        if ctx.inputs.transcript.name != "extended_silence_wrap_up":
+            return True
+        idx = ctx.output.wrap_up_turn_index
+        return idx is not None and idx <= 4
+
+
+@dataclass
+class DisengagementWrapsUp(Evaluator[ReplayInputs, ReplayResult, None]):
+    """For the disengaged_early_exit transcript: wrap_up must fire within the
+    5-turn transcript even though scripted questions remain unanswered.
+
+    This evaluator intentionally passes when wrap_up fires *before* all
+    scripted are covered — that's the correct behaviour for a disengaged
+    respondent. It conflicts with WrapUpOnlyAfterAllScripted, so that
+    evaluator is skipped for this transcript in _build_dataset().
+
+    Returns True (N/A pass) for all other transcripts.
+    """
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
+    ) -> bool:
+        if ctx.inputs.transcript.name != "disengaged_early_exit":
+            return True
+        return ctx.output.wrap_up_turn_index is not None
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +392,9 @@ def _build_dataset() -> Dataset[ReplayInputs, ReplayResult, None]:
             ScriptedCursorAdvanced(),
             WrapUpOnlyAfterAllScripted(),
             NoStillThereLoop(),
+            BridgingPhrasePresent(),
+            WrapUpAfterFourthSilence(),
+            DisengagementWrapsUp(),
         ),
     )
 
@@ -323,6 +433,10 @@ async def test_replay_transcripts():
     for name, value in sorted(scores.items()):
         print(f"  {name:<28} {value:.3f}")
 
+    assert not report.failures, (
+        f"{len(report.failures)} transcript(s) errored: "
+        + ", ".join(f.name or "?" for f in report.failures)
+    )
     assert scores.get("AllActionsValid", 0) >= 1.0, (
         "Replay transcripts: interviewer produced unexpected actions on at least one turn"
     )
@@ -335,6 +449,15 @@ async def test_replay_transcripts():
     assert scores.get("NoStillThereLoop", 0) >= 1.0, (
         "Replay transcripts: interviewer repeated 'Still there?' on consecutive turns"
     )
+    assert scores.get("BridgingPhrasePresent", 1.0) >= 1.0, (
+        "stale_probe_bridging: interviewer did not bridge back with 'Earlier you mentioned…'"
+    )
+    assert scores.get("WrapUpAfterFourthSilence", 1.0) >= 1.0, (
+        "extended_silence_wrap_up: wrap_up did not fire after 4 consecutive silence turns"
+    )
+    assert scores.get("DisengagementWrapsUp", 1.0) >= 1.0, (
+        "disengaged_early_exit: interviewer kept asking scripted questions despite disengagement"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +466,7 @@ async def test_replay_transcripts():
 
 
 def _print_results(report) -> None:
-    header = f"{'transcript':<30} {'AV':>4} {'SC':>4} {'WU':>4} {'SL':>4}  turn actions"
+    header = f"{'transcript':<30} {'AV':>4} {'SC':>4} {'WU':>4} {'SL':>4} {'BP':>4} {'4S':>4} {'DE':>4}  turn actions"
     print(f"\nReplay eval results:\n{header}\n{'-' * len(header)}")
 
     def _b(src, key) -> str:
@@ -357,8 +480,11 @@ def _print_results(report) -> None:
         sc = _b(case.assertions, "ScriptedCursorAdvanced")
         wu = _b(case.assertions, "WrapUpOnlyAfterAllScripted")
         sl = _b(case.assertions, "NoStillThereLoop")
+        bp = _b(case.assertions, "BridgingPhrasePresent")
+        ss = _b(case.assertions, "WrapUpAfterFourthSilence")
+        de = _b(case.assertions, "DisengagementWrapsUp")
         actions = ", ".join(t["action"] for t in (case.output.turn_results if case.output else []))
-        print(f"{(case.name or ''):<30} {av} {sc} {wu} {sl}  {actions[:60]}")
+        print(f"{(case.name or ''):<30} {av} {sc} {wu} {sl} {bp} {ss} {de}  {actions[:60]}")
 
         if case.output:
             fails = [t for t in case.output.turn_results if not t["pass"]]

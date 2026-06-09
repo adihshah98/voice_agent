@@ -98,6 +98,15 @@ def _seed_engine(inputs: InterviewerCaseInputs):
                     rationale=p.rationale,
                 )
             )
+        if inputs.covered_subtopics:
+            s.add(
+                state.AnalystSnapshot(
+                    call_id=call_id,
+                    after_turn=len(inputs.prior_turns),
+                    after_scripted_cursor=cursor,
+                    covered_subtopics=list(inputs.covered_subtopics),
+                )
+            )
     return engine, call_id, len(inputs.prior_turns)
 
 

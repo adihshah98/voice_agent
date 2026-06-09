@@ -416,38 +416,53 @@ When `LOGFIRE_TOKEN` is unset, output is console-only. Evals always pass `send_t
 
 ## Eval Suite — `evals/`
 
-Three tiers using `pydantic_evals`. All run with `uv run pytest`.
+Four test files using `pydantic_evals`. All run with `uv run pytest`.
 
 ### Tier 1 — Single-turn interviewer decisions (`test_interviewer.py`)
 
-18 labeled cases in `datasets/interviewer_turns.yaml`. Each case specifies prior turns, pending probes, and expected action. Seeds a fresh in-memory SQLite per case.
+35 labeled cases in `datasets/interviewer_turns.yaml`. Each case specifies prior turns, pending probes, and expected action. Seeds a fresh in-memory SQLite per case, runs one real `run_speech_turn` call.
 
-Thresholds: ActionMatches ≥90% | SingleQuestion 100% | warmth ≥4.0/5 | non-leading ≥90%
+Thresholds: ActionMatches ≥90% | SingleQuestion 100% | warmth ≥4.0/5 | non-leading ≥90% | response_relevant ≥90%
 
 ### Tier 2 — Analyst probe quality (`test_analyst.py`)
 
-6 transcript cases in `datasets/analyst_probes.yaml` (contradiction-heavy, specificity-focused, clean).
+14 transcript cases in `datasets/analyst_probes.yaml`, including incremental (snapshot-seeded) cases.
 
-Thresholds: HasProbes 100% | NoDuplicateProbes 100% | probes_specific ≥4.0/5 | non_leading ≥90% | priority_calibrated ≥90%
+Thresholds: HasProbes 100% | NoDuplicateProbes 100% | ProbeUrgencyOrdered 100% | NoReprobeFromSnapshot 100% | probes_specific ≥4.0/5 | non_leading ≥90% | priority_calibrated ≥90% | covers_expected_topics ≥90%
 
-### Tier 3 — Full conversation trajectories (`test_trajectories.py`, `@pytest.mark.slow`)
+### Tier 3a — Replay transcripts (`test_replay.py`, `@pytest.mark.replay`)
 
-5 respondent personas in `datasets/personas.yaml`, driven by `simulator.py` (Sonnet 4.6 respondent simulator). Full loop: simulate turn → run analyst (awaited) → run interviewer → repeat up to 20 turns → run synthesis.
+6 canned full transcripts in `datasets/replay_transcripts.yaml`. **The respondent lines are fixed; only the interviewer runs live.** Fast (~40–60s, Haiku calls), CI-safe, deterministic. Tests multi-turn state effects that Tier 1 can't cover: scripted cursor advancement, probe staleness, `skip_scripted` on organic coverage, loop guards.
 
-Thresholds: CallCompletes 100% | CoveredAllScripted ≥75% | CaughtContradiction 100% (contradictory persona) | report_quality ≥3.0/5
+Thresholds: AllActionsValid 100% | ScriptedCursorAdvanced 100% | WrapUpOnlyAfterAllScripted 100% | NoStillThereLoop 100%
+
+### Tier 3b — Live simulation (`test_trajectories.py`, `@pytest.mark.slow`)
+
+3 personas (`contradictory`, `off_topic_rambler`, `silent_respondent`) driven by `simulator.py`. **Both sides run live**: a PydanticAI respondent agent generates its own responses each turn, and the real interviewer + analyst respond. Non-deterministic, ~60s, Sonnet calls. Tests emergent multi-agent behavior that replay can't cover.
+
+Thresholds: CaughtContradiction 100% | RedirectedOffTopic 100% | ProbesAreSpecific ≥80% | StaleProbesBridged ≥75%
+
+**Why the replay/simulation split:** 4 of the 7 personas (`power_user`, `skeptical_buyer`, `ai_skeptic`, `churn_risk`) don't require emergent behavior — their interesting behaviors can be fully specified as canned transcripts. Only `contradictory`, `off_topic_rambler`, and `silent_respondent` need live simulation because you can't pre-script whether the analyst will catch a contradiction and whether the interviewer will act on it. Replay is deterministic and CI-safe; simulation is reserved for behaviors that only emerge from live multi-agent interaction.
+
+**When to add a replay case vs. a simulation case:** Use replay whenever you can write down the exact respondent text that triggers the behavior you want to test — e.g. "after two `clarify` turns, does the next action advance to `scripted`?" Script those two silence turns in the YAML and assert the action on turn 3. Use simulation only when the behavior depends on what a live respondent *chooses* to say in response to the interviewer — contradictions, off-topic tangents, and extended silence chains all require a live respondent because the interesting signal is emergent rather than scripted.
+
+### Synthesis (`test_synthesis.py`)
+
+Runs synthesis agent against the same 6 replay transcripts. Tests the post-call synthesis path independently of trajectory evals. Note: synthesis is currently **disabled in production** (`ENABLE_SYNTHESIS_REPORT=False` in `config.py`).
+
+Thresholds: SynthesisNotEmpty 100% | HasKeyFields 100% | report_quality ≥3.0/5
 
 ### Eval datasets
 
-
-| File                      | Contents                                                                      |
-| ------------------------- | ----------------------------------------------------------------------------- |
-| `interviewer_turns.yaml`  | 18 single-turn cases (probe×5, scripted×5, clarify×3, wrap_up×3, off_topic×2) |
-| `analyst_probes.yaml`     | 6 transcript cases for analyst quality                                        |
+| File                           | Contents                                                                                        |
+| ------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `interviewer_turns.yaml`       | 35 single-turn cases (probe, scripted, clarify, wrap_up, off_topic, skip_scripted, clarify)     |
+| `analyst_probes.yaml`          | 14 transcript cases including incremental (snapshot-seeded) cases                               |
+| `replay_transcripts.yaml`      | 6 canned full transcripts; respondent lines fixed, interviewer runs live                        |
+| `personas.yaml`                | 7 respondent personas; 3 used for live simulation, 4 covered by replay transcripts              |
 | `data/investor_questions.yaml` | 10-question canonical scripted arc with `[product]` token (not an eval fixture — lives in `data/`) |
-| `personas.yaml`           | 6 respondent personas for trajectory evals                                    |
 
-
-LLM judge model: `claude-opus-4-6` (defined in `evals/evaluators.py`).
+LLM judge model: `claude-sonnet-4-6` (defined in `evals/evaluators.py`).
 
 ---
 

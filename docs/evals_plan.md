@@ -1,355 +1,201 @@
-# Evals Plan: Voice Agent
+# Evals Gap Analysis & Plan
 
-## Context
-
-The current 3-tier eval system (pydantic_evals, 18 Tier 1 cases, 6 Tier 2, 6 Tier 3 personas) is solid but has four compounding problems:
-
-1. **REPL path divergence silently invalidates eval results.** Evals call `run_interviewer()` with a live session; production calls `TurnPipeline.stream_tokens()` with `deps.session=None`. They exercise different code paths.
-2. **No online evals.** Logfire captures rich per-turn telemetry, but no automatic post-call scoring fires on production traffic.
-3. **No versioning / score history.** Can't correlate "which dataset version + git SHA produced which scores."
-4. **Tier 3 is too slow and expensive to be prod-grade.** Full simulation with a Sonnet respondent per turn is ~40–80 LLM calls per persona, non-deterministic, and runs minutes. Not suitable for CI.
+Current state: 35 Tier 1 cases, 14 Tier 2 cases, 6 replay transcripts, 3 simulation personas. All evals route through `run_speech_turn()` (production path). This document tracks what's not yet covered and what to build next.
 
 ---
 
-## Platform Choice: Logfire Evals + Live Evals
+## What's Already Covered
 
-Logfire/pydantic-evals provides exactly the right infrastructure:
-
-- **Offline evals → Logfire Evals UI** (`/evals`): `logfire.configure()` + `dataset.evaluate()` sends every eval run (per-case scores, aggregates, evaluator traces) to the Logfire Evals: Datasets & Experiments page automatically. Datasets can also be hosted in Logfire via `LogfireAPIClient` and fetched at eval time. Use `send_to_logfire='if-token-present'` so local runs are free and CI with `LOGFIRE_TOKEN` set lands in the UI.
-
-- **Online evals → Logfire Live Evals** (`/live-evals`): `pydantic_evals.online.evaluate` decorator (or `OnlineEvaluation` capability on PydanticAI agents) runs evaluators in the background on live traffic and emits `gen_ai.evaluation.result` OTel events. These show up on the Live Monitoring page with sparklines per evaluator per target over time. **This replaces the hand-rolled `online_eval.py` approach** — no new file needed, just decorate the right function.
-
-Both are in the existing `pydantic-evals` + `logfire` stack already installed.
-
----
-
-## Priority 1: Fix the REPL Path Divergence
-
-**This is the most critical fix — it currently invalidates Tier 1 and Tier 3 results.**
-
-### The Exact Divergence
-
-| | Production | Evals today |
-|---|---|---|
-| Entry | `TurnPipeline.stream_tokens()` | `run_interviewer()` in `interviewer.py` |
-| `deps.session` | Always `None` | Always non-None |
-| DB prep | `prepare_interviewer_turn_concurrent()` (async parallel) | `prepare_interviewer_turn()` (sync sequential) |
-| vapi_messages | Always from Vapi webhook | `_db_messages_fallback()` if missing |
-| Session lifetime | Closed before LLM call | Open during entire LLM call |
-
-`run_interviewer()`, `prepare_interviewer_turn()`, and `_db_messages_fallback()` in `interviewer.py` are never called in production. Evals test a dead code path.
-
-### Fix: Route Evals Through `run_speech_turn()`
-
-`run_speech_turn()` in `turn.py` already wraps `TurnPipeline` exactly as production does. It takes `(engine, call_id, vapi_messages)`, runs `stream_tokens()` + `commit()`, and returns a dict with `action`, `message`, `reasoning`, `should_run_analyst`, etc.
-
-**`evals/test_interviewer.py`** — replace `run_interviewer_on_case()`:
-
-```python
-from voice_agent.turn import run_speech_turn
-
-async def run_interviewer_on_case(inputs: InterviewerCaseInputs) -> InterviewerOutput:
-    engine, call_id, _ = _seed_engine(inputs)
-    vapi_messages = [
-        {"role": "assistant" if t.speaker == "interviewer" else "user", "content": t.text}
-        for t in inputs.prior_turns
-    ]
-    vapi_messages.append({"role": "user", "content": inputs.last_respondent})
-    result = await run_speech_turn(engine, call_id, vapi_messages=vapi_messages)
-    return InterviewerOutput(
-        utterance=result["message"],
-        action=result["action"],
-        reasoning=result["reasoning"],
-    )
-```
-
-Remove the `run_interviewer` import and the `session_scope` block. `_seed_engine()` is unchanged.
-
-**`evals/test_trajectories.py`** — inner loop "Interviewer turn" block (lines 157–179):
-
-```python
-# Remove: with state.session_scope(engine) as s: block wrapping run_interviewer()
-# Remove: manual session.add(state.Turn(...)) for the interviewer turn — commit() does it
-vapi_messages = [
-    {"role": "assistant" if t["speaker"] == "interviewer" else "user", "content": t["text"]}
-    for t in history
-]
-result = await run_speech_turn(engine, call_id, vapi_messages=vapi_messages)
-# out.action → result["action"], out.utterance → result["message"]
-```
-
-`commit()` now writes the interviewer Turn row — remove the manual `session.add(Turn(...))` for the interviewer inside the loop.
-
-### Post-Fix Cleanup (Not Blocking)
-
-`run_interviewer()`, `prepare_interviewer_turn()`, `_db_messages_fallback()` in `interviewer.py` will have no callers except the REPL. Add `# REPL-only — not used in production or evals` on each. Leave for a future REPL consolidation.
+| Behavior | Where tested |
+|---|---|
+| Action selection (probe/scripted/clarify/wrap_up/off_topic/skip_scripted) | Tier 1 — 35 single-turn cases |
+| Utterance warmth, single question, non-leading, topical relevance | Tier 1 — LLMJudge evaluators |
+| Analyst probe quality: specificity, non-leading, priority calibration | Tier 2 — 14 cases |
+| Analyst incremental behavior (no re-probe from prior snapshot) | Tier 2 — snapshot-seeded cases |
+| Scripted cursor advancement over a full arc | Replay — all 6 transcripts |
+| `skip_scripted` on organic coverage | Replay — `skip_scripted_organic_coverage` |
+| Silence → "Still there?" (single occurrence) | Replay — `non_happy_path_silence_vague` |
+| Vague answer → clarify | Replay — `non_happy_path_silence_vague` |
+| Loop guard: no consecutive "Still there?" | Replay — `loop_guard_no_repeat` evaluator |
+| `WrapUpOnlyAfterAllScripted` — no premature exit | Replay — evaluator on all 6 transcripts |
+| Analyst catches contradiction + interviewer probes it | Simulation — `contradictory` persona |
+| Off-topic redirect | Simulation — `off_topic_rambler` persona |
+| Extended silence → wrap_up after 3× "Still there?" | Simulation — `silent_respondent` persona |
+| Probe specificity and stale-probe bridging | Simulation — `ProbesAreSpecific`, `StaleProbesBridged` |
 
 ---
 
-## Priority 2: Offline Evals → Logfire Evals UI
+## Gaps by Category
 
-### Wire Logfire Evals into the existing test files
+### 1. Stale probe bridging ("Earlier you mentioned…")
 
-Change `init_tracing(send_to_logfire=False)` → `logfire.configure(send_to_logfire='if-token-present')` at the top of each eval test file. When `LOGFIRE_TOKEN` is set (CI), every `dataset.evaluate()` call sends results to the Logfire Evals page automatically. Locally without a token, evals run as before with no changes.
+**What the prompt says:** When a probe is 3–8 turns old (`turns_ago 3–8`), bridge with "Earlier you mentioned X…" before asking.
 
-No structural changes to the eval framework — `pydantic_evals.Dataset.evaluate()` already sends traces when Logfire is configured.
+**What's tested:** `StaleProbesBridged` in the simulation eval scores this, but only when stale probes actually appear in the trajectory — and even then only at a 75% threshold. No deterministic replay case verifies that phrasing.
 
-### Add Dataset Name to Each Dataset
+**Gap:** No replay transcript seeds a probe at turn N and then forces the interviewer to use it at turn N+4, verifying the utterance contains a bridging phrase.
 
-```python
-dataset = Dataset[InterviewerCaseInputs, InterviewerOutput, None](
-    name="tier1-interviewer-decisions",  # shows up as dataset name in Logfire UI
-    cases=cases,
-    evaluators=[ActionMatches(), SingleQuestion(), ...],
-)
-```
+**Fix — new replay transcript: `stale_probe_bridging`**
+- Turn 1–2: analyst generates a probe (seed in DB directly, or verify via analyst output)
+- Turns 3–5: three scripted turns that don't trigger the probe
+- Turn 6: respondent answer that has no new signal — interviewer should reach for the now-stale probe and bridge with "Earlier you mentioned…"
+- Add a new evaluator `BridgingPhrasePresent` that checks for "earlier" / "you mentioned" / "going back" in utterances where `action=probe` and the probe is 3+ turns old.
 
-This lets you track score history per named dataset across git SHAs.
+---
 
-### Tier 1 — New YAML Cases (append to `evals/datasets/interviewer_turns.yaml`)
+### 2. Silence handling — full 3× sequence
 
-Current 18 cases cover probe (5), scripted (5), clarify (3), wrap_up (3), off_topic (2). Missing:
+**What the prompt says:** silence → "Still there?" → silence → "Still there?" → silence → `wrap_up`.
 
-| Gap | Case name | Expected action |
-|---|---|---|
-| `[silence]` → clarify | `true_silence_clarify` | clarify |
-| Pure filler ("um") → clarify | `thinking_filler_clarify` | clarify |
-| ROI quantification → probe | `roi_quantification_probe` | probe |
-| Named competitor mention → probe | `competitor_mention_probe` | probe |
-| Expansion signal → probe | `expansion_signal_probe` | probe |
-| Low rating (4/10) → probe | `low_rating_probe` | probe |
-| Scripted topic already organically covered → skip | `skip_scripted_already_covered` | skip_scripted |
+**What's tested:** `NoStillThereLoop` (in replay) catches *consecutive* "Still there?" turns. `HandledSilenceGracefully` (in simulation) checks that at least one "Still there?" and one "Take your time." appeared and that `wrap_up` eventually fired.
 
-**+7 cases → 25 total.** No Python changes; append YAML entries.
+**Gap:** No replay transcript walks through the full 3-silence chain to assert `wrap_up` fires at exactly the right point. The simulation test covers this but non-deterministically.
 
-### Tier 2 — New Analyst Cases (append to `evals/datasets/analyst_probes.yaml`)
-
-Current 6 cases: contradictions (3), specificity (1), advocacy gap (1), clean (1). Missing:
-
-| Gap | Case name | Expected probe |
-|---|---|---|
-| Low adoption + IT security block | `red_flag_low_adoption` | priority-1 probe |
-| Strong word-of-mouth + expansion | `pmf_expansion_signal` | priority-1 or priority-2 |
-
-**+2 cases → 8 total.** No Python changes; append YAML entries.
-
-### Dataset Versioning via YAML Frontmatter
-
-Add to each `evals/datasets/*.yaml`:
+**Fix — new replay transcript: `extended_silence_wrap_up`**
 ```yaml
-version: "2026-05-05.1"
-description: "Added 7 Tier 1 cases: silence, investor triggers, skip_scripted"
-cases:
-  - ...
+turns:
+  - text: "We use it for customer calls."   # substantive turn
+    expected_actions: [scripted, probe]
+  - text: "[silence]"                        # → "Still there?"
+    expected_actions: [clarify]
+  - text: "[silence]"                        # → "Still there?" again (count=2)
+    expected_actions: [clarify]
+  - text: "[silence]"                        # → wrap_up (count=3)
+    expected_actions: [wrap_up]
 ```
+Add evaluator `WrapUpAfterThirdSilence` — checks `wrap_up` fires by turn 4 of this transcript.
 
-Add to `evals/cases.py`:
-```python
-def get_dataset_version(path: str | Path) -> str:
-    raw = yaml.safe_load(Path(path).read_text())
-    return raw.get("version", "unversioned")
-```
-
-Pass `dataset_version` as metadata on the Dataset or as a span attribute — shows up in the Logfire Evals UI next to each run.
+Also add a case for the `um` → "Take your time." → silence → "Still there?" chain (not "Take your time." twice in a row).
 
 ---
 
-## Priority 3: Tier 3 — Faster, Prod-Grade E2E Evals
+### 3. `skip_scripted` — multiple consecutive skips
 
-### Problem with Current Tier 3
+**What's tested:** `skip_scripted_organic_coverage` has two `skip_scripted` turns but they're separated by substantive content.
 
-Tier 3 runs a Sonnet respondent per turn — 20 turns × 6 personas = 120 Sonnet calls + 120 Haiku calls + 6 Opus synthesis = ~$1.50/run, ~5 minutes, non-deterministic. That's not CI-able and score variance is high.
+**Gap:** No test for the pathological case where the respondent's first answer organically covers Q2 and Q3 simultaneously, requiring two consecutive `skip_scripted` actions before landing on an unanswered question.
 
-### Solution: Three-Layer Tier 3 Strategy
+**Fix — new replay transcript: `multi_skip_scripted`**
+- Q1–Q5 loaded; respondent's turn 1 covers Q1, Q2, Q3 all at once
+- Expected actions on turn 1: `[skip_scripted]`
+- Expected actions on turn 2: `[skip_scripted]` (skipping Q3 too)
+- Expected actions on turn 3: `[scripted]` (Q4 genuinely unanswered)
 
-**Layer A — Replay Evals (new, fast, deterministic, CI-safe)**
+---
 
-Store canned full transcripts as YAML. The respondent lines are fixed; only the interviewer runs live. Tests multi-turn state effects that Tier 1 can't cover: `covered_subtopics` accumulation, probe staleness, scripted cursor advancement, barge-in reconciliation.
+### 4. Early wrap-up when respondent is disengaged
 
-**New file: `evals/datasets/replay_transcripts.yaml`**
+**What the prompt says (step 8):** Wrap up when scripted remaining is 0 *and no important threads remain*. But the prompt also implies wrapping up on sustained disengagement (repeated silence, off-topic with no return).
+
+**What's tested:** `WrapUpOnlyAfterAllScripted` prevents *premature* wrap-up. But there's no test for the inverse: does the interviewer *actually* wrap up promptly on genuine disengagement rather than grinding through all scripted questions robotically?
+
+**Gap:** A transcript where the respondent gives 3 consecutive one-word or dismissive answers after a natural conversational endpoint — does the interviewer wrap up, or does it keep asking scripted questions?
+
+**Fix — new replay transcript: `disengaged_early_exit`**
+- Turn 1: good answer
+- Turn 2: "Not really." (vague → clarify)
+- Turn 3: "I dunno." (vague again)
+- Turn 4: "Fine I guess." (third low-signal answer)
+- Expected actions on turn 4 or 5: `[wrap_up]` — interviewer should read disengagement and close gracefully rather than continuing to ask scripted questions
+
+This requires a new evaluator or a looser `expected_actions` definition; the key is asserting `wrap_up` fires before all scripted are done, which the current `WrapUpOnlyAfterAllScripted` evaluator would *fail* — so we'd need a `DisengagementWrapsUp` evaluator that passes on this transcript only.
+
+---
+
+### 5. Context drift / topic already covered in COVERED_SUBTOPICS
+
+**What the prompt says (step 2):** Before choosing any action, check COVERED_SUBTOPICS. If the specific subtopic you're about to ask about was already addressed, skip it.
+
+**What's tested:** `skip_scripted_organic_coverage` tests this at the scripted-question level. But there's no test for the analyst generating a probe about a topic that's already in `COVERED_SUBTOPICS` — does the interviewer skip it rather than re-ask?
+
+**Gap:** No replay or Tier 1 case seeds a probe whose topic is already in `covered_subtopics` and asserts the probe is skipped (either `scripted` action or a different probe is used).
+
+**Fix — new Tier 1 case: `skip_probe_already_covered`**
 ```yaml
-version: "2026-05-05.1"
-transcripts:
-  - name: power_user_arc
-    scripted_questions: [...]
-    turns:
-      - speaker: respondent
-        text: "We use it for every external call, about 30 a week..."
-        expected_actions: [scripted, probe]
-      - speaker: respondent
-        text: "Honestly the Slack integration is the biggest thing missing..."
-        expected_actions: [probe, scripted]
+covered_subtopics:
+  - "Slack integration missing feature"
+probes:
+  - question: "You mentioned Slack — is that integration missing for the whole team or just you?"
+    priority: 2
+prior_turns: [...]
+last_respondent: "Yeah so that's basically it."
+expected_action: scripted  # probe topic is covered; should move to scripted
 ```
-
-`expected_actions` is a set — any listed action passes. Absorbs LLM variance while catching regressions.
-
-**New file: `evals/test_replay.py`**
-
-```python
-@pytest.mark.replay
-async def test_replay_transcripts():
-    for transcript in load_replay_transcripts():
-        engine, call_id = seed_replay(transcript)
-        history = []
-        for turn in transcript.turns:
-            history.append({"role": "user", "content": turn.text})
-            result = await run_speech_turn(engine, call_id, vapi_messages=history)
-            assert result["action"] in turn.expected_actions
-            history.append({"role": "assistant", "content": result["message"]})
-```
-
-**Runtime:** 3 transcripts × 10 turns = 30 Haiku calls ≈ 20s. Mark `@pytest.mark.replay`, run in CI fast path.
-
-**Layer B — Focused Simulation (existing Tier 3, scoped down)**
-
-Keep the full simulation but reduce scope: run only the **2 persona-specific behaviors** that require live simulation — `contradictory` (analyst contradiction detection) and `off_topic_rambler` (redirect action). Cap at 12 turns. Skip synthesis for speed.
-
-These two are the only personas testing emergent multi-agent behavior (analyst ↔ interviewer interaction) that replay can't cover. The other 4 personas (power_user, skeptical_buyer, ai_skeptic, churn_risk) become replay transcripts instead.
-
-Result: **2 Sonnet personas × 12 turns = 24 Sonnet calls** vs current 120. ~$0.25/run, ~45s. Mark `@pytest.mark.slow` — run in nightly CI or pre-deploy only.
-
-**Layer C — Synthesis Quality (separate, infrequent)**
-
-Pull the `ReportQuality` LLMJudge into its own test file `evals/test_synthesis.py`. Run against a fixed set of stored transcripts (the replay transcripts) rather than re-simulating. This makes synthesis evals reproducible and separable from trajectory evals.
-
-### After REPL Path Fix
-
-Replace `run_interviewer()` calls in the remaining simulation loop (the 2 persona sim) with `run_speech_turn()`. Remove manual Turn row inserts — `commit()` handles them.
 
 ---
 
-## Priority 4: Online Evals → Logfire Live Evals
+### 6. Re-ask / rabbit hole prevention
 
-### Mechanism
+**What the prompt says:** "Never re-ask what the respondent has already answered." Hard rule.
 
-`pydantic_evals.online` provides two hooks:
+**What's tested:** `loop_guard_no_repeat` checks for consecutive silence handlers. But no eval checks whether the model re-asks a *content question* (e.g., asks about Slack integration twice in the same transcript).
 
-1. **`@evaluate` decorator** — wraps any async function; evaluators run in background after each call
-2. **`OnlineEvaluation` capability** — attaches evaluators directly to a PydanticAI agent
+**Gap:** No multi-turn test where the same topic comes up in both a scripted question and a probe, verifying only one is asked.
 
-Results are emitted as `gen_ai.evaluation.result` OTel events and show up on the Live Evals page with sparklines over time. No new file, no new DB table.
-
-### What to Instrument
-
-**`TurnPipeline.stream_tokens()` in `turn.py`** — wrap the commit result with `@evaluate` or emit inline. The natural place is after `commit()` returns, using the existing `logfire.info("interviewer_stream_done", ...)` span as the hook point.
-
-Evaluators to attach:
-
-```python
-from pydantic_evals.online import OnlineEvalConfig
-
-online_eval_config = OnlineEvalConfig(emit_otel_events=True)
-
-@dataclass
-class SingleQuestionOnline(Evaluator):
-    def evaluate(self, ctx: EvaluatorContext) -> bool:
-        return ctx.output.get("utterance", "").count("?") <= 1
-
-@dataclass
-class ActionIsValid(Evaluator):
-    VALID_ACTIONS = {"probe", "scripted", "clarify", "off_topic", "wrap_up", "skip_scripted"}
-    def evaluate(self, ctx: EvaluatorContext) -> bool:
-        return ctx.output.get("action") in self.VALID_ACTIONS
-
-@dataclass
-class FillerRate(Evaluator):
-    def evaluate(self, ctx: EvaluatorContext) -> float:
-        # Returns 0.0 or 1.0 per turn; Live Evals shows the rolling average
-        return 1.0 if ctx.output.get("filler_injected") else 0.0
-```
-
-**Post-call (analyst output)** — attach evaluators to `run_analyst_safely` in `analyst.py`:
-
-```python
-@dataclass
-class ProbesGenerated(Evaluator):
-    def evaluate(self, ctx: EvaluatorContext) -> bool:
-        return bool(ctx.output and ctx.output.new_probes)
-```
-
-### Configuration
-
-Initialize at server startup in `voice_agent/server.py` lifespan (or `tracing.py`):
-
-```python
-from pydantic_evals.online import configure as configure_online_evals
-configure_online_evals(
-    emit_otel_events=True,
-    default_sample_rate=1.0,  # score every production turn
-)
-```
-
-`emit_otel_events=True` is the only thing needed — Logfire's OTel exporter picks up `gen_ai.evaluation.result` events automatically.
-
-### Live Evals Page
-
-After a few calls, the `/live-evals` page shows:
-- `SingleQuestionOnline` pass rate over time per interviewer turn
-- `FillerRate` rolling average
-- `ProbesGenerated` rate per analyst run
-
-Alerts can be set in Logfire when pass rates drop below threshold.
+**Fix — new replay transcript: `no_topic_repeat`**
+- Turn 1: respondent mentions Slack integration gap organically
+- Turn 2: interviewer asks scripted Q3 ("What frustrated you?") — respondent restates Slack
+- Turn 3: analyst probe seeded: "How often do you manually copy-paste summaries?"
+- Expected: interviewer should NOT re-ask about Slack integration; should advance to next scripted or use a different probe
+- Add evaluator `NoTopicRepeat` — checks whether the same named entity (e.g. "Slack") appears in both an interviewer question and the subsequent turn where it was already answered, and flags if the interviewer re-raises it anyway.
 
 ---
 
-## Implementation Sequence
+### 7. Depth without breadth trade-off (probe at correct depth, don't skip scripted)
 
-| Step | File(s) | What | Blocker |
+**What the prompt says:** Priority 1 and 2 probes beat scripted. Priority 3 yields to scripted.
+
+**What's tested:** Tier 1 has single-turn cases for probe vs. scripted priority. But no multi-turn test verifies that a Priority 3 probe doesn't cause the interviewer to skip scripted questions it should be asking.
+
+**Gap:** No replay transcript that seeds a Priority 3 probe and verifies the interviewer still asks the next scripted question rather than burning the turn on the low-priority probe.
+
+**Fix — new replay transcript: `priority3_yields_to_scripted`**
+- Seed a Priority 3 probe in DB
+- Turn 1: substantive answer with no urgent signals
+- Expected action: `[scripted]` — Priority 3 should yield
+- Turn 2: scripted done, now Priority 3 probe is the only option
+- Expected action: `[probe]`
+
+---
+
+### 8. Wrap-up completeness — all scripted + key threads before closing
+
+**What's tested:** `WrapUpOnlyAfterAllScripted` checks wrap_up doesn't fire before all scripted are done. `CoveredAllScripted` in simulation checks coverage at end. But neither checks whether important *open threads* (pending Priority 1 or 2 probes) were addressed before wrap_up.
+
+**Gap:** No test for: interviewer fires `wrap_up` while a Priority 1 probe is still pending — this is a quality failure.
+
+**Fix — new Tier 1 case: `no_wrap_up_with_p1_probe_pending`**
+```yaml
+scripted_remaining: 0
+probes:
+  - question: "You mentioned evaluating Fireflies — what specifically prompted that?"
+    priority: 1
+last_respondent: "That pretty much covers it from my end."
+expected_action: probe  # must probe the P1 signal before wrapping
+```
+
+---
+
+### 9. Structured logging / observability gap (not an eval — a production monitoring gap)
+
+**What's missing:** There's no structured per-turn log event in `TurnPipeline.commit()` that records `action`, `utterance`, `filler_injected`, `probe_id_used` as queryable fields in Logfire. All the state machine signal is in spans but not as a discrete event you can aggregate across calls.
+
+**Fix:** Add one `logfire.info("turn_committed", call_id=call_id, turn_number=..., action=..., filler_injected=..., probe_id_used=..., utterance_chars=len(utterance))` in `commit()`. Lets you query: action distribution, how often probes are stale when asked, filler injection rate, silence handler rate — all from real calls.
+
+---
+
+## Implementation Priority
+
+| Priority | Gap | Type | Effort |
 |---|---|---|---|
-| 1 | `evals/test_interviewer.py` | Use `run_speech_turn`, remove session block | **Do first** |
-| 2 | `evals/test_trajectories.py` | Use `run_speech_turn`, remove manual Turn inserts | After Step 1 |
-| 3 | `evals/test_*.py` | `logfire.configure(send_to_logfire='if-token-present')`, add `Dataset(name=...)` | None |
-| 4 | `evals/datasets/interviewer_turns.yaml` | +7 Tier 1 cases | After Step 1 (verify they pass) |
-| 5 | `evals/datasets/analyst_probes.yaml` | +2 Tier 2 cases | None |
-| 6 | `evals/cases.py` | Add `get_dataset_version()` | None |
-| 6 | `evals/datasets/*.yaml` | Add `version:` + `description:` fields | None |
-| 7 | `evals/datasets/replay_transcripts.yaml` | 3 canned transcripts | None |
-| 7 | `evals/test_replay.py` | Replay eval harness | After Step 1 |
-| 8 | `evals/test_trajectories.py` | Scope to 2 simulation personas, remove other 4 | After Step 2 |
-| 8 | `evals/test_synthesis.py` | Pull out synthesis eval, replay-transcript driven | After Step 7 |
-| 9 | `voice_agent/turn.py` + `analyst.py` | Wire online eval decorators | None |
-| 9 | `voice_agent/server.py` or `tracing.py` | `configure_online_evals(emit_otel_events=True)` | None |
+| 1 | Stale probe bridging ("Earlier you mentioned…") | New replay transcript + evaluator | Medium |
+| 1 | Full 3× silence → wrap_up chain | New replay transcript + evaluator | Low |
+| 2 | Early wrap-up on disengagement | New replay transcript + new evaluator | Medium |
+| 2 | `wrap_up` blocked by pending P1 probe | New Tier 1 case | Low |
+| 2 | `skip_probe` when topic in `covered_subtopics` | New Tier 1 case | Low |
+| 3 | Multi-`skip_scripted` consecutive | New replay transcript | Low |
+| 3 | No topic repeat within a transcript | New replay transcript + evaluator | Medium |
+| 3 | Priority 3 probe yields to scripted | New replay transcript | Low |
+| 4 | Structured `turn_committed` log in `commit()` | Production code change | Low |
 
----
-
-## Key Design Decisions
-
-**Why `run_speech_turn` and not a new `run_interviewer_for_eval()`?**
-Any wrapper that partially replicates `TurnPipeline` will drift again. Calling `run_speech_turn` directly means evals and production share one code path — the divergence problem can't recur.
-
-**Why Logfire Live Evals instead of a custom `online_eval.py`?**
-`pydantic_evals.online` is already installed, emits OTel events natively, shows up in the Live Evals page with no extra code, and is maintained by Pydantic. A hand-rolled post-call scorer would be more work, harder to visualize, and would drift from the framework.
-
-**Why Logfire Evals UI instead of just logging aggregate scores?**
-`logfire.configure()` + `dataset.evaluate()` sends full per-case traces (each evaluator's score + rationale for LLMJudge) to the UI, not just aggregates. You can drill into which specific case regressed, compare runs side-by-side, and manage datasets from the UI. Score-only logging loses this.
-
-**Why scoped simulation (2 personas) instead of full 6-persona simulation?**
-Only 2 personas (`contradictory`, `off_topic_rambler`) test emergent multi-agent behavior that replay can't cover — analyst contradiction detection and off_topic redirect. The other 4 test interviewer output quality, which is better tested deterministically via replay. Cutting from 6 to 2 personas + capping at 12 turns reduces simulation cost by ~80%.
-
-**Why replay transcripts instead of always running the simulator for Tier 3?**
-Simulator is non-deterministic (LLM-driven) and slow. Replay transcripts fix the respondent text, making multi-turn evals deterministic and cheap (~20s in CI). They test the state machine (covered_subtopics, probe staleness, scripted cursor) which single-turn Tier 1 can't catch, without paying for a live Sonnet respondent.
-
----
-
-## Critical Files
-
-- [evals/test_interviewer.py](evals/test_interviewer.py) — Step 1 (REPL fix, most critical)
-- [evals/test_trajectories.py](evals/test_trajectories.py) — Steps 2 & 8 (REPL fix + scope reduction)
-- [evals/cases.py](evals/cases.py) — Step 6 (versioning)
-- [evals/datasets/interviewer_turns.yaml](evals/datasets/interviewer_turns.yaml) — Step 4
-- [evals/datasets/analyst_probes.yaml](evals/datasets/analyst_probes.yaml) — Step 5
-- [evals/datasets/replay_transcripts.yaml](evals/datasets/replay_transcripts.yaml) — Step 7 (new file)
-- [evals/test_replay.py](evals/test_replay.py) — Step 7 (new file)
-- [evals/test_synthesis.py](evals/test_synthesis.py) — Step 8 (new file)
-- [voice_agent/turn.py](voice_agent/turn.py) — Step 9 (online eval decorators)
-- [voice_agent/agents/analyst.py](voice_agent/agents/analyst.py) — Step 9 (online eval decorators)
-- [voice_agent/server.py](voice_agent/server.py) or [voice_agent/tracing.py](voice_agent/tracing.py) — Step 9 (configure online evals)
-
-## Verification
-
-- After Step 1: `uv run pytest evals/test_interviewer.py -v` — all 18 cases pass
-- After Step 4: `uv run pytest evals/test_interviewer.py -v` — 25 cases pass
-- After Step 7: `uv run pytest evals/test_replay.py -v -m replay` — 3 transcripts × ~10 turns in ~20s
-- After Step 8: `uv run pytest evals/test_trajectories.py -v -s -m slow` — 2 personas only, ~45s
-- After Step 9: trigger a test call → check Logfire `/live-evals` page for `gen_ai.evaluation.result` events
-- Offline scores: after CI run with `LOGFIRE_TOKEN` set → check `/evals` page for tier1/tier2 datasets
+All replay additions are YAML-only unless a new evaluator is needed. All Tier 1 additions are YAML-only. The only code changes are the new evaluators (`BridgingPhrasePresent`, `WrapUpAfterThirdSilence`, `DisengagementWrapsUp`, `NoTopicRepeat`) and the Logfire log line.

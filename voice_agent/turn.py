@@ -309,6 +309,18 @@ class TurnPipeline:
                     should_run_analyst = state.should_run_analyst(session, call_id)
         persist_ms = int((time.perf_counter() - persist_t0) * 1000)
 
+        logfire.info(
+            "turn_committed",
+            call_id=call_id,
+            turn_number=turn_number,
+            action=reply.action,
+            probe_id_used=reply.probe_id_used,
+            filler_injected=self._filler_injected,
+            utterance_chars=len(reply.utterance),
+            llm_latency_ms=self._llm_latency_ms,
+            persist_ms=persist_ms,
+        )
+
         return StreamTurnResult(
             action=reply.action,
             reasoning=reply.reasoning,

@@ -1,25 +1,10 @@
 ## Todo
 
 - Evals
-  - Tier 3: 
-    - See if it is covering enough
-      - Make sure it asks everything - Done
-      - When handling a probe from earlier, it should say like you said earlier - Done 
-      - Silence not working
-      - Scripted Skip not working
-      - Context compression for topics covered
-      - Context drift: agent forgets or misinterprets earlier info
-      - Make sure it wraps up with everything covered in a set time but probes at correct depth
-      - Make sure it doesn't ask again/get stuck in loops/rabbitholes - ENd if responder is not talking/off-topic. Do'nt wait till all scripted are asked
-  - Misc
-    - Diff btw replay & trajectory
-    - See if we are testing appropriate things
-    - Should test an E2E interview but efficiently
-    - Ask if it's prod grade
-    - Best way to track state transitions etc. of the agents? (Like still there etc.)
-    - Run the evals (See if working & fix what is not)
-  - Versioned datasets/eval runs: 
-    - How to view & compare nicely
+  - Trajectory Evals
+    - Context compression for topics covered
+    - Context drift: agent forgets or misinterprets earlier info (the context compression compresses questions, what abt answers)
+    - Make sure it wraps up with everything covered in a set time but probes at correct depth
   - Online Evals: 
     - Only returning that probes were generated - we should add more
 - Infra - Prod Level
@@ -40,9 +25,16 @@
 
 ## Future improvements
 
+- Flow
+  - RIght now, we pause on 3 clarifies - this is if the user is giving non-commital replies, but even in cases of genuine temporary lack of conection, it might end call
+  - What if user has to tend to doorbell and asks agent to pause for 3-5 minutes
+- Decision Making
+  - Some kind of deterministic order to decide what action to take?
+  - Is our code/logic modular
 - Evals
   - Host datasets directly on Logfire (Currently we run it on local and save runs there, now we can host datasets, collab etc. directly on LF)
   - Hosted prompt & prompt versioning on Logfire
+  - Versioned eval datasets
 - Prod Infra
   - Multi-server deployment - cleaning up data that is in-memory worker dependant
   - CI/CD

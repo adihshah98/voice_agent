@@ -1,5 +1,5 @@
-version: "2026-05-07.1"
-description: "6 canned replay transcripts. Tests multi-turn state: covered_subtopics accumulation, probe staleness, scripted cursor advancement, skip_scripted on organic coverage, non-happy-path silence/vague handling, loop guard."
+version: "2026-06-08.1"
+description: "11 canned replay transcripts. Tests multi-turn state: covered_subtopics accumulation, probe staleness, scripted cursor advancement, skip_scripted on organic coverage, non-happy-path silence/vague handling, loop guard (4-silence wrap-up)."
 
 transcripts:
   - name: power_user_arc
@@ -206,8 +206,185 @@ transcripts:
         text: ""
         expected_actions: [clarify]
 
-      # Turn 4: another silence — loop guard fires; must NOT say "Still there?"
-      # again. Must advance to scripted or probe instead.
+      # Turn 4: another silence — SILENCE_HANDLER_COUNT is 1; re-engage again (clarify).
+      # Wrap-up only fires on the 4th consecutive silence.
       - speaker: respondent
         text: "[silence]"
-        expected_actions: [scripted, probe, wrap_up]
+        expected_actions: [clarify]
+
+  # -------------------------------------------------------------------------
+  # stale_probe_bridging: probe seeded early, 3 scripted turns follow, then
+  # a low-signal answer forces the interviewer to reach for the old probe.
+  # Interviewer must bridge with "Earlier you mentioned..." or similar.
+  # Checked by BridgingPhrasePresent evaluator in test_replay.py.
+  # -------------------------------------------------------------------------
+  - name: stale_probe_bridging
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you recently?"
+      - "Would you recommend it to someone else?"
+    turns:
+      # Turn 1: respondent mentions the action items feature specifically — analyst
+      # would generate a probe about it. We seed the probe in the DB setup in
+      # the replay seeder (via the probe_seeds field below).
+      - speaker: respondent
+        text: "We use it for every customer call. The AI action items are genuinely great — I share them with the whole team after every meeting. It's become our standard follow-up process."
+        expected_actions: [probe, scripted]
+
+      # Turns 2–4: interviewer asks scripted questions; probe goes stale (turns_ago grows).
+      - speaker: respondent
+        text: "The time savings, honestly. I was spending forty minutes after each call on notes. Now it's five minutes of editing."
+        expected_actions: [scripted, probe]
+
+      - speaker: respondent
+        text: "Nothing major. The Zoom integration dropped audio once last week but I think that was a Zoom issue, not this product."
+        expected_actions: [scripted, probe]
+
+      - speaker: respondent
+        text: "Absolutely yes. I've already told two colleagues at other companies to try it."
+        expected_actions: [scripted, probe]
+
+      # Turn 5: low-signal answer with no new thread — interviewer should now
+      # reach for the stale action-items probe and bridge back to turn 1.
+      - speaker: respondent
+        text: "I mean, not really. I'm pretty happy with how things are."
+        expected_actions: [probe, scripted]
+    probe_seeds:
+      - question: "You mentioned sharing the AI action items with your whole team — has anyone flagged mistakes in them, or is the accuracy solid?"
+        priority: 2
+        rationale: "Action items accuracy is a key satisfaction signal; team-sharing makes attribution errors high-stakes."
+        generated_after_turn: 1
+
+  # -------------------------------------------------------------------------
+  # extended_silence_wrap_up: full 4x silence chain.
+  # silence → clarify → silence → clarify → silence → clarify → silence → wrap_up.
+  # Tests that the counting rule fires correctly after 4 consecutive silences.
+  # -------------------------------------------------------------------------
+  - name: extended_silence_wrap_up
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you recently?"
+    turns:
+      # Turn 1: substantive opener — interviewer asks scripted Q2
+      - speaker: respondent
+        text: "We use it for customer calls, about fifteen a week across the team."
+        expected_actions: [scripted, probe]
+
+      # Turn 2: first silence — must respond with re-engagement (clarify)
+      - speaker: respondent
+        text: "[silence]"
+        expected_actions: [clarify]
+
+      # Turn 3: second silence — SILENCE_HANDLER_COUNT is 1; re-engage again (clarify)
+      - speaker: respondent
+        text: "[silence]"
+        expected_actions: [clarify]
+
+      # Turn 4: third silence — SILENCE_HANDLER_COUNT is 2; re-engage again (clarify)
+      - speaker: respondent
+        text: "[silence]"
+        expected_actions: [clarify]
+
+      # Turn 5: fourth silence — SILENCE_HANDLER_COUNT is 3; must wrap_up now
+      - speaker: respondent
+        text: "[silence]"
+        expected_actions: [wrap_up]
+
+  # -------------------------------------------------------------------------
+  # multi_skip_scripted: respondent's first answer covers Q1, Q2, and Q3
+  # simultaneously. Interviewer must fire skip_scripted twice consecutively
+  # before landing on the first genuinely uncovered scripted question.
+  # -------------------------------------------------------------------------
+  - name: multi_skip_scripted
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you recently?"
+      - "Would you recommend it to someone else?"
+      - "What would make you use it more often?"
+    turns:
+      # Turn 1: respondent answers Q1 + Q2 + Q3 all at once organically.
+      # Interviewer asked Q1 as the opener (seeded). Now interviewer must
+      # skip_scripted past Q2 (covered) and Q3 (covered) to reach Q4.
+      - speaker: respondent
+        text: "We use it for every external call — maybe twenty a week. What I value most is that I never have to take notes anymore; it's completely eliminated that. And frustration? Honestly nothing that bothers me — it just works."
+        expected_actions: [skip_scripted]
+
+      # Turn 2: interviewer skipped Q2, now faces Q3 (frustrations — already covered).
+      # Should skip again or land on Q4 (recommendation).
+      - speaker: respondent
+        text: "Yeah nothing, really — I said it's been smooth."
+        expected_actions: [skip_scripted, scripted]
+
+      # Turn 3: now at Q4 (Would you recommend it?) — genuinely unanswered.
+      - speaker: respondent
+        text: "I'd definitely recommend it. I already have, to two people at other companies."
+        expected_actions: [scripted, probe, skip_scripted]
+
+  # -------------------------------------------------------------------------
+  # disengaged_early_exit: after a good opener, respondent gives three
+  # consecutive low-signal / dismissive answers. Interviewer should wrap up
+  # rather than grinding through remaining scripted questions.
+  # Uses DisengagementWrapsUp evaluator which expects wrap_up within 5 turns.
+  # -------------------------------------------------------------------------
+  - name: disengaged_early_exit
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you recently?"
+      - "Would you recommend it to someone else?"
+      - "What would make you use it more often?"
+    turns:
+      # Turn 1: good opener — interviewer asks Q2
+      - speaker: respondent
+        text: "We use it for sales calls, about ten a week."
+        expected_actions: [scripted, probe]
+
+      # Turn 2: vague → clarify
+      - speaker: respondent
+        text: "Not really."
+        expected_actions: [clarify]
+
+      # Turn 3: still vague after clarify
+      - speaker: respondent
+        text: "I dunno, it's fine I guess."
+        expected_actions: [clarify, scripted]
+
+      # Turn 4: third low-signal response — interviewer should read disengagement
+      # and wrap up gracefully rather than continuing to ask scripted questions.
+      - speaker: respondent
+        text: "Yeah, fine. Look, I don't really have much more to say."
+        expected_actions: [wrap_up, clarify]
+
+  # -------------------------------------------------------------------------
+  # priority3_yields_to_scripted: a priority-3 probe is pending but scripted
+  # questions remain. Interviewer must ask scripted first, then use the
+  # priority-3 probe only once scripted is exhausted.
+  # -------------------------------------------------------------------------
+  - name: priority3_yields_to_scripted
+    scripted_questions:
+      - "How do you currently use this product?"
+      - "What do you value most about it?"
+      - "Has anything frustrated you recently?"
+    turns:
+      # Turn 1: answer to Q1 — priority-3 probe is seeded but scripted Q2 should win.
+      - speaker: respondent
+        text: "We use it for team stand-ups and client calls, maybe twelve a week."
+        expected_actions: [scripted]
+
+      # Turn 2: answer to Q2 — still scripted Q3 to go; priority-3 probe should still yield.
+      - speaker: respondent
+        text: "The automated summaries. I used to spend twenty minutes writing notes; now it's instant."
+        expected_actions: [scripted]
+
+      # Turn 3: answer to Q3 — scripted exhausted. Priority-3 probe should now be used.
+      - speaker: respondent
+        text: "Not much honestly. Sometimes the speaker labels get mixed up in group calls."
+        expected_actions: [probe, wrap_up]
+    probe_seeds:
+      - question: "You mentioned stand-ups — do you share the summary with the whole team or just keep it for yourself?"
+        priority: 3
+        rationale: "Nice-to-have detail on sharing behaviour; low urgency."
+        generated_after_turn: 1

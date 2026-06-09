@@ -1,5 +1,5 @@
-version: "2026-05-06.3"
-description: "Analyst probe cases now have realistic lag: signal in older turn, 2-4 turns of normal conversation after, probe surfaces at latest turn"
+version: "2026-06-08.1"
+description: "Added partial-answer-next-scripted probe case: respondent surface-touches NEXT_SCRIPTED topic, interviewer must probe deeper rather than skip_scripted"
 
 # Tier 1 interviewer dataset — 35 single-turn decisions.
 #
@@ -26,7 +26,7 @@ description: "Analyst probe cases now have realistic lag: signal in older turn, 
 #   "interviewer" — model must fire a spontaneous probe (probes: [] in inputs)
 #   (omitted)     — source not checked; used for non-probe actions
 #
-# Coverage: probe x16 (analyst x10, interviewer x6), scripted x5, clarify x5,
+# Coverage: probe x17 (analyst x10, interviewer x7), scripted x5, clarify x5,
 #           wrap_up x5, off_topic x2, skip_scripted x2.
 
 cases:
@@ -535,6 +535,37 @@ cases:
       action: probe
       probe_source: analyst
 
+  # --- partial answer on next scripted — probe deeper, don't skip ----------
+  # The respondent surface-touches the next scripted topic but leaves a clear
+  # gap. skip_scripted would be wrong here — the topic wasn't fully addressed.
+  # The interviewer should probe to get the depth that's missing.
+
+  - name: partial_answer_next_scripted_probe_deeper
+    # NEXT_SCRIPTED: "What's been the biggest challenge in adopting the product?"
+    # Respondent mentioned a challenge ("training took longer than expected") but
+    # gave zero detail — how long, what broke, who was affected, resolved or not.
+    # skip_scripted would be wrong: the topic was barely touched.
+    # The right move is to probe deeper before advancing.
+    inputs:
+      scripted_questions:
+        - Tell me about your role and team.
+        - How long have you been using the product?
+        - What's been the biggest challenge in adopting the product?
+        - What would you change about it?
+        - Would you recommend it to a colleague?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a VP of Customer Success at a mid-market SaaS company. Team of twenty."}
+        - {speaker: interviewer, text: "How long have you been using the product?", action: scripted}
+        - {speaker: respondent, text: "About nine months now. We went live after a longer-than-expected onboarding."}
+        - {speaker: interviewer, text: "What's been the biggest challenge in adopting the product?", action: scripted}
+        - {speaker: respondent, text: "Training, I guess. It took longer than expected. But we got there."}
+      probes: []
+      last_respondent: "Training, I guess. It took longer than expected. But we got there."
+    expected_output:
+      action: probe
+      probe_source: interviewer
+
   # --- skip_scripted (scripted topic already covered organically) ----------
 
   - name: skip_scripted_already_covered
@@ -750,6 +781,96 @@ cases:
         - {question: "Earlier you mentioned doubling seats — was that driven by one team or organic across the org?", priority: 1, rationale: "Seat expansion driver is a direct growth signal; organic vs. top-down matters for investor narrative."}
         - {question: "What made you start using the API rather than just the UI?", priority: 2, rationale: "API adoption suggests deeper technical integration and higher switching cost."}
       last_respondent: "Yeah, we can't give contractors access without giving them too much visibility into internal roadmaps."
+    expected_output:
+      action: probe
+      probe_source: analyst
+
+  # --- skip covered probe, use next available probe (Gap 5) -----------------
+  # The top probe's topic is already in covered_subtopics (Slack integration
+  # was fully discussed). A second priority-2 probe on a different topic is
+  # available. Interviewer must skip the covered probe and pick the next one.
+
+  - name: skip_probe_already_covered_use_next
+    inputs:
+      covered_subtopics:
+        - "Slack integration — auto-posts summaries to deal channel"
+      scripted_questions:
+        - Tell me about your role.
+        - What do you value most about the product?
+        - Has anything frustrated you recently?
+        - Would you recommend it to a colleague?
+        - What would make you use it more often?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a sales manager at a mid-size software company. I run a team of twelve."}
+        - {speaker: interviewer, text: "What do you value most about the product?", action: scripted}
+        - {speaker: respondent, text: "The Slack integration is huge — summaries auto-post to our deal channel so the whole team stays in sync without any manual effort. That alone saves me thirty minutes a day."}
+        - {speaker: interviewer, text: "How long have you had the Slack integration running?", action: probe}
+        - {speaker: respondent, text: "About three months. Took an hour to configure but completely seamless since."}
+        - {speaker: interviewer, text: "Has anything frustrated you recently?", action: scripted}
+        - {speaker: respondent, text: "Not really. Minor stuff — the mobile app could be faster, but nothing that blocks me."}
+      probes:
+        # Priority-2 probe about Slack — already covered in covered_subtopics; should be skipped
+        - {question: "You mentioned the Slack integration — is that available to your whole team or just certain roles?", priority: 2, rationale: "Understand whether the integration is a team-wide workflow or a personal workaround."}
+        # Priority-2 probe on a different topic — should be picked instead
+        - {question: "You mentioned the mobile app being slow — is that something you hit daily or only occasionally?", priority: 2, rationale: "Mobile friction detail; surface whether it's a blocker or a minor annoyance."}
+      last_respondent: "Not really. Minor stuff — the mobile app could be faster, but nothing that blocks me."
+    expected_output:
+      action: probe
+      probe_source: analyst
+
+  # --- skip covered probe, fall through to scripted when no other probe (Gap 5 alt) ---
+  # Same setup but only the covered probe exists — interviewer must skip it
+  # and advance to the next scripted question rather than re-asking.
+
+  - name: skip_probe_already_covered_use_scripted
+    inputs:
+      covered_subtopics:
+        - "Slack integration — auto-posts summaries to deal channel"
+      scripted_questions:
+        - Tell me about your role.
+        - What do you value most about the product?
+        - Has anything frustrated you recently?
+        - Would you recommend it to a colleague?
+        - What would make you use it more often?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a sales manager at a mid-size software company. I run a team of twelve."}
+        - {speaker: interviewer, text: "What do you value most about the product?", action: scripted}
+        - {speaker: respondent, text: "The Slack integration is huge — summaries auto-post to our deal channel so the whole team stays in sync without any manual effort."}
+        - {speaker: interviewer, text: "How long have you had the Slack integration running?", action: probe}
+        - {speaker: respondent, text: "About three months. Took an hour to configure but completely seamless since."}
+        - {speaker: interviewer, text: "Has anything frustrated you recently?", action: scripted}
+        - {speaker: respondent, text: "Not really. Minor stuff — the mobile app could be faster, but nothing that blocks me."}
+      probes:
+        # Only probe available is about Slack — already covered; no other probe
+        - {question: "You mentioned the Slack integration — is that available to your whole team or just certain roles?", priority: 2, rationale: "Understand whether the integration is a team-wide workflow or a personal workaround."}
+      last_respondent: "Not really. Minor stuff — the mobile app could be faster, but nothing that blocks me."
+    expected_output:
+      action: scripted
+
+  # --- no wrap_up with a priority-1 probe still pending (Gap 8) ------------
+  # Scripted queue is exhausted and respondent signals they're done.
+  # But a priority-1 churn signal probe (active competitor evaluation) is
+  # still pending — interviewer must probe it before wrapping up.
+
+  - name: no_wrap_up_with_p1_probe_pending
+    inputs:
+      scripted_questions:
+        - Tell me about your role.
+        - How long have you been using it?
+      prior_turns:
+        - {speaker: interviewer, text: "Tell me about your role and what your team does.", action: scripted}
+        - {speaker: respondent, text: "I'm a product manager at an e-commerce startup."}
+        - {speaker: interviewer, text: "How long have you been using it?", action: scripted}
+        - {speaker: respondent, text: "About eight months. We're actually evaluating Fireflies right now as a cheaper alternative — haven't decided yet."}
+        - {speaker: interviewer, text: "What specifically prompted that evaluation?", action: probe}
+        - {speaker: respondent, text: "Mostly cost. Our CFO asked all teams to find ten percent savings this quarter."}
+        - {speaker: interviewer, text: "Is there anything else on your mind before we wrap up?", action: scripted}
+        - {speaker: respondent, text: "That pretty much covers it from my end."}
+      probes:
+        - {question: "You mentioned evaluating Fireflies — how far along is that, and what would tip the decision?", priority: 1, rationale: "Active competitor evaluation with a cost driver is a priority-1 churn signal — must be probed before closing."}
+      last_respondent: "That pretty much covers it from my end."
     expected_output:
       action: probe
       probe_source: analyst

@@ -36,12 +36,17 @@ class InterviewerCaseInputs(BaseModel):
     what gets passed to `interviewer.run(...)`. It is *not* appended to
     `prior_turns`; the task function appends it when seeding the DB so that
     the prompt's `recent_turns` tool sees the same thing a live call would.
+
+    `covered_subtopics` seeds an AnalystSnapshot row so the interviewer's
+    CONTEXT block includes the COVERED_SUBTOPICS list — used to test whether
+    the model skips probes or scripted questions whose topic is already covered.
     """
 
     scripted_questions: list[str] = Field(default_factory=list)
     prior_turns: list[TurnLine] = Field(default_factory=list)
     probes: list[ProbeSeed] = Field(default_factory=list)
     last_respondent: str
+    covered_subtopics: list[str] = Field(default_factory=list)
 
 
 def load_cases(
