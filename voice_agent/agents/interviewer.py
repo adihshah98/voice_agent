@@ -87,7 +87,9 @@ def _build_prompt_parts_from_reads(
     respondent_text: str,
     vapi_messages: list[dict],
 ) -> list[str | CachePoint]:
-    # Order: COVERED_SUBTOPICS, cache breakpoint (Anthropic), then per-turn CONTEXT. See interviewer_llm_caching.
+    # Order: COVERED_SUBTOPICS + CALL_CONTEXT, cache breakpoint (Anthropic), then per-turn CONTEXT.
+    # COVERED_SUBTOPICS and CALL_CONTEXT sit before the cache breakpoint so they are cached across
+    # turns (they change only when the analyst runs, not every turn). See interviewer_llm_caching.
     covered_lines = []
     if reads.snapshot and reads.snapshot.covered_subtopics:
         covered_lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
@@ -95,6 +97,18 @@ def _build_prompt_parts_from_reads(
             covered_lines.append(f"  - {topic}")
     else:
         covered_lines.append("COVERED_SUBTOPICS: none")
+
+    if reads.snapshot and (reads.snapshot.themes or reads.snapshot.contradictions or reads.snapshot.investor_signals):
+        covered_lines.append("")
+        covered_lines.append("CALL_CONTEXT (analyst summary of the full call so far — use this to stay anchored to earlier discussion):")
+        if reads.snapshot.themes:
+            covered_lines.append(f"  Themes: {'; '.join(reads.snapshot.themes)}")
+        if reads.snapshot.contradictions:
+            covered_lines.append(f"  Contradictions: {'; '.join(reads.snapshot.contradictions)}")
+        if reads.snapshot.investor_signals:
+            covered_lines.append("  Key signals (reference these when probing or bridging):")
+            for sig in reads.snapshot.investor_signals:
+                covered_lines.append(f"    {sig}")
 
     recent = [m for m in vapi_messages if m.get("role") in ("assistant", "user")][-CONTEXT_WINDOW_TURNS:]
     dynamic_lines = ["[CONTEXT]", f"SCRIPTED_REMAINING: {reads.scripted_remaining}"]
@@ -225,7 +239,7 @@ async def prepare_interviewer_turn_concurrent(
 
 
 # Bump when INTERVIEWER_PROMPT content changes so Logfire traces can be filtered by version.
-INTERVIEWER_PROMPT_VERSION = "2026-06-08.6"
+INTERVIEWER_PROMPT_VERSION = "2026-06-09.2"
 
 INTERVIEWER_PROMPT = """\
 You are conducting a customer interview on behalf of an investor or research firm
@@ -248,6 +262,12 @@ CONTEXT fields:
   Labels name exact entities and dimensions, e.g. "Notion vs Google Docs product features".
   A covered label does NOT block other entities or dimensions — "Notion vs Quip" or
   "Notion vs Google Docs pricing" remain open even if product features is covered.
+- CALL_CONTEXT: analyst summary of the entire call — themes, contradictions, and tagged
+  investor signals (e.g. "[REVENUE] $50k annual spend", "[COMPETITIVE] churned from Google Docs").
+  This covers the full call history, including turns before RECENT_TURNS. Use it to:
+  (a) stay anchored to facts established earlier in the call,
+  (b) avoid re-asking about signals already captured, and
+  (c) bridge naturally ("Earlier you mentioned X...") when a new answer connects to an old thread.
 - RECENT_TURNS: last several turns of conversation
 
 Decision framework — use your judgment in this order:
@@ -322,11 +342,32 @@ Decision framework — use your judgment in this order:
    Use action=`wrap_up`. This overrides all steps below, even if probes are pending.
    Do NOT apply to vague non-answers like "Not really" or "Fine" — those go to step 4.
 
-6. IMMEDIATE FOLLOW-UP: If the respondent just said something matching an investor
-   signal trigger (referral, AI trust, ROI, competitor, budget, expansion, red flag)
-   OR a direct contradiction — probe it NOW. Use action=`probe`.
-   SKIP if: answer is too vague (step 4 applies), or it's a closing/dismissive
-   statement ("it's fine now", "not really", "I guess so", "never mind").
+6. LAYERING — stay on the thread before moving on.
+   Ask yourself: does the respondent's answer contain anything concrete that is still
+   unexplained or unresolved? If yes, dig into it before advancing to scripted or analyst
+   probes. Use action=`probe`.
+
+   A thread is open when the answer contains:
+   - A named thing with no story: a product, person, team, event, or competitor named
+     but not elaborated ("we tried Gong", "my manager flagged it", "the security team
+     pushed back", "the rollout stalled")
+   - A tension or contrast: something working AND something not, or a before/after
+     ("it was great at first, then...", "some teams use it, others don't")
+   - A cause left implicit: something happened but the why wasn't given
+     ("we stopped using that feature", "adoption dropped off", "we almost didn't renew")
+   - A concrete detail that changes the picture: a number, a timeline, a role, a
+     specific incident mentioned in passing
+   - An investor signal trigger: referral, AI trust gap, ROI claim, competitor mention,
+     budget/approval path, expansion signal, or red flag (see INVESTOR SIGNAL TRIGGERS)
+
+   SKIP layering and advance when:
+   - The answer was complete and self-contained — the thread is genuinely closed
+   - You already probed this specific angle in a recent turn (check RECENT_TURNS)
+   - The answer is a direct contradiction of something said earlier — go to step 7
+     (analyst probe) or address it there; don't layer on a contradiction mid-thread
+
+   ONE layer at a time. Never chain two probes on the same detail in consecutive turns —
+   if the layered answer fully resolves the thread, move on.
 
 7. ANALYST PROBE — PENDING_PROBES is non-empty:
    - SKIP THIS ENTIRE STEP if step 4 (CLARIFY) applies — vague answers must be
@@ -339,7 +380,7 @@ Decision framework — use your judgment in this order:
    - Set probe_id_used to the probe's exact id.
    Use action=`probe`.
 
-8. SCRIPTED: No clarify, no verbal exit, no immediate follow-up, no priority-1 or
+8. SCRIPTED: No clarify, no verbal exit, no open thread, no priority-1 or
    priority-2 probe — ask NEXT_SCRIPTED. A small lead-in is fine; don't change the meaning.
    Use action=`scripted`.
    SKIP_SCRIPTED EXCEPTION — ALWAYS check whether NEXT_SCRIPTED has already been
@@ -362,8 +403,8 @@ Decision framework — use your judgment in this order:
    Use action=`wrap_up`.
 
 --- INVESTOR SIGNAL TRIGGERS ---
-These are high-value moments. When you hear them, deviate from scripted order
-and probe immediately (action=`probe`):
+These are the highest-value instances of step 6 (LAYERING). When you hear them,
+the thread is always open — stay on it before advancing:
 
 REFERRAL / WORD-OF-MOUTH — "a colleague recommended it", "everyone I know uses it",
 "I just found it on my own": probe one level deeper.

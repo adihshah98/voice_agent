@@ -1,17 +1,22 @@
-"""Tier 3 — focused simulation for 3 persona-specific behaviors.
+"""Tier 3 — focused simulation for 6 persona-specific behaviors.
 
 Only personas that require live simulation (emergent multi-agent behavior)
 are tested here. The other 4 personas (power_user, skeptical_buyer,
 ai_skeptic, churn_risk) run as deterministic replay evals in test_replay.py.
 
-    contradictory      — analyst must detect contradiction + probe it
-    off_topic_rambler  — interviewer must fire off_topic redirect
-    silent_respondent  — interviewer must handle silence gracefully and
-                         end the call after 3 consecutive "Still there?"s
+    contradictory        — analyst must detect contradiction + probe it
+    off_topic_rambler    — interviewer must fire off_topic redirect
+    silent_respondent    — interviewer must handle silence gracefully and
+                           end the call after 3 consecutive "Still there?"s
+    context_compression  — analyst accumulates all covered subtopics
+    context_drift        — interviewer doesn't re-ask facts stated in turn 1
+    cooperative_respondent — call should reach wrap_up naturally
+
+Stage variants (mid/end) pre-seed the DB with canned prior turns to test
+behaviors at different call stages. Capped at 25 turns per case.
 
 Evaluators:
 
-    CallCompletes           deterministic — reached wrap_up before turn limit
     CoveredAllScripted      deterministic — all scripted questions asked
     CaughtContradiction     deterministic — contradictory: analyst found
                             contradiction AND a priority-1 probe was asked
@@ -20,8 +25,10 @@ Evaluators:
     HandledSilenceGracefully deterministic — silent_respondent: said "Still
                             there?", said "Take your time.", ended call after
                             repeated silence
-
-Capped at 12 turns per persona. ~36 Sonnet calls ≈ 60s.
+    ProbesAreSpecific       LLM judge — probes reference specific details
+    StaleProbesBridged      LLM judge — old probes bridged back to prior context
+    CoveredSubtopicsAccumulate LLM judge — analyst tracked expected topics
+    NoContextDrift          LLM judge — interviewer didn't re-ask known facts
 
 Run with:
     uv run pytest evals/test_trajectories.py -v -s -m slow
@@ -37,7 +44,7 @@ import pytest
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from pydantic_evals import Case, Dataset
-from pydantic_evals.evaluators import Evaluator, EvaluatorContext
+from pydantic_evals.evaluators import Evaluator, EvaluatorContext, EvaluationReason
 from sqlalchemy.pool import StaticPool
 from sqlmodel import create_engine, select
 
@@ -49,12 +56,11 @@ from voice_agent import state
 from voice_agent.agents.analyst import run_analyst_safely
 from evals.simulator import load_personas, simulate_turn
 from voice_agent.models import AnalystDeps, Persona
-from voice_agent.tracing import init_tracing
 from voice_agent.turn import run_speech_turn
 
-_JUDGE_MODEL = "anthropic:claude-sonnet-4-6"
+_JUDGE_MODEL = "anthropic:claude-haiku-4-5-20251001"
 
-MAX_TURNS = 12  # capped at 12 turns; ~24 Sonnet calls total across 2 personas
+MAX_TURNS = 25  # hard cap — conversations run to completion or this limit
 
 SCRIPTED_QUESTIONS = [
     "How do you currently use this product?",
@@ -75,6 +81,8 @@ class TrajectoryInputs(BaseModel):
     persona_system: str
     scripted_questions: list[str]
     max_turns: int = MAX_TURNS
+    # "start" = fresh call; "mid" = partway through; "end" = near wrap-up
+    stage: str = "start"
 
 
 class ProbeTurn(BaseModel):
@@ -103,6 +111,123 @@ class TrajectoryResult(BaseModel):
     still_there_utterances: list[int] = []    # turn indices where "Still there?" was said
     take_your_time_utterances: list[int] = []  # turn indices where "Take your time." was said
     wrapped_up_after_silence: bool = False     # True if wrap_up fired after repeated silence
+    # context_compression: covered_subtopics accumulated by analyst across the call
+    final_covered_subtopics: list[str] = []
+    # context_drift: all interviewer utterances for drift checking
+    interviewer_utterances: list[str] = []
+    # cooperative_respondent: turn index when wrap_up fired (None = never)
+    wrap_up_turn_index: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Stage seeding — canned prior turns that set up mid / end starting points
+# ---------------------------------------------------------------------------
+
+# Canned turns used to pre-seed mid/end stages. Each entry is
+# (interviewer_text, respondent_text). These are generic enough to apply to
+# any persona and realistic enough to produce valid DB state.
+_CANNED_TURNS: list[tuple[str, str]] = [
+    (
+        "How do you currently use this product?",
+        "I use it mainly for meeting summaries — we have it connected to our Zoom account "
+        "so it automatically captures all our team calls. I'd say we get about 20 calls a "
+        "week transcribed and summarised.",
+    ),
+    (
+        "What do you value most about it?",
+        "Honestly, the time savings are huge. I used to spend 20–30 minutes after every "
+        "call writing up notes and action items. Now I just review the AI summary, make a "
+        "few edits if needed, and share it. Probably saves me an hour a day across the team.",
+    ),
+    (
+        "Has anything frustrated you about it recently?",
+        "The speaker attribution in large group calls can be off — when there are more than "
+        "five people it sometimes mixes up who said what. We had an issue last month where "
+        "a client call summary attributed a concern to the wrong person and it caused a bit "
+        "of confusion. That's my main gripe.",
+    ),
+    (
+        "Would you recommend it to someone else?",
+        "Yes, I already have — two colleagues at other companies are now using it. I'd give "
+        "it an 8 out of 10. The core functionality is solid; the edge cases like attribution "
+        "and the mobile app performance are the things holding it back from a 10.",
+    ),
+]
+
+
+def _seed_prior_history(
+    engine,
+    call_id: str,
+    scripted_questions: list[str],
+    stage: str,
+) -> tuple[list[dict[str, str]], int]:
+    """Seed the DB with canned prior turns for mid/end stages.
+
+    Returns (history, next_db_turn_number) so the live loop can continue
+    from the correct state.
+
+    mid: 2 scripted asked, analyst snapshot with partial coverage
+    end: all-but-last scripted asked, richer analyst snapshot
+    """
+    if stage == "start":
+        return [], 1
+
+    # mid: seed first 2 canned turns; end: seed first 4 (all available)
+    turns_to_seed = 2 if stage == "mid" else len(_CANNED_TURNS)
+    scripted_to_advance = min(turns_to_seed, len(scripted_questions))
+
+    history: list[dict[str, str]] = []
+    db_turn = 1
+
+    with state.session_scope(engine) as s:
+        call = s.get(state.Call, call_id)
+        # Advance scripted cursor to reflect questions already asked
+        call.scripted_cursor = scripted_to_advance
+
+        for i in range(turns_to_seed):
+            interviewer_text, respondent_text = _CANNED_TURNS[i]
+            s.add(state.Turn(
+                call_id=call_id,
+                turn_number=db_turn,
+                speaker="interviewer",
+                text=interviewer_text,
+                action="scripted",
+            ))
+            db_turn += 1
+            s.add(state.Turn(
+                call_id=call_id,
+                turn_number=db_turn,
+                speaker="respondent",
+                text=respondent_text,
+            ))
+            db_turn += 1
+            history.append({"speaker": "interviewer", "text": interviewer_text})
+            history.append({"speaker": "respondent", "text": respondent_text})
+
+        # Seed an analyst snapshot reflecting the seeded conversation
+        covered = [
+            "daily use for meeting summaries via Zoom integration (~20 calls/week)",
+            "time savings: ~1 hour/day across the team",
+            "speaker attribution errors in large group calls (5+ people)",
+            "NPS/rating: 8/10; would recommend to others",
+        ][:turns_to_seed]  # proportional to how many turns were seeded
+
+        themes = ["time savings", "meeting summaries", "speaker attribution quality"]
+        if stage == "end":
+            themes.append("recommendation intent")
+
+        s.add(state.AnalystSnapshot(
+            call_id=call_id,
+            after_turn=db_turn - 1,
+            after_scripted_cursor=scripted_to_advance,
+            themes=themes,
+            covered_subtopics=covered,
+            contradictions=[],
+            surprises=[],
+            investor_signals=[],
+        ))
+
+    return history, db_turn
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +246,7 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
     call_id = f"traj-{inputs.persona_name}"
     persona = Persona(name=inputs.persona_name, system=inputs.persona_system)
 
-    # Seed call
+    # Seed call record
     with state.session_scope(engine) as s:
         s.add(
             state.Call(
@@ -131,7 +256,12 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
             )
         )
 
-    history: list[dict[str, str]] = []
+    # Pre-populate DB + history for mid/end stages so the live loop starts
+    # partway through a realistic conversation.
+    history, db_turn_number = _seed_prior_history(
+        engine, call_id, inputs.scripted_questions, inputs.stage
+    )
+
     turn_actions: list[str] = []
     off_topic_redirects_at: list[int] = []
     analyst_found_contradiction = False
@@ -141,27 +271,28 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
     still_there_utterances: list[int] = []
     take_your_time_utterances: list[int] = []
     wrapped_up_after_silence = False
+    interviewer_utterances: list[str] = []
+    wrap_up_turn_index: int | None = None
 
-    # Interviewer opens with the first scripted question
-    db_turn_number = 1
-    with state.session_scope(engine) as s:
-        opening = state.next_scripted(s, call_id)
-        state.mark_scripted_asked(s, call_id)
-
-    opening_text = opening or "Tell me about your experience with this product."
-    with state.session_scope(engine) as s:
-        s.add(
-            state.Turn(
-                call_id=call_id,
-                turn_number=db_turn_number,
-                speaker="interviewer",
-                text=opening_text,
-                action="scripted",
+    # For start stage: open with first scripted question (other stages already have history)
+    if inputs.stage == "start":
+        with state.session_scope(engine) as s:
+            opening = state.next_scripted(s, call_id)
+            state.mark_scripted_asked(s, call_id)
+        opening_text = opening or "Tell me about your experience with this product."
+        with state.session_scope(engine) as s:
+            s.add(
+                state.Turn(
+                    call_id=call_id,
+                    turn_number=db_turn_number,
+                    speaker="interviewer",
+                    text=opening_text,
+                    action="scripted",
+                )
             )
-        )
-    history.append({"speaker": "interviewer", "text": opening_text})
-    turn_actions.append("scripted")
-    db_turn_number += 1
+        history.append({"speaker": "interviewer", "text": opening_text})
+        turn_actions.append("scripted")
+        db_turn_number += 1
 
     for _ in range(inputs.max_turns):
         # --- Respondent turn (simulated) ---
@@ -181,6 +312,7 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
         history.append({"speaker": "interviewer", "text": out["message"]})
         turn_actions.append(out["action"])
         turn_idx = len(turn_actions) - 1
+        interviewer_utterances.append(out["message"])
 
         if out["action"] == "off_topic":
             off_topic_redirects_at.append(db_turn_number - 1)
@@ -219,8 +351,11 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
                 stale=stale,
             ))
 
-        # --- Analyst pass — runs after commit(), matching production fire-and-forget order ---
-        await run_analyst_safely(AnalystDeps(call_id=call_id, engine=engine))
+        # --- Analyst pass — gated by should_run_analyst(), matching production behaviour ---
+        with state.session_scope(engine) as s:
+            _run_analyst = state.should_run_analyst(s, call_id)
+        if _run_analyst:
+            await run_analyst_safely(AnalystDeps(call_id=call_id, engine=engine))
         with state.session_scope(engine) as s:
             snapshot = state.latest_snapshot(s, call_id)
             if snapshot and snapshot.contradictions:
@@ -228,15 +363,18 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
 
         if out["action"] == "wrap_up":
             completed = True
+            wrap_up_turn_index = turn_idx
             # Detect wrap_up triggered by silence (preceded by a "Still there?" clarify)
             if still_there_utterances and turn_idx > 0 and (turn_idx - 1) in still_there_utterances:
                 wrapped_up_after_silence = True
             break
 
-    # Scripted coverage
+    # Scripted coverage + final analyst snapshot
     with state.session_scope(engine) as s:
         call = s.get(state.Call, call_id)
         scripted_asked_count = call.scripted_cursor if call else 0
+        snapshot = state.latest_snapshot(s, call_id)
+        final_covered_subtopics = snapshot.covered_subtopics if snapshot else []
 
     return TrajectoryResult(
         persona_name=inputs.persona_name,
@@ -252,23 +390,15 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
         still_there_utterances=still_there_utterances,
         take_your_time_utterances=take_your_time_utterances,
         wrapped_up_after_silence=wrapped_up_after_silence,
+        final_covered_subtopics=final_covered_subtopics,
+        interviewer_utterances=interviewer_utterances,
+        wrap_up_turn_index=wrap_up_turn_index,
     )
 
 
 # ---------------------------------------------------------------------------
 # Evaluators
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class CallCompletes(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
-    """Call must reach wrap_up before the turn limit."""
-
-    def evaluate(
-        self,
-        ctx: EvaluatorContext[TrajectoryInputs, TrajectoryResult, None],
-    ) -> bool:
-        return ctx.output.completed
 
 
 @dataclass
@@ -445,38 +575,202 @@ class StaleProbesBridged(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
         return sum(results) / len(results)
 
 
+class _SubtopicCoverageJudgement(BaseModel):
+    covered: list[str]
+    missing: list[str]
+    fraction_covered: float
+
+
+_SUBTOPIC_COVERAGE_SYSTEM = (
+    "You are checking whether a qualitative research analyst correctly tracked the topics "
+    "discussed in a customer interview. You will receive:\n"
+    "  1. EXPECTED_TOPICS — the themes the respondent was supposed to cover (from their persona)\n"
+    "  2. COVERED_SUBTOPICS — the list the analyst accumulated in their snapshot\n\n"
+    "For each expected topic, determine whether it is semantically represented in "
+    "COVERED_SUBTOPICS. A covered_subtopic covers an expected topic if a human reading it "
+    "would recognise it addresses the same subject (exact wording not required).\n\n"
+    "Return:\n"
+    "  covered: list of expected topics found in covered_subtopics\n"
+    "  missing: list of expected topics absent from covered_subtopics\n"
+    "  fraction_covered: len(covered) / len(expected_topics), or 1.0 if expected_topics is empty"
+)
+
+# Topics the context_compression persona is scripted to surface
+_CONTEXT_COMPRESSION_EXPECTED_TOPICS = [
+    "seat count (35 seats)",
+    "respondent is economic buyer, not daily user",
+    "SDR team usage (12 reps)",
+    "time savings (30 minutes per rep per call)",
+    "Salesforce CRM integration issue",
+    "Gong competitor evaluation",
+    "renewal timeline (2 months)",
+    "NPS or rating (7/10)",
+    "mobile app performance",
+]
+
+
+def _get_subtopic_coverage_agent() -> Agent[None, _SubtopicCoverageJudgement]:
+    return Agent(
+        _JUDGE_MODEL,
+        output_type=_SubtopicCoverageJudgement,
+        system_prompt=_SUBTOPIC_COVERAGE_SYSTEM,
+    )
+
+
+@dataclass
+class CoveredSubtopicsAccumulate(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
+    """For the context_compression persona: the analyst's final covered_subtopics
+    must collectively represent the expected topics discussed during the call.
+
+    Uses an LLM judge to do semantic matching — a subtopic string doesn't need to
+    exactly match an expected topic, just cover the same concept. Passes at ≥ 70%
+    coverage (allows for organic variation in what the respondent actually said).
+
+    Returns True (N/A pass) for all other personas.
+    """
+
+    threshold: float = 0.70
+
+    async def evaluate(
+        self,
+        ctx: EvaluatorContext[TrajectoryInputs, TrajectoryResult, None],
+    ) -> dict:
+        if ctx.inputs.persona_name != "context_compression":
+            return {"CoveredSubtopicsAccumulate": True}
+
+        covered_subtopics = ctx.output.final_covered_subtopics
+        if not covered_subtopics:
+            return {"CoveredSubtopicsAccumulate": EvaluationReason(
+                value=0.0,
+                reason="analyst produced no covered_subtopics at all",
+            )}
+
+        topic_lines = "\n".join(f"  - {t}" for t in _CONTEXT_COMPRESSION_EXPECTED_TOPICS)
+        subtopic_lines = "\n".join(f"  - {s}" for s in covered_subtopics)
+        prompt = (
+            f"EXPECTED_TOPICS:\n{topic_lines}\n\n"
+            f"COVERED_SUBTOPICS (from analyst snapshot):\n{subtopic_lines}"
+        )
+
+        agent = _get_subtopic_coverage_agent()
+        result = await agent.run(prompt)
+        j = result.output
+
+        reason = (
+            f"missing: {j.missing}" if j.missing
+            else f"all {len(j.covered)} expected topics found"
+        )
+        passed = j.fraction_covered >= self.threshold
+        return {"CoveredSubtopicsAccumulate": EvaluationReason(
+            value=j.fraction_covered,
+            reason=reason,
+        )}
+
+
+class _ContextDriftJudgement(BaseModel):
+    drifted: bool
+    reason: str
+
+
+_CONTEXT_DRIFT_SYSTEM = (
+    "You are auditing an AI interviewer for CONTEXT DRIFT on a market-research phone call.\n\n"
+    "The respondent stated these KEY FACTS in their very first turn:\n"
+    "  - 50 seats purchased\n"
+    "  - Only 8 people actively using it\n"
+    "  - The respondent is the main internal champion\n\n"
+    "Read ALL of the interviewer's utterances below and determine whether the interviewer "
+    "at any point:\n"
+    "  (a) asks about something the respondent already clearly answered (e.g. seat count, "
+    "      adoption rate, their role), as if the earlier answer was forgotten, OR\n"
+    "  (b) states or implies facts that directly contradict what the respondent said "
+    "      (e.g. says 'so with your full team using it...' when only 8/50 are active).\n\n"
+    "DRIFTED=true if any such forgetting or contradiction occurred.\n"
+    "DRIFTED=false if the interviewer correctly remembered and built on the stated facts.\n\n"
+    "Return: drifted (bool) and reason (one sentence describing what drifted or confirming consistency)."
+)
+
+
+def _get_context_drift_agent() -> Agent[None, _ContextDriftJudgement]:
+    return Agent(_JUDGE_MODEL, output_type=_ContextDriftJudgement, system_prompt=_CONTEXT_DRIFT_SYSTEM)
+
+
+@dataclass
+class NoContextDrift(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
+    """For the context_drift persona: interviewer must not re-ask or contradict facts
+    the respondent stated clearly in turn 1 (seat count, adoption rate, champion role).
+
+    Uses an LLM judge that reads all interviewer utterances.
+    Returns True (N/A pass) for all other personas.
+    """
+
+    async def evaluate(
+        self,
+        ctx: EvaluatorContext[TrajectoryInputs, TrajectoryResult, None],
+    ) -> bool:
+        if ctx.inputs.persona_name != "context_drift":
+            return True
+        utterances = ctx.output.interviewer_utterances
+        if not utterances:
+            return True
+        numbered = "\n".join(f"  [{i+1}] {u}" for i, u in enumerate(utterances))
+        prompt = f"Interviewer utterances (in order):\n{numbered}"
+        agent = _get_context_drift_agent()
+        result = await agent.run(prompt)
+        return not result.output.drifted
+
+
 # ---------------------------------------------------------------------------
-# Dataset builder — only the 2 personas requiring live simulation
+# Dataset builder — only the personas requiring live simulation
 # ---------------------------------------------------------------------------
 
-_SIMULATION_PERSONAS = {"contradictory", "off_topic_rambler", "silent_respondent"}
+_SIMULATION_PERSONAS = {
+    "contradictory",
+    "off_topic_rambler",
+    "silent_respondent",
+    "context_compression",
+    "context_drift",
+    "cooperative_respondent",
+}
+
+# Personas that get mid/end stage variants in addition to start.
+# All others run start-only to keep the suite fast.
+_MULTI_STAGE_PERSONAS: dict[str, list[str]] = {
+    "context_drift": ["start", "mid"],
+    "cooperative_respondent": ["start", "mid"],
+}
 
 
-def _build_dataset() -> Dataset[TrajectoryInputs, TrajectoryResult, None]:
+def _build_dataset(only: set[str] | None = None) -> Dataset[TrajectoryInputs, TrajectoryResult, None]:
     all_personas = load_personas()
     sim_personas = [p for p in all_personas if p.name in _SIMULATION_PERSONAS]
-    cases: list[Case[TrajectoryInputs, TrajectoryResult, None]] = [
-        Case(
-            name=p.name,
-            inputs=TrajectoryInputs(
-                persona_name=p.name,
-                persona_system=p.system,
-                scripted_questions=SCRIPTED_QUESTIONS,
-            ),
-        )
-        for p in sim_personas
-    ]
+    if only:
+        sim_personas = [p for p in sim_personas if p.name in only]
+    cases: list[Case[TrajectoryInputs, TrajectoryResult, None]] = []
+    for p in sim_personas:
+        stages = _MULTI_STAGE_PERSONAS.get(p.name, ["start"])
+        for stage in stages:
+            case_name = p.name if stage == "start" else f"{p.name}_{stage}"
+            cases.append(Case(
+                name=case_name,
+                inputs=TrajectoryInputs(
+                    persona_name=p.name,
+                    persona_system=p.system,
+                    scripted_questions=SCRIPTED_QUESTIONS,
+                    stage=stage,
+                ),
+            ))
     return Dataset(
         name="trajectories_tier3_sim",
         cases=cases,
         evaluators=(
-            CallCompletes(),
             CoveredAllScripted(),
             CaughtContradiction(),
             RedirectedOffTopic(),
             HandledSilenceGracefully(),
             ProbesAreSpecific(),
             StaleProbesBridged(),
+            CoveredSubtopicsAccumulate(),
+            NoContextDrift(),
         ),
     )
 
@@ -488,22 +782,28 @@ def _build_dataset() -> Dataset[TrajectoryInputs, TrajectoryResult, None]:
 
 @pytest.mark.asyncio
 @pytest.mark.slow
-async def test_tier3_trajectories():
-    """Focused simulation for contradictory + off_topic_rambler personas.
+async def test_tier3_trajectories(cases_filter: set[str] | None):
+    """Focused simulation for 6 personas testing emergent multi-turn behavior.
 
-    These are the only 2 personas testing emergent multi-agent behavior
-    (analyst ↔ interviewer) that replay evals can't cover. The other 4
-    personas run as deterministic replay evals in test_replay.py.
+    Personas testing multi-agent dynamics (analyst ↔ interviewer) and trajectory
+    properties that deterministic replay evals can't cover:
+      - contradictory: analyst catches contradiction + interviewer probes it
+      - off_topic_rambler: interviewer fires off_topic redirect (start + mid)
+      - silent_respondent: silence handling + wrap_up after 3× "Still there?"
+      - context_compression: analyst accumulates all covered subtopics (start + mid)
+      - context_drift: interviewer doesn't re-ask facts from turn 1 (start/mid/end)
+      - cooperative_respondent: call should reach wrap_up naturally (start/mid/end)
 
-    Marked `slow` — ~24 Sonnet calls ≈ 45s. Run with:
+    Each case is capped at 25 turns. Stage variants (mid/end) pre-seed the DB
+    with realistic prior conversation state so we cover calls that start at
+    different points. Marked `slow`. Run with:
         uv run pytest evals/test_trajectories.py -v -s -m slow
+        uv run pytest evals/test_trajectories.py -v -s -m slow --cases context_drift,context_compression
     """
-    init_tracing(service_name="voice-agent-evals")
-
-    dataset = _build_dataset()
+    dataset = _build_dataset(only=cases_filter)
     report = await dataset.evaluate(
         run_trajectory,
-        max_concurrency=2,
+        max_concurrency=6,
         progress=False,
     )
 
@@ -533,6 +833,14 @@ async def test_tier3_trajectories():
         f"stale probe bridging {scores.get('StaleProbesBridged', 0):.0%} below 75% — "
         "interviewer not saying 'earlier you mentioned' when picking up old probes"
     )
+    assert scores.get("CoveredSubtopicsAccumulate", 1.0) >= 0.70, (
+        f"context_compression: analyst only tracked "
+        f"{scores.get('CoveredSubtopicsAccumulate', 0):.0%} of expected topics — "
+        "covered_subtopics not accumulating across turns"
+    )
+    assert scores.get("NoContextDrift", 1.0) >= 1.0, (
+        "context_drift persona: interviewer re-asked or contradicted facts from turn 1"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -541,8 +849,8 @@ async def test_tier3_trajectories():
 
 
 def _print_results(report) -> None:
-    cols = "  CC  CS  CT  RT  PS  SB"
-    header = f"{'persona':<24}{cols}  actions"
+    cols = "  CS  CT  RT  PS  SB  CA  ND"
+    header = f"{'case':<32}{cols}  actions"
     print(f"\nTier 3 simulation results:\n{header}\n{'-' * len(header)}")
 
     def _b(src, key) -> str:
@@ -559,14 +867,15 @@ def _print_results(report) -> None:
     for case in report.cases:
         a = case.assertions or {}
         sc = case.scores or {}
-        cc = _b(a, "CallCompletes")
         cs = _b(a, "CoveredAllScripted")
         ct = _b(a, "CaughtContradiction")
         rt = _b(a, "RedirectedOffTopic")
         ps = _b(sc, "ProbesAreSpecific")
         sb = _b(sc, "StaleProbesBridged")
+        ca = _b(sc, "CoveredSubtopicsAccumulate")
+        nd = _b(a, "NoContextDrift")
         actions = ", ".join(case.output.turn_actions) if case.output else ""
-        print(f"{(case.name or ''):<24}{cc}{cs}{ct}{rt}{ps}{sb}  {actions[:60]}")
+        print(f"{(case.name or ''):<32}{cs}{ct}{rt}{ps}{sb}{ca}{nd}  {actions[:60]}")
 
         if case.output and not case.output.completed:
             print(f"  [did not complete — {case.output.total_db_turns} db turns]")

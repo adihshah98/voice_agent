@@ -23,7 +23,7 @@ load_dotenv()
 
 from voice_agent.models import Persona, SimulatedReply
 
-SIMULATOR_MODEL = "anthropic:claude-sonnet-4-6"
+SIMULATOR_MODEL = "anthropic:claude-haiku-4-5-20251001"
 
 
 @dataclass

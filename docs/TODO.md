@@ -2,6 +2,7 @@
 
 - Evals
   - Trajectory Evals
+    - How long are these trajectories
     - Context compression for topics covered
     - Context drift: agent forgets or misinterprets earlier info (the context compression compresses questions, what abt answers)
     - Make sure it wraps up with everything covered in a set time but probes at correct depth
@@ -11,6 +12,11 @@
   - Render Deployment 
   - Live DB + Alembic (Remove all alter tables)
   - Rate limiting
+- Decision Making
+  - Some kind of deterministic order to decide what action to take?
+  - Is our code/logic modular
+  - State Machine to manage loops/rabbitholes?
+  - Write latest arch & take account of best practice etc.
 - Multi-tenant 
   - Eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in mind
     - Tell it it is diligencing which product & some knowledge abt it
@@ -26,11 +32,7 @@
 ## Future improvements
 
 - Flow
-  - RIght now, we pause on 3 clarifies - this is if the user is giving non-commital replies, but even in cases of genuine temporary lack of conection, it might end call
   - What if user has to tend to doorbell and asks agent to pause for 3-5 minutes
-- Decision Making
-  - Some kind of deterministic order to decide what action to take?
-  - Is our code/logic modular
 - Evals
   - Host datasets directly on Logfire (Currently we run it on local and save runs there, now we can host datasets, collab etc. directly on LF)
   - Hosted prompt & prompt versioning on Logfire
@@ -46,8 +48,6 @@
   - **Feature flags / kill switches**: disable analyst, disable probes, force scripted-only mode during incidents
   - The analyst is triggered by polling `should_run_analyst()` on every `conversation-update`. Fine for one call, but with N concurrent calls you get lock contention and polling overhead. Production systems use a task queue (Celery + Redis, SQS, etc.) — the webhook handler enqueues a job instead of calling `asyncio.create_task` inline.
   - The analyst competes with the real-time interviewer for the event loop. A slow Sonnet call during a burst can delay turn responses. In production you'd want the analyst as a separate worker service — the invariant holds, you just move the writes to a different process.
-- Better Agent Loop
-  - State Machine to manage loops/rabbitholes?
 - Memory
   - Memory/Improving agents with usage
 - Advanced Voice UX
