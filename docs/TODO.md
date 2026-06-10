@@ -1,13 +1,7 @@
 ## Todo
 
 - Evals
-  - Trajectory Evals
-    - How long are these trajectories
-    - Context compression for topics covered
-    - Context drift: agent forgets or misinterprets earlier info (the context compression compresses questions, what abt answers)
-    - Make sure it wraps up with everything covered in a set time but probes at correct depth
-  - Online Evals: 
-    - Only returning that probes were generated - we should add more
+  - Online Evals: ✓ Done — structural checks (action valid, single question, filler rate, fallback rate) on every turn via turn_online_eval span; LLM judges (probe specificity, contextual relevance) at 20% sample on run_speech_turn path; post-call call_summary_eval with scripted arc %, probe utilization %, barge-in rate, fallback rate
 - Infra - Prod Level
   - Render Deployment 
   - Live DB + Alembic (Remove all alter tables)

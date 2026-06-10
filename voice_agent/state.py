@@ -364,6 +364,56 @@ def turns_since(session: Session, call_id: str, after_turn: int) -> list[Turn]:
     return list(session.exec(stmt))
 
 
+def call_summary_stats(session: Session, call_id: str) -> dict:
+    """Return post-call aggregate stats for online eval summary.
+
+    Returns scripted arc completion fraction, probe utilization, and barge-in count.
+    """
+    call = session.get(Call, call_id)
+    if call is None:
+        return {}
+
+    total_scripted = len(call.scripted_questions)
+    scripted_pct = round(100 * call.scripted_cursor / total_scripted) if total_scripted else None
+
+    probes_asked, probes_total = probe_utilization(session, call_id)
+    probe_pct = round(100 * probes_asked / probes_total) if probes_total else None
+
+    barge_in_count = session.exec(
+        select(func.count()).where(
+            Turn.call_id == call_id,
+            Turn.barge_in_truncated == True,  # noqa: E712
+        )
+    ).one()
+
+    interviewer_turns = session.exec(
+        select(func.count()).where(
+            Turn.call_id == call_id,
+            Turn.speaker == "interviewer",
+        )
+    ).one()
+
+    fallback_count = session.exec(
+        select(func.count()).where(
+            Turn.call_id == call_id,
+            Turn.speaker == "interviewer",
+            Turn.action == None,  # noqa: E711 — fallback rows have no action set
+        )
+    ).one()
+
+    return {
+        "scripted_cursor": call.scripted_cursor,
+        "scripted_total": total_scripted,
+        "scripted_arc_pct": scripted_pct,
+        "probes_asked": probes_asked,
+        "probes_total": probes_total,
+        "probe_utilization_pct": probe_pct,
+        "barge_in_count": int(barge_in_count),
+        "interviewer_turns": int(interviewer_turns),
+        "fallback_count": int(fallback_count),
+    }
+
+
 def consecutive_clarify_count(session: Session, call_id: str) -> int:
     """Count trailing consecutive interviewer turns with action='clarify'.
 

@@ -11,9 +11,10 @@ from typing import Any
 
 import logfire
 from dataclasses import dataclass
+from pydantic_ai import Agent
 from pydantic_ai.usage import RunUsage
 from pydantic_evals.evaluators import Evaluator, EvaluatorContext
-from pydantic_evals.online import evaluate
+from pydantic_evals.online import OnlineEvaluator, SamplingContext, evaluate, run_evaluators
 from sqlmodel import select
 from voice_agent import state
 from voice_agent.agents.interviewer import (
@@ -64,6 +65,16 @@ class StreamTurnResult:
 
 _VALID_ACTIONS = {"probe", "scripted", "clarify", "off_topic", "wrap_up", "skip_scripted"}
 
+_ONLINE_JUDGE_MODEL = "anthropic:claude-haiku-4-5-20251001"
+
+# Filler + <flush /> prefix injected by TurnPipeline — strip before judging.
+import re as _re
+_FILLER_RE = _re.compile(r"^[^<]*<flush\s*/>\s*", _re.IGNORECASE)
+
+
+def _strip_filler(text: str) -> str:
+    return _FILLER_RE.sub("", text).strip()
+
 
 @dataclass
 class ActionIsValid(Evaluator):
@@ -74,7 +85,7 @@ class ActionIsValid(Evaluator):
 @dataclass
 class SingleQuestionOnline(Evaluator):
     def evaluate(self, ctx: EvaluatorContext) -> bool:
-        return ctx.output.get("message", "").count("?") <= 1
+        return _strip_filler(ctx.output.get("message", "")).count("?") <= 1
 
 
 @dataclass
@@ -83,7 +94,120 @@ class FillerRate(Evaluator):
         return 1.0 if ctx.output.get("filler_injected") else 0.0
 
 
-@evaluate(ActionIsValid(), SingleQuestionOnline(), FillerRate())
+@dataclass
+class FallbackRate(Evaluator):
+    """Tracks fallback firing rate — high values signal model latency or prompt bloat."""
+
+    def evaluate(self, ctx: EvaluatorContext) -> float:
+        return 1.0 if ctx.output.get("is_fallback") else 0.0
+
+
+_PROBE_SPECIFICITY_AGENT: Agent | None = None
+
+
+def _get_probe_specificity_agent() -> Agent:
+    global _PROBE_SPECIFICITY_AGENT
+    if _PROBE_SPECIFICITY_AGENT is None:
+        _PROBE_SPECIFICITY_AGENT = Agent(
+            _ONLINE_JUDGE_MODEL,
+            output_type=bool,
+            system_prompt=(
+                "You are grading a single interviewer utterance from a market research phone call "
+                "where the action was `probe`.\n\n"
+                "Return true if the probe is SPECIFIC: it references at least one concrete detail "
+                "the respondent actually mentioned — a named feature, a number, a person, a "
+                "competitor, a workflow, or a concrete event from the conversation.\n\n"
+                "Return false if the probe is VAGUE: it could apply to any respondent in any "
+                "interview without reading this conversation. Examples that should return false:\n"
+                "  - 'Can you tell me more about your day-to-day use?'\n"
+                "  - 'What does that look like for your team?'\n"
+                "  - 'Can you elaborate on that?'\n\n"
+                "The full conversation is provided as context. Reply with only true or false."
+            ),
+        )
+    return _PROBE_SPECIFICITY_AGENT
+
+
+_CONTEXTUAL_RELEVANCE_AGENT: Agent | None = None
+
+
+def _get_contextual_relevance_agent() -> Agent:
+    global _CONTEXTUAL_RELEVANCE_AGENT
+    if _CONTEXTUAL_RELEVANCE_AGENT is None:
+        _CONTEXTUAL_RELEVANCE_AGENT = Agent(
+            _ONLINE_JUDGE_MODEL,
+            output_type=bool,
+            system_prompt=(
+                "You are grading whether an interviewer's utterance is topically appropriate "
+                "given the conversation context.\n\n"
+                "Return true if the utterance is CONTEXTUALLY RELEVANT: it addresses what the "
+                "respondent just said, follows naturally from the conversation, and pursues a "
+                "goal that makes sense at this moment in the interview.\n\n"
+                "Return false if:\n"
+                "  - The utterance asks about something the respondent never mentioned and that "
+                "doesn't flow from the conversation\n"
+                "  - The utterance completely ignores a striking thing the respondent just said "
+                "(a named competitor, a churn signal, a low NPS score) and pivots to something "
+                "unrelated\n"
+                "  - For action=probe: the question probes something unrelated to the recent "
+                "conversation\n\n"
+                "Do NOT fail on warmth or leading-ness — grade only topical relevance. "
+                "Reply with only true or false."
+            ),
+        )
+    return _CONTEXTUAL_RELEVANCE_AGENT
+
+
+def _is_probe_action(ctx: SamplingContext) -> float:
+    """Sample at 20% overall; skip entirely when the action is not probe."""
+    output = ctx.inputs.get("_output")
+    if output is not None and output.get("action") != "probe":
+        return 0.0
+    return 0.2
+
+
+@dataclass
+class ProbeSpecificityOnline(Evaluator):
+    """LLM judge: is the probe specific to what the respondent said? Sampled, probe-only."""
+
+    async def evaluate(self, ctx: EvaluatorContext) -> bool:
+        message = _strip_filler(ctx.output.get("message", ""))
+        conversation = ctx.output.get("conversation_context", "")
+        prompt = f"CONVERSATION:\n{conversation}\n\nPROBE UTTERANCE:\n{message}"
+        result = await _get_probe_specificity_agent().run(prompt)
+        return bool(result.output)
+
+
+@dataclass
+class ContextualRelevanceOnline(Evaluator):
+    """LLM judge: is the response topically on-point given conversation context? Sampled."""
+
+    async def evaluate(self, ctx: EvaluatorContext) -> bool:
+        message = _strip_filler(ctx.output.get("message", ""))
+        action = ctx.output.get("action", "")
+        conversation = ctx.output.get("conversation_context", "")
+        prompt = (
+            f"ACTION: {action}\n\n"
+            f"CONVERSATION:\n{conversation}\n\n"
+            f"INTERVIEWER UTTERANCE:\n{message}"
+        )
+        result = await _get_contextual_relevance_agent().run(prompt)
+        return bool(result.output)
+
+
+# Per-evaluator online eval wrappers with explicit sample rates.
+# Structural checks run on every turn (cheap); LLM judges at 20%.
+_ONLINE_EVALUATORS = [
+    OnlineEvaluator(evaluator=ActionIsValid(), sample_rate=1.0),
+    OnlineEvaluator(evaluator=SingleQuestionOnline(), sample_rate=1.0),
+    OnlineEvaluator(evaluator=FillerRate(), sample_rate=1.0),
+    OnlineEvaluator(evaluator=FallbackRate(), sample_rate=1.0),
+    OnlineEvaluator(evaluator=ProbeSpecificityOnline(), sample_rate=0.2),
+    OnlineEvaluator(evaluator=ContextualRelevanceOnline(), sample_rate=0.2),
+]
+
+
+@evaluate(*_ONLINE_EVALUATORS)
 async def run_speech_turn(
     engine,
     call_id: str,
@@ -93,6 +217,8 @@ async def run_speech_turn(
     pipeline = TurnPipeline(engine, call_id, vapi_messages=vapi_messages)
     message = "".join([tok async for tok in pipeline.stream_tokens()])
     result = await pipeline.commit()
+    # Build a human-readable conversation string for LLM judges.
+    conversation_context = _format_conversation_context(vapi_messages)
     return {
         "message": message,
         "action": result.action,
@@ -100,7 +226,25 @@ async def run_speech_turn(
         "llm_latency_ms": result.llm_latency_ms,
         "should_run_analyst": result.should_run_analyst,
         "llm_usage": result.llm_usage,
+        "filler_injected": result.filler_injected,
+        "is_fallback": pipeline._reply.is_fallback if pipeline._reply else False,
+        "conversation_context": conversation_context,
     }
+
+
+def _format_conversation_context(vapi_messages: list[dict] | None) -> str:
+    """Format the last 10 Vapi messages as a readable transcript for LLM judges."""
+    if not vapi_messages:
+        return ""
+    recent = vapi_messages[-10:]
+    lines = []
+    for m in recent:
+        role = m.get("role", "unknown")
+        label = "Respondent" if role == "user" else "Interviewer"
+        content = m.get("content", "").strip()
+        if content:
+            lines.append(f"{label}: {content}")
+    return "\n".join(lines)
 
 
 class TurnPipeline:
@@ -319,6 +463,22 @@ class TurnPipeline:
             utterance_chars=len(reply.utterance),
             llm_latency_ms=self._llm_latency_ms,
             persist_ms=persist_ms,
+        )
+
+        # Emit structural online eval scores for the production streaming path.
+        # LLM judges (ProbeSpecificity, ContextualRelevance) are NOT run here — they
+        # are background-dispatched only on the run_speech_turn non-streaming path via
+        # @evaluate. Structural checks are cheap enough to run on every turn.
+        utterance_clean = _strip_filler(reply.utterance)
+        logfire.info(
+            "turn_online_eval",
+            call_id=call_id,
+            turn_number=turn_number,
+            action_is_valid=reply.action in _VALID_ACTIONS,
+            single_question=utterance_clean.count("?") <= 1,
+            filler_injected=self._filler_injected,
+            is_fallback=reply.is_fallback,
+            prompt_version=INTERVIEWER_PROMPT_VERSION,
         )
 
         return StreamTurnResult(

@@ -449,6 +449,7 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
 
             with state.session_scope(engine) as session:
                 token_totals = state.call_llm_token_totals(session, call_id)
+                summary_stats = state.call_summary_stats(session, call_id)
 
             logfire.info(
                 "call_ended",
@@ -461,6 +462,24 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                 **token_totals,
                 **vapi_latency,
             )
+
+            # Post-call aggregate eval — scripted arc completion, probe utilization,
+            # barge-in rate, fallback rate. All derived from DB; no LLM call needed.
+            if summary_stats:
+                interviewer_turns = summary_stats.get("interviewer_turns") or 0
+                logfire.info(
+                    "call_summary_eval",
+                    call_id=call_id,
+                    **summary_stats,
+                    barge_in_rate_pct=(
+                        round(100 * summary_stats["barge_in_count"] / interviewer_turns)
+                        if interviewer_turns else None
+                    ),
+                    fallback_rate_pct=(
+                        round(100 * summary_stats["fallback_count"] / interviewer_turns)
+                        if interviewer_turns else None
+                    ),
+                )
             if ENABLE_SYNTHESIS_REPORT:
                 _fire(_synthesis_task(call_id), name=f"synthesis-{call_id}")
             else:
