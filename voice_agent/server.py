@@ -26,7 +26,9 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -71,7 +73,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="voice-agent", lifespan=lifespan)
+app = FastAPI(
+    title="voice-agent",
+    lifespan=lifespan,
+    swagger_ui_parameters={"persistAuthorization": True},
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -300,19 +306,24 @@ async def _require_llm_secret(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
 
-async def _require_api_auth(request: Request) -> None:
-    """Require Authorization: Bearer … when API_AUTH_TOKEN is set. No-op when unset (dev)."""
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def _require_api_auth(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> None:
+    """Require Authorization: Bearer … when API_AUTH_TOKEN is set. No-op when unset (dev).
+
+    Using HTTPBearer as the dependency makes FastAPI declare the BearerAuth security
+    scheme in the OpenAPI spec, so Swagger UI shows the Authorize button.
+    """
     expected = settings.api_auth_token
     if not expected:
         return
-    auth = request.headers.get("Authorization", "")
-    scheme, _, value = auth.partition(" ")
-    if scheme.lower() != "bearer":
-        logfire.warning("api_auth_invalid", path=request.url.path, reason="missing_or_non_bearer")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    given = value.strip()
-    if len(given) != len(expected) or not secrets.compare_digest(given, expected):
-        logfire.warning("api_auth_invalid", path=request.url.path, reason="bad_token")
+    given = credentials.credentials if credentials else ""
+    if not given or len(given) != len(expected) or not secrets.compare_digest(given, expected):
+        logfire.warning("api_auth_invalid", path=request.url.path)
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 

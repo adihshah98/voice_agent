@@ -1,9 +1,5 @@
 ## Todo
 
-- Infra - Prod Level
-  - ~~Render Deployment~~ ✓ (render.yaml + Dockerfile; psycopg2-binary; migrations run on startup)
-  - ~~Live DB + Alembic (Remove all alter tables)~~ ✓ (alembic/ + initial_schema migration; DATABASE_URL from env)
-  - ~~Rate limiting~~ ✓ (slowapi on POST /calls/start; CALLS_START_RATE_LIMIT env var, default 20/min)
 - Decision Making
   - Some kind of deterministic order to decide what action to take?
   - Is our code/logic modular
