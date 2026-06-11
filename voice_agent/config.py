@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     groq_model: str = "groq:llama-3.3-70b-versatile"
     cerebras_model: str = "cerebras:llama3.1-8b"  # same provider:model form; "" skips Cerebras in the chain
 
+    # Rate limiting (POST /calls/start). Format: "<count>/<period>" e.g. "20/minute".
+    # Set to "" to disable. Applies per client IP (X-Forwarded-For on Render).
+    calls_start_rate_limit: str = "20/minute"
+
     # Dev / evals
     log_level: str = "INFO"
     # Set to 0.0 in eval environments for deterministic outputs. None = provider default.

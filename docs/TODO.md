@@ -1,18 +1,16 @@
 ## Todo
 
-- Evals
-  - Online Evals: ✓ Done — structural checks (action valid, single question, filler rate, fallback rate) on every turn via turn_online_eval span; LLM judges (probe specificity, contextual relevance) at 20% sample on run_speech_turn path; post-call call_summary_eval with scripted arc %, probe utilization %, barge-in rate, fallback rate
 - Infra - Prod Level
-  - Render Deployment 
-  - Live DB + Alembic (Remove all alter tables)
-  - Rate limiting
+  - ~~Render Deployment~~ ✓ (render.yaml + Dockerfile; psycopg2-binary; migrations run on startup)
+  - ~~Live DB + Alembic (Remove all alter tables)~~ ✓ (alembic/ + initial_schema migration; DATABASE_URL from env)
+  - ~~Rate limiting~~ ✓ (slowapi on POST /calls/start; CALLS_START_RATE_LIMIT env var, default 20/min)
 - Decision Making
   - Some kind of deterministic order to decide what action to take?
   - Is our code/logic modular
   - State Machine to manage loops/rabbitholes?
   - Write latest arch & take account of best practice etc.
 - Multi-tenant 
-  - Eventual goal is per customer, per call, per project level configurabilityt across many customers, with a frotnend to be able to configure it. Design keeping that in mind
+  - Eventual goal is per customer, per call, per project level configurability across many customers, with a frotnend to be able to configure it. Design keeping that in mind
     - Tell it it is diligencing which product & some knowledge abt it
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default

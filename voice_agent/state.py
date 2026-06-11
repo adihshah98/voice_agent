@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import logfire
-from sqlalchemy import Column, UniqueConstraint, inspect, text
+from sqlalchemy import Column, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import JSON
 from sqlalchemy.pool import NullPool, StaticPool
@@ -194,34 +194,10 @@ def make_engine(url: str = "sqlite:///voice_agent.db", *, echo: bool = False):
 
 
 def init_db(engine) -> None:
-    SQLModel.metadata.create_all(engine)
-    # Additive columns for existing DBs (SQLite dev file / Postgres without Alembic yet).
-    try:
-        cols = {c["name"] for c in inspect(engine).get_columns("calls")}
-    except Exception:
-        return
-    with engine.begin() as conn:
-        if "dial_status" not in cols:
-            conn.execute(text("ALTER TABLE calls ADD COLUMN dial_status VARCHAR"))
-        if "dial_error" not in cols:
-            conn.execute(text("ALTER TABLE calls ADD COLUMN dial_error VARCHAR"))
-
-    try:
-        turn_cols = {c["name"] for c in inspect(engine).get_columns("turns")}
-    except Exception:
-        return
-    with engine.begin() as conn:
-        if "probe_source" not in turn_cols:
-            conn.execute(text("ALTER TABLE turns ADD COLUMN probe_source VARCHAR"))
-
-    try:
-        sr_cols = {c["name"] for c in inspect(engine).get_columns("synthesis_reports")}
-    except Exception:
-        return
-    with engine.begin() as conn:
-        for col in ("tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write"):
-            if col not in sr_cols:
-                conn.execute(text(f"ALTER TABLE synthesis_reports ADD COLUMN {col} INTEGER"))
+    # Schema is managed by Alembic migrations. create_all() is kept for
+    # in-memory SQLite only (tests/evals), where there is no migration history.
+    if str(engine.url).startswith("sqlite:///:memory:"):
+        SQLModel.metadata.create_all(engine)
 
 
 @contextmanager

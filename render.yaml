@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: voice-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Render injects DATABASE_URL automatically from the linked database below.
+    envVars:
+      # --- Required secrets — set these in the Render dashboard or via render.yaml secrets ---
+      - key: ANTHROPIC_API_KEY
+        sync: false          # set manually in dashboard
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: LOGFIRE_TOKEN
+        sync: false
+      - key: VAPI_API_KEY
+        sync: false
+      - key: VAPI_PHONE_NUMBER_ID
+        sync: false
+      - key: VAPI_WEBHOOK_SECRET
+        sync: false
+      - key: VAPI_SERVER_CREDENTIAL_ID
+        sync: false
+      - key: LLM_SECRET_TOKEN
+        sync: false
+      - key: API_AUTH_TOKEN
+        sync: false
+      - key: VAPI_VOICE_ID
+        sync: false
+      # --- Auto-wired by Render from the database below ---
+      - key: DATABASE_URL
+        fromDatabase:
+          name: voice-agent-db
+          property: connectionString
+      # --- Service URL (set after first deploy, needed for outbound Vapi dials) ---
+      - key: WEBHOOK_URL
+        sync: false          # set to https://<your-render-service>.onrender.com after first deploy
+
+databases:
+  - name: voice-agent-db
+    databaseName: voice_agent
+    user: voice_agent
+    plan: free              # upgrade to starter/standard for production

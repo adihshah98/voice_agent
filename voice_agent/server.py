@@ -28,6 +28,9 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy import update
 from sqlmodel import Session, select
 from voice_agent import state
@@ -37,6 +40,10 @@ from voice_agent.tracing import agent_span, init_tracing
 from voice_agent.turn import TurnPipeline
 
 LOGFIRE_BASE_URL = "https://logfire.pydantic.dev"
+
+# Rate limiter — in-memory, keyed by client IP.
+# Configure via CALLS_START_RATE_LIMIT env var, e.g. "5/minute". "" = disabled.
+limiter = Limiter(key_func=get_remote_address)
 
 engine = state.make_engine(settings.database_url)
 
@@ -65,6 +72,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="voice-agent", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 
@@ -555,7 +564,8 @@ class StartCallRequest(BaseModel):
 
 
 @app.post("/calls/start")
-async def start_call(req: StartCallRequest, _: None = Depends(_require_api_auth)) -> JSONResponse:
+@limiter.limit(settings.calls_start_rate_limit or "9999/hour")
+async def start_call(request: Request, req: StartCallRequest, _: None = Depends(_require_api_auth)) -> JSONResponse:
     """Seed scripted questions and optionally dial out via Vapi (dial runs in background; 202 if queued)."""
     call_id = req.call_id or str(uuid.uuid4())
 
