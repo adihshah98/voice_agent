@@ -178,6 +178,11 @@ class SynthesisReport(SQLModel, table=True):
 
 
 def make_engine(url: str = "sqlite:///voice_agent.db", *, echo: bool = False):
+    # Normalize bare postgresql:// → postgresql+psycopg2:// (Supabase/Render copy-paste).
+    if url.startswith("postgresql://") or url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1).replace(
+            "postgresql://", "postgresql+psycopg2://", 1
+        )
     if url.startswith("sqlite"):
         if ":memory:" in url:
             # StaticPool keeps a single connection so all sessions share the
