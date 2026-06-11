@@ -343,19 +343,19 @@ async def test_calls_start_and_delete_require_bearer_when_api_auth_configured(
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        r = await client.post("/calls/start", json={"scripted_questions": ["q1"]})
+        r = await client.post("/calls/start", json={"product": "Test"})
         assert r.status_code == 401
 
         r = await client.post(
             "/calls/start",
-            json={"scripted_questions": ["q1"]},
+            json={"product": "Test"},
             headers={"Authorization": "Bearer wrong"},
         )
         assert r.status_code == 401
 
         r = await client.post(
             "/calls/start",
-            json={"scripted_questions": ["q1"]},
+            json={"product": "Test"},
             headers={"Authorization": "Bearer test-bearer-secret"},
         )
         assert r.status_code == 200
@@ -401,7 +401,7 @@ async def test_calls_start_async_dial_returns_202(mocker: pytest_mock.MockerFixt
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         r = await client.post(
             "/calls/start",
-            json={"scripted_questions": ["q1"], "phone_number": "+15551234567"},
+            json={"product": "Test", "phone_number": "+15551234567"},
         )
     assert r.status_code == 202
     assert r.json()["dial_status"] == "queued"
@@ -427,7 +427,7 @@ async def test_calls_start_sync_abort_when_dial_config_incomplete(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         r = await client.post(
             "/calls/start",
-            json={"scripted_questions": ["q1"], "phone_number": "+15551234567"},
+            json={"product": "Test", "phone_number": "+15551234567"},
         )
     assert r.status_code == 200
     body = r.json()

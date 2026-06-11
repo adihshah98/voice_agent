@@ -568,17 +568,29 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
 # --- Call lifecycle ---------------------------------------------------------
 
 
+def _load_default_questions(product: str) -> list[str]:
+    """Load questions from data/investor_questions.yaml, substituting [product]."""
+    import yaml
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "data" / "investor_questions.yaml"
+    raw = yaml.safe_load(path.read_text())
+    return [
+        entry["question"].strip().replace("[product]", product or "the product")
+        for entry in raw["questions"]
+    ]
+
+
 class StartCallRequest(BaseModel):
-    scripted_questions: list[str]
+    product: str
     phone_number: str | None = None
-    call_id: str | None = None
 
 
 @app.post("/calls/start")
 @limiter.limit(settings.calls_start_rate_limit or "9999/hour")
 async def start_call(request: Request, req: StartCallRequest, _: None = Depends(_require_api_auth)) -> JSONResponse:
-    """Seed scripted questions and optionally dial out via Vapi (dial runs in background; 202 if queued)."""
-    call_id = req.call_id or str(uuid.uuid4())
+    """Dial out via Vapi, loading scripted questions from investor_questions.yaml for the given product."""
+    call_id = str(uuid.uuid4())
+    scripted_questions = _load_default_questions(req.product)
 
     wants_dial = bool(req.phone_number and settings.vapi_api_key)
     can_dial = bool(
@@ -612,7 +624,7 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
             state.Call(
                 id=call_id,
                 phone_number=req.phone_number,
-                scripted_questions=req.scripted_questions,
+                scripted_questions=scripted_questions,
                 status=status,
                 dial_status=dial_status,
                 dial_error=dial_error,
@@ -625,7 +637,8 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
         "call_created",
         call_id=call_id,
         phone_number=req.phone_number,
-        question_count=len(req.scripted_questions),
+        question_count=len(scripted_questions),
+        product=req.product,
         dial_status=dial_status,
     )
 
