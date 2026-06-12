@@ -1,10 +1,9 @@
 ## Todo
 
-- Decision Making
-  - Some kind of deterministic order to decide what action to take?
-  - Is our code/logic modular
-  - State Machine to manage loops/rabbitholes?
-  - Write latest arch & take account of best practice etc.
+- Decision Making: Some kind of deterministic order to decide what action to take?
+  - How did you debug the regex issue? I want to know how I can replciate it in the future
+- Silence in Vapi
+  - See chat that says "silence detection and time limits"
 - Multi-tenant 
   - Eventual goal is per customer, per call, per project level configurability across many customers, with a frotnend to be able to configure it. Design keeping that in mind
     - Tell it it is diligencing which product & some knowledge abt it

@@ -55,6 +55,7 @@ def _pick_filler(call_id: str) -> str:
 class StreamTurnResult:
     action: str
     reasoning: str
+    probe_source: str | None
     llm_latency_ms: int
     ttft_ms: int | None
     persist_ms: int
@@ -223,6 +224,7 @@ async def run_speech_turn(
         "message": message,
         "action": result.action,
         "reasoning": result.reasoning,
+        "probe_source": result.probe_source,
         "llm_latency_ms": result.llm_latency_ms,
         "should_run_analyst": result.should_run_analyst,
         "llm_usage": result.llm_usage,
@@ -484,6 +486,7 @@ class TurnPipeline:
         return StreamTurnResult(
             action=reply.action,
             reasoning=reply.reasoning,
+            probe_source=reply.probe_source,
             llm_latency_ms=self._llm_latency_ms,
             ttft_ms=self._first_token_ms,
             persist_ms=persist_ms,

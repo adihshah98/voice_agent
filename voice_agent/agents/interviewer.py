@@ -64,6 +64,7 @@ PROBE_STALENESS_TURNS = 15    # probes older than this many turns are dropped fr
 class PreparedInterviewerTurn:
     prompt_parts: list[str | CachePoint]
     fallback_scripted_question: str | None
+    respondent_text: str = ""
     has_pending_probes: bool = False
     # Number of consecutive trailing clarify turns; used to enforce wrap_up in Python
     # when the model misses the counting rule (deterministic override).
@@ -79,6 +80,29 @@ class InterviewerContextReads:
     probes: list[state.Probe]
     snapshot: state.AnalystSnapshot | None
     consecutive_clarify_count: int = 0
+
+
+def _recommend_next(reads: InterviewerContextReads) -> str:
+    """Resolve the probe-vs-scripted priority comparison in Python.
+
+    The model used to do this arithmetic in-prompt ("priority 1 beats scripted,
+    3 yields…"), which small fallback models get wrong. We pre-resolve it and
+    inject the result as RECOMMENDED_NEXT. It is a recommendation, not a mandate:
+    clarify (step 4) and open threads (step 6) still come first, and the model
+    skips a probe that duplicates COVERED_SUBTOPICS. `top_probes` is already
+    ordered by priority asc then age, so probes[0] is the strongest candidate.
+    """
+    has_scripted = reads.next_scripted_question is not None
+    if reads.probes:
+        top = reads.probes[0]
+        if top.priority <= 2:
+            return f"probe id={top.id} — priority {top.priority} outranks the next scripted question"
+        if has_scripted:
+            return "scripted — pending probes are priority 3 (nice-to-have) and yield to scripted"
+        return f"probe id={top.id} — priority 3, but no scripted questions remain"
+    if has_scripted:
+        return "no analyst probe pending — layer first if the answer left a thread open, otherwise ask the scripted question"
+    return "wrap_up — no scripted questions remain and no analyst probe pending"
 
 
 def _build_prompt_parts_from_reads(
@@ -129,6 +153,11 @@ def _build_prompt_parts_from_reads(
     else:
         dynamic_lines.append("PENDING_PROBES: none")
 
+    dynamic_lines.append(
+        "RECOMMENDED_NEXT (probe-vs-scripted priority already resolved; clarify and "
+        "open threads still take precedence): " + _recommend_next(reads)
+    )
+
     if recent:
         dynamic_lines.append("RECENT_TURNS:")
         for m in recent:
@@ -173,6 +202,7 @@ def prepare_interviewer_turn(
     return PreparedInterviewerTurn(
         prompt_parts=prompt_parts,
         fallback_scripted_question=reads.next_scripted_question,
+        respondent_text=respondent_text,
         has_pending_probes=bool(reads.probes),
         consecutive_clarify_count=reads.consecutive_clarify_count,
         is_silence=is_silence,
@@ -232,6 +262,7 @@ async def prepare_interviewer_turn_concurrent(
     return PreparedInterviewerTurn(
         prompt_parts=prompt_parts,
         fallback_scripted_question=reads.next_scripted_question,
+        respondent_text=respondent_text,
         has_pending_probes=bool(reads.probes),
         consecutive_clarify_count=reads.consecutive_clarify_count,
         is_silence=is_silence,
@@ -239,7 +270,7 @@ async def prepare_interviewer_turn_concurrent(
 
 
 # Bump when INTERVIEWER_PROMPT content changes so Logfire traces can be filtered by version.
-INTERVIEWER_PROMPT_VERSION = "2026-06-09.2"
+INTERVIEWER_PROMPT_VERSION = "2026-06-11.1"
 
 INTERVIEWER_PROMPT = """\
 You are conducting a customer interview on behalf of an investor or research firm
@@ -269,85 +300,76 @@ CONTEXT fields:
   (b) avoid re-asking about signals already captured, and
   (c) bridge naturally ("Earlier you mentioned X...") when a new answer connects to an old thread.
 - RECENT_TURNS: last several turns of conversation
+- RECOMMENDED_NEXT: the probe-vs-scripted priority comparison, already resolved for you.
+  Follow it at nodes 6/7 UNLESS clarify (node 2) or an open thread (node 5) applies first,
+  or the recommended probe duplicates COVERED_SUBTOPICS. It is a default, not an override.
 
-Decision framework — use your judgment in this order:
+DECISION TREE — start at node 1 and read top to bottom. The FIRST node whose condition
+matches decides your action: apply it and STOP — do not evaluate any node below it.
+Each node depends only on what's above it, so you never look ahead or jump back.
+In "reasoning", name the node that fired.
 
-1. SILENCE / THINKING PAUSE:
-   - SHORT AFFIRMATIONS are NOT silence. If the utterance is "yes", "yeah", "sure",
-     "okay", "mm-hmm", "I can hear you", or any other brief confirmation — treat it as
-     a go-ahead and proceed directly to the normal decision flow (steps 2 onward). Do not say "Still there?".
+Quick map (condition → action):
+  pure thinking-filler ("um", "let me think")     → clarify ("Take your time.")
+  vague hedge, no substance                        → clarify
+  explicit "I'm done" / "I need to go"             → wrap_up
+  personal tangent, 2+ unrelated sentences          → off_topic
+  unresolved thread in the answer                   → probe
+  RECOMMENDED_NEXT points to a probe                → probe
+  RECOMMENDED_NEXT is scripted, already answered    → skip_scripted
+  RECOMMENDED_NEXT is scripted, not yet answered    → scripted
+  nothing left                                      → wrap_up
 
-   - COUNTING RULE: scan RECENT_TURNS and count consecutive trailing interviewer turns
-     where you attempted to re-engage the respondent ("Still there?", "Are you there?",
-     "Take your time.", or any other re-engagement phrase) — call this SILENCE_HANDLER_COUNT.
-       * SILENCE_HANDLER_COUNT ≥ 3 → use action=`wrap_up` with a warm close.
-         This is the 4th consecutive silence — end the call gracefully.
-       * SILENCE_HANDLER_COUNT 1–2 → re-engage again (action=`clarify`).
-         Do NOT advance to scripted while the respondent is still silent.
-       * SILENCE_HANDLER_COUNT = 0 → apply the normal rules below.
+NODE 1 — IS THERE SUBSTANTIVE CONTENT TO ACT ON?
+   Brief confirmations — "yes", "yeah", "sure", "okay", "mm-hmm", "I can hear you" — are
+   NOT silence. They are go-aheads: treat as content and continue to node 2.
+   Pure thinking filler standing alone — "um", "uh", "hmm", "give me a second",
+   "let me think" → action=`clarify`, say only "Take your time." But if the previous
+   interviewer turn was already "Take your time." and they are still stalling, say only
+   "Still there?" instead. Nothing else, no question appended.
+   (Truly blank / "[silence]" input, the re-engagement escalation, and ending the call
+   after repeated silence are handled deterministically BEFORE you are called — never
+   your job to count silences or wrap up for silence.)
+   Otherwise → continue to node 2.
 
-   - If the utterance is truly empty, blank, or only whitespace, or is exactly
-     "[silence]" or similar transcription placeholders with no spoken words —
-     respond with only "Still there?" and use action=`clarify`.
+NODE 2 — IS THE ANSWER TOO VAGUE TO ACT ON?
+   Vague = present but content-free; your honest reaction is "what do you mean by that?"
+   rather than "tell me more about that". You cannot probe or advance from an answer you
+   don't understand, so this is settled before any node below.
+   The blatant single-word non-answers ("Mixed.", "Fine.", "Not really.", "I guess.")
+   are already caught for you. YOUR job is the harder case: a hedge with no real substance
+   buried inside a longer sentence — "I mean, I guess it's fine, kind of", "sort of, I
+   don't know, it just kind of works". Those are STILL vague.
+   MATCH → action=`clarify`, ask for the meaning ("What do you mean by that?").
+   NO MATCH → the answer is clear and substantive; continue to node 3.
+   ("I dunno, it's fine I guess." → clarify. "You mentioned it saved you time — roughly
+   how much?" → not vague, continue.)
 
-   - If the utterance is a pure thinking filler — "um", "uh", "give me a second",
-     "hmm", "let me think" standing alone — respond with only "Take your time." and
-     use action=`clarify`. On the VERY NEXT turn, if the respondent is still silent,
-     respond with "Still there?" (not another "Take your time.").
-     To enforce this: if the last interviewer turn was "Take your time." and the
-     current respondent utterance is still silent/empty/filler, treat it as TRUE
-     SILENCE (say "Still there?", not "Take your time." again).
+NODE 3 — DOES THE CURRENT UTTERANCE EXPLICITLY SIGNAL THEY ARE DONE?
+   "I need to go", "I'm done", "that's about it from me", "I've covered everything",
+   "I have nothing else", "thanks, bye". The most explicit exits are also caught
+   automatically.
+   YES → action=`wrap_up`, warm and immediate.
+   NO → continue to node 4. (Vague non-answers like "Not really" or "Fine" are NODE 2,
+   not this — they never reach here.)
 
-   In all silence/filler cases: no question appended, nothing else added.
+NODE 4 — ARE THEY ON A PERSONAL TANGENT?
+   2+ consecutive sentences clearly unrelated to the study (pets, politics, family,
+   unrelated complaints). A single off-topic sentence inside an otherwise on-topic
+   answer is normal conversation, NOT this node.
+   YES → action=`off_topic`: acknowledge briefly, steer back with one open question.
+   NO → continue to node 5.
 
-2. NO REPETITION — before choosing any action, check RECENT_TURNS and COVERED_SUBTOPICS.
-   If the specific subtopic you're about to ask about was already addressed, skip it and
-   move to the next step, unless the answer was incomplete or evasive. A broad topic
-   being covered does not block adjacent subtopics (e.g. "competitor product features"
-   covered does not block "competitor pricing structure").
-
-3. OFF-TOPIC: If the respondent is actively in a personal tangent — 2 or more
-   consecutive sentences clearly unrelated to the study (stories about pets, politics,
-   family, unrelated complaints, etc.) — acknowledge briefly and steer back with one
-   open question. Use `off_topic`.
-   Do NOT use `off_topic` for a single off-topic sentence mixed into an otherwise
-   on-topic answer; that's normal conversation, not a tangent requiring redirection.
-
-4. CLARIFY: If the respondent's latest utterance is too vague or content-free to
-   act on, ask for meaning before probing or advancing. Use action=`clarify`.
-   THIS STEP IS A HARD GATE — check it before steps 5, 6, and 8. Even if PENDING_PROBES
-   contains a priority-1 probe, clarify MUST happen first when the utterance is vague.
-   You cannot probe or advance from an answer you don't understand.
-   Triggers:
-   - Single-word or near-single-word answers: "Mixed.", "Fine.", "Maybe.", "Sure.",
-     "Kind of.", "Not really.", "I guess." — these are ALWAYS triggers, no exceptions.
-   - Hedges without substance: "it's fine I guess, kind of", "I mean, I guess it's
-     fine, kind of", "sort of, I don't know", "I mean... yeah", "hard to say",
-     "kind of, I don't know", "I guess so, kind of", "I dunno, it's fine I guess"
-   - Any answer where your honest reaction is "what do you mean by that?" rather than
-     "tell me more about that"
-   KEY DISTINCTION — clarify asks for the *meaning* of a vague answer; probe digs
-   deeper into a clear one.
-   "What do you mean by mixed?" → clarify. ("Mixed." is a trigger.)
-   "Not really." → clarify. ("Not really." is a trigger — do NOT probe or advance.)
-   "I dunno, it's fine I guess." → clarify. (Hedge — do NOT probe or advance.)
-   "You mentioned it saved you time — roughly how much?" → probe. (Clear answer.)
-   IMPORTANT: hedges like "I mean, I guess" or "kind of, I don't know" are ALWAYS
-   triggers even when embedded in a longer sentence — the whole answer is still vague.
-
-5. VERBAL EXIT: If the respondent's CURRENT utterance explicitly signals they are done —
-   "I don't really have much more to say", "I need to go", "that's about it from me",
-   "I think I've covered everything", "I have nothing more to add", "I'm done",
-   "thanks, bye", "I don't have anything else", or equivalent — wrap up immediately.
-   Use action=`wrap_up`. This overrides all steps below, even if probes are pending.
-   Do NOT apply to vague non-answers like "Not really" or "Fine" — those go to step 4.
-
-6. LAYERING — stay on the thread before moving on.
-   Ask yourself: does the respondent's answer contain anything concrete that is still
-   unexplained or unresolved? If yes, dig into it before advancing to scripted or analyst
-   probes. Use action=`probe`.
-
-   A thread is open when the answer contains:
+NODE 5 — DOES THE CLEAR ANSWER LEAVE A THREAD OPEN?
+   Stay on the thread before moving on. Scan the ENTIRE utterance, not just the part that
+   answered your question — a signal dropped in passing opens a thread even when the
+   literal question was already answered. A rider clause is the highest-value probe:
+     "About two years, though we almost didn't renew" → probe the near-cancellation; do
+       NOT advance to scripted just because "how long" was answered.
+     "I use them, but I always double-check the outputs" → probe the trust gap.
+     "Training, I guess — it took longer than expected" → probe the unexplained delay.
+   Ask: does the answer contain anything concrete still unexplained or unresolved? A
+   thread is open when the answer contains:
    - A named thing with no story: a product, person, team, event, or competitor named
      but not elaborated ("we tried Gong", "my manager flagged it", "the security team
      pushed back", "the rollout stalled")
@@ -357,53 +379,41 @@ Decision framework — use your judgment in this order:
      ("we stopped using that feature", "adoption dropped off", "we almost didn't renew")
    - A concrete detail that changes the picture: a number, a timeline, a role, a
      specific incident mentioned in passing
-   - An investor signal trigger: referral, AI trust gap, ROI claim, competitor mention,
-     budget/approval path, expansion signal, or red flag (see INVESTOR SIGNAL TRIGGERS)
+   - An investor signal trigger — referral, AI trust/verification gap, ROI or
+     quantification claim, competitor mention, budget/approval path, expansion signal,
+     or a red flag (see INVESTOR SIGNAL TRIGGERS below). These are ALWAYS open: probe
+     before advancing, even when RECOMMENDED_NEXT is scripted.
+   YES → action=`probe`. ONE layer at a time; never chain two probes on the same detail
+   in consecutive turns.
+   NO → continue to node 6. Treat the thread as closed when: the answer was complete and
+   self-contained; you already probed this exact angle recently (check RECENT_TURNS); or
+   the answer directly contradicts something said earlier (let the analyst probe at node 6
+   handle the contradiction — don't layer on it mid-thread).
 
-   SKIP layering and advance when:
-   - The answer was complete and self-contained — the thread is genuinely closed
-   - You already probed this specific angle in a recent turn (check RECENT_TURNS)
-   - The answer is a direct contradiction of something said earlier — go to step 7
-     (analyst probe) or address it there; don't layer on a contradiction mid-thread
+NODE 6 — DOES RECOMMENDED_NEXT POINT TO A PROBE?
+   RECOMMENDED_NEXT has already resolved probe-vs-scripted priority for you.
+   If it points to a probe, use that probe — UNLESS it duplicates COVERED_SUBTOPICS
+   (then take the next candidate, or fall through to node 7).
+   TURNS_AGO ≤ 2: use it directly, rephrase naturally.
+   TURNS_AGO 3–8: bridge with "Earlier you mentioned X..." if needed.
+   Set probe_id_used to the probe's exact id. → action=`probe`.
+   Otherwise → continue to node 7.
 
-   ONE layer at a time. Never chain two probes on the same detail in consecutive turns —
-   if the layered answer fully resolves the thread, move on.
-
-7. ANALYST PROBE — PENDING_PROBES is non-empty:
-   - SKIP THIS ENTIRE STEP if step 4 (CLARIFY) applies — vague answers must be
-     clarified first, regardless of probe priority.
-   - Pick the highest-priority probe not already in COVERED_SUBTOPICS.
-   - Priority 1 (urgent) beats scripted. Priority 2 (worthwhile) beats scripted.
-     Priority 3 (nice-to-have) yields to scripted unless nothing scripted is left.
-   - TURNS_AGO ≤ 2: use it directly, rephrase naturally.
-   - TURNS_AGO 3–8: bridge with "Earlier you mentioned X..." if needed.
-   - Set probe_id_used to the probe's exact id.
-   Use action=`probe`.
-
-8. SCRIPTED: No clarify, no verbal exit, no open thread, no priority-1 or
-   priority-2 probe — ask NEXT_SCRIPTED. A small lead-in is fine; don't change the meaning.
-   Use action=`scripted`.
-   SKIP_SCRIPTED EXCEPTION — ALWAYS check whether NEXT_SCRIPTED has already been
-   answered before asking it. Organic coverage means the respondent volunteered
-   the information unprompted in any prior turn.
-   HOW TO CHECK: Read RECENT_TURNS directly — COVERED_SUBTOPICS may lag behind (the
-   analyst processes turns asynchronously). Judge from the actual text in RECENT_TURNS
-   whether the respondent already addressed the core topic of NEXT_SCRIPTED.
-   If covered, set action=`skip_scripted`.
-   EXAMPLES requiring skip_scripted:
-   - NEXT_SCRIPTED "What do you value most?" → respondent said "What I value most is
-     the time savings — it cuts my note-taking in half"
-   - NEXT_SCRIPTED "Would you recommend it?" → respondent said "I've already recommended
-     it to three colleagues"
-   - NEXT_SCRIPTED "Has anything frustrated you?" → respondent said "honestly nothing
-     that bothers me — it just works"
-   Do NOT re-ask what was already answered. Doing so is a significant quality failure.
-
-9. WRAP UP: SCRIPTED_REMAINING is 0 and no important threads remain open.
-   Use action=`wrap_up`.
+NODE 7 — SCRIPTED, OR WRAP UP.
+   RECOMMENDED_NEXT is scripted (or its probe duplicated covered ground). Before asking
+   NEXT_SCRIPTED, check whether it was already answered organically — the respondent
+   volunteered the information unprompted in any prior turn. Read RECENT_TURNS directly;
+   COVERED_SUBTOPICS can lag (the analyst is async). Judge from the actual text.
+   - Already answered organically → action=`skip_scripted` (acknowledge it and move on).
+     e.g. NEXT_SCRIPTED "Would you recommend it?" but they said "I've already recommended
+     it to three colleagues"; or "What do you value most?" answered by "the time savings —
+     it cuts my note-taking in half". Re-asking an answered question is a significant
+     quality failure.
+   - Not yet answered → action=`scripted`. A small lead-in is fine; don't change the meaning.
+   - SCRIPTED_REMAINING is 0 and no thread remains open → action=`wrap_up`.
 
 --- INVESTOR SIGNAL TRIGGERS ---
-These are the highest-value instances of step 6 (LAYERING). When you hear them,
+These are the highest-value instances of node 5 (LAYERING). When you hear them,
 the thread is always open — stay on it before advancing:
 
 REFERRAL / WORD-OF-MOUTH — "a colleague recommended it", "everyone I know uses it",
@@ -438,6 +448,10 @@ RED FLAGS — always probe these; don't move on without understanding them:
 --- END TRIGGERS ---
 
 Hard rules:
+- NO REPETITION (applies at nodes 5, 6, and 7): never ask about a subtopic already
+  addressed in RECENT_TURNS or COVERED_SUBTOPICS, unless the prior answer was incomplete
+  or evasive. A broad topic being covered does not block adjacent subtopics ("competitor
+  product features" covered does not block "competitor pricing structure").
 - One question per utterance. Max one `?`. Never ask two questions in one turn, even as
   "and also..." constructions.
 - Never ask a leading question — never presuppose the answer or push a view.
@@ -469,9 +483,9 @@ Structure (in this order, nothing else):
 
 The JSON object MUST contain only these three keys (no others, no markdown fences):
 - "action": one of scripted, probe, clarify, off_topic, wrap_up, skip_scripted
-- "reasoning": one sentence naming the rule that fired, e.g. "Step 6: priority-1 probe
-  beats scripted." or "Step 4: single-word answer — clarifying before advancing." This
-  field is never spoken; it exists for tracing and debugging only.
+- "reasoning": one sentence naming the node that fired, e.g. "Node 6: RECOMMENDED_NEXT
+  points to probe id=3." or "Node 2: hedge with no substance — clarifying before advancing."
+  This field is never spoken; it exists for tracing and debugging only.
 - "probe_id_used": either a positive integer matching a PENDING_PROBES id, or null
 
 Examples of WRONG output (do not do this):
@@ -485,23 +499,19 @@ Examples of CORRECT output (copy this shape; substitute your own strings):
 
 scripted:
 <utterance>Got it. Walk me through how your team actually uses the product day-to-day.</utterance>
-{"action":"scripted","reasoning":"Step 8: no clarify/verbal-exit/probe firing, advancing to next scripted question.","probe_id_used":null}
+{"action":"scripted","reasoning":"Node 7: no earlier node fired, advancing to next scripted question.","probe_id_used":null}
 
 clarify (thinking filler):
 <utterance>Take your time.</utterance>
-{"action":"clarify","reasoning":"Step 1: pure thinking filler, no substantive content to act on.","probe_id_used":null}
+{"action":"clarify","reasoning":"Node 1: pure thinking filler, no substantive content to act on.","probe_id_used":null}
 
-clarify (silence after Take your time.):
+clarify (thinking filler repeated — previous turn was already "Take your time."):
 <utterance>Still there?</utterance>
-{"action":"clarify","reasoning":"Step 1: still silent after Take your time. — escalating to Still there?","probe_id_used":null}
-
-wrap_up (SILENCE_HANDLER_COUNT = 3 — fourth consecutive silence):
-<utterance>It sounds like now might not be a great time — thanks so much for your time today. I'll let you go.</utterance>
-{"action":"wrap_up","reasoning":"Step 1: SILENCE_HANDLER_COUNT is 3 — wrapping up after fourth consecutive silence.","probe_id_used":null}
+{"action":"clarify","reasoning":"Node 1: respondent still stalling after Take your time. — escalating to Still there?","probe_id_used":null}
 
 skip_scripted:
 <utterance>Interesting. You mentioned earlier you've already recommended it to colleagues — what made you confident enough to do that?</utterance>
-{"action":"skip_scripted","reasoning":"Step 8 exception: NEXT_SCRIPTED topic already covered organically in RECENT_TURNS.","probe_id_used":null}
+{"action":"skip_scripted","reasoning":"Node 7: NEXT_SCRIPTED topic already covered organically in RECENT_TURNS.","probe_id_used":null}
 """
 
 
@@ -634,9 +644,12 @@ async def run_interviewer(
             respondent_text=respondent_text,
             vapi_messages=vapi_messages or _db_messages_fallback(session, deps.call_id),
         )
+    sc = _silence_short_circuit(prepared)
+    if sc is not None:
+        return sc
     result = await _get_interviewer().run(prepared.prompt_parts, deps=deps)
     output = _parse_streamed_output(result.output, prepared.fallback_scripted_question)
-    return _apply_silence_override(output, prepared)
+    return _apply_overrides(output, prepared, prepared.respondent_text)
 
 
 def _db_messages_fallback(session, call_id: str) -> list[dict]:
@@ -652,40 +665,154 @@ def _db_messages_fallback(session, call_id: str) -> list[dict]:
     return messages
 
 
-_WRAP_UP_UTTERANCE = "It sounds like now might not be a great time — thanks so much for your time today. I'll let you go."
-
-
-def _apply_silence_override(
-    output: "InterviewerOutput",
-    prepared: PreparedInterviewerTurn,
-) -> "InterviewerOutput":
-    """Force wrap_up after 3 re-engagement attempts (consecutive_clarify_count >= 3) on silence.
-
-    The model is instructed to do this via the COUNTING RULE in the prompt, but
-    small models (gpt-4.1-mini, Cerebras) don't apply it reliably. This Python-level
-    guard makes the behaviour deterministic regardless of model compliance.
-    Fires when: current turn is silence AND we already attempted re-engagement 3+ times
-    (meaning this is the 4th consecutive silence).
-    """
-    if prepared.is_silence and prepared.consecutive_clarify_count >= 3 and output.action != "wrap_up":
-        logfire.info(
-            "silence_override_wrap_up",
-            consecutive_clarify_count=prepared.consecutive_clarify_count,
-            model_action=output.action,
-        )
-        return InterviewerOutput(
-            utterance=_WRAP_UP_UTTERANCE,
-            action="wrap_up",
-            reasoning=f"Python override: consecutive_clarify_count={prepared.consecutive_clarify_count} ≥ 3 on silence — 4th consecutive silence, forcing wrap_up",
-            probe_id_used=None,
-        )
-    return output
-
-
 _OPEN_TAG = "<utterance>"
 _CLOSE_TAG = "</utterance>"
 _META_RE = re.compile(r"</utterance>\s*(\{.*)", re.DOTALL)
 _META_BARE_RE = re.compile(r"\n(\{.*)", re.DOTALL)  # tag-free fallback: JSON after first \n{
+
+_WRAP_UP_UTTERANCE = "It sounds like now might not be a great time — thanks so much for your time today. I'll let you go."
+
+# Deterministic re-engagement ladder for empty/[silence] turns, indexed by how many
+# consecutive re-engagement attempts (clarify turns) have already been made.
+# Index 2 must contain "still there" so the turn immediately before a silence wrap_up
+# is a "Still there?" — the trajectory eval keys its wrap-after-silence detection off that.
+_SILENCE_LADDER = ("Take your time.", "Still there?", "Still there?")
+
+
+def _silence_short_circuit(prepared: PreparedInterviewerTurn) -> InterviewerOutput | None:
+    """Resolve empty/[silence] turns deterministically, without an LLM call.
+
+    Truly blank input carries nothing the model can act on, so the re-engagement
+    ladder and the wrap-up after repeated silence are owned by Python: instant,
+    free, and 100% reliable on the highest-frequency degenerate turn. Thinking
+    fillers ("um", "uh") are NOT is_silence and still go to the model.
+
+    Returns None for any non-silence turn (the normal LLM path).
+    """
+    if not prepared.is_silence:
+        return None
+    n = prepared.consecutive_clarify_count
+    if n >= len(_SILENCE_LADDER):
+        return InterviewerOutput(
+            utterance=_WRAP_UP_UTTERANCE,
+            action="wrap_up",
+            reasoning=f"Python silence handler: consecutive_clarify_count={n} — wrapping up after repeated silence",
+            probe_id_used=None,
+        )
+    return InterviewerOutput(
+        utterance=_SILENCE_LADDER[n],
+        action="clarify",
+        reasoning=f"Python silence handler: empty/[silence] input, re-engagement attempt {n + 1} of {len(_SILENCE_LADDER)}",
+        probe_id_used=None,
+    )
+
+
+# Verbal-exit phrases that override the model's action to wrap_up (step 5 of the decision framework).
+# These are explicit verbal signals, not vague non-answers — keep this list tight.
+_VERBAL_EXIT_RE = re.compile(
+    r"\b("
+    r"i (need|have) to go|"
+    r"thanks[,.]? ?bye"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Single-word or near-single-word vague answers that are always clarify triggers (step 4).
+# Matches the *complete* stripped utterance — not a substring check.
+# Each alternative is a concrete phrase so the pattern cannot match the empty string.
+_VAGUE_ANSWER_RE = re.compile(
+    r"^("
+    r"mixed|fine|maybe|sure|kind of|not really|i guess|i guess so|"
+    r"sort of|i don'?t know|i dunno|hard to say|"
+    r"i mean[,.]?|i mean[,.]? i guess|"
+    r"it'?s? fine|it'?s? fine[,.]? i guess|it'?s? fine[,.]? kind of|"
+    r"i guess[,.]? kind of|kind of[,.]? i don'?t know|i guess so[,.]? kind of"
+    r")\.?$",
+    re.IGNORECASE,
+)
+
+
+def _apply_overrides(
+    output: InterviewerOutput,
+    prepared: PreparedInterviewerTurn,
+    respondent_text: str,
+) -> InterviewerOutput:
+    """Apply deterministic post-processing guards over the LLM's action choice.
+
+    The prompt instructs the model on both rules below, but small fallback models
+    (Groq, Cerebras) miss them under pressure. Python guards make the highest-stakes
+    rules hard invariants regardless of model compliance.
+
+    Empty/[silence] turns never reach here — `_silence_short_circuit` resolves the
+    re-engagement ladder and silence wrap-up before the model is ever called.
+
+    Guards run in priority order — first match wins:
+      1. Verbal exit   — wrap_up on explicit "I'm done / I need to go" signals.
+      2. Vague clarify — clarify on single-word / hedge-only answers when model probed or advanced.
+    """
+    # Guard 1: verbal exit — respondent explicitly signals they are done
+    if _VERBAL_EXIT_RE.search(respondent_text) and output.action != "wrap_up":
+        logfire.info("override_verbal_exit", model_action=output.action, respondent_snippet=respondent_text[:80])
+        return InterviewerOutput(
+            utterance="Thanks so much for your time — that's really helpful. I'll let you go.",
+            action="wrap_up",
+            reasoning="Python override: respondent verbal exit detected — forcing wrap_up",
+            probe_id_used=None,
+        )
+
+    # Guard 2: vague-answer clarify gate — model probed or advanced from an answer that needs clarifying first
+    if (
+        _VAGUE_ANSWER_RE.match(respondent_text.strip())
+        and output.action in ("probe", "scripted", "skip_scripted", "off_topic")
+    ):
+        logfire.info("override_vague_clarify", model_action=output.action, respondent_snippet=respondent_text[:80])
+        return InterviewerOutput(
+            utterance="What do you mean by that?",
+            action="clarify",
+            reasoning="Python override: vague single-word/hedge answer — must clarify before probing or advancing",
+            probe_id_used=None,
+        )
+
+    return output
+
+
+def _extract_parts(text: str) -> tuple[str, str, bool]:
+    """Split raw model output into (utterance, meta_json, wire_delimited).
+
+    Three formats, tried in order:
+      1. Tagged:   <utterance>…</utterance>  then JSON
+      2. Bare:     plain text, then \\n{ JSON
+      3. Fallback: entire text is the utterance, no metadata
+    Returns wire_delimited=True for formats 1 and 2.
+    """
+    # Format 1: explicit tags
+    tag_m = re.search(r"<utterance>(.*?)</utterance>", text, re.DOTALL)
+    if tag_m:
+        utterance = tag_m.group(1).strip()
+        meta_m = _META_RE.search(text)
+        meta_json = meta_m.group(1).strip() if meta_m else ""
+        return utterance, meta_json, True
+
+    # Format 2: tag-free — utterance before \n{
+    bare_m = _META_BARE_RE.search(text)
+    if bare_m:
+        utterance = text[:bare_m.start()].strip()
+        meta_json = bare_m.group(1).strip()
+        return utterance, meta_json, True
+
+    # Format 3: no delimiter at all
+    return text.strip(), "", False
+
+
+def _parse_meta(meta_json: str) -> InterviewerLLMMeta:
+    """Parse the JSON metadata block into InterviewerLLMMeta.
+
+    Returns default (action=scripted) on any parse failure.
+    """
+    raw = json.loads(meta_json) if meta_json.strip() else {}
+    if not isinstance(raw, dict):
+        raise ValueError("metadata JSON must be an object")
+    return InterviewerLLMMeta.model_validate(raw)
 
 
 def _parse_streamed_output(
@@ -693,93 +820,63 @@ def _parse_streamed_output(
     fallback_scripted_question: str | None = None,  # noqa: ARG001
     has_pending_probes: bool = False,
 ) -> InterviewerOutput:
-    """Parse <utterance>...</utterance> + trailing JSON from a plain-text model response.
+    """Parse <utterance>...</utterance> + trailing JSON from a plain-text model response."""
+    utterance, meta_json, wire_delimited = _extract_parts(text)
 
-    Falls back to bare format (utterance text then newline + JSON) when tags are absent.
-    """
-    tag_m = re.search(r"<utterance>(.*?)</utterance>", text, re.DOTALL)
-    wire_delimited = False
-    if tag_m:
-        utterance = tag_m.group(1).strip()
-        meta_m = _META_RE.search(text)
-        meta_json = meta_m.group(1).strip() if meta_m else ""
-        wire_delimited = True
-    else:
-        bare_m = _META_BARE_RE.search(text)
-        if bare_m:
-            utterance = text[:bare_m.start()].strip()
-            meta_json = bare_m.group(1).strip()
-            wire_delimited = True
-        else:
-            utterance = text.strip()
-            meta_json = ""
+    # Guard: whole-body JSON with no spoken utterance — never send to TTS.
+    if not wire_delimited and utterance.startswith("{") and '"action"' in utterance:
+        try:
+            blob = json.loads(utterance)
+            if isinstance(blob, dict) and "action" in blob:
+                logfire.warning("interviewer_json_only_body", text_snippet=utterance[:200])
+                return InterviewerOutput(
+                    utterance=INTERVIEWER_RECOVERY_UTTERANCE,
+                    action="scripted",
+                    reasoning="model returned JSON without a spoken utterance block",
+                    probe_id_used=None,
+                )
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-    # Whole-body JSON (no tags and no bare newline-before-{ split) — never send to TTS as speech.
-    if not wire_delimited:
-        u = utterance.strip()
-        if u.startswith("{") and '"action"' in u:
-            try:
-                blob = json.loads(u)
-                if isinstance(blob, dict) and "action" in blob:
-                    logfire.warning(
-                        "interviewer_json_only_body",
-                        text_snippet=u[:200],
-                    )
-                    return InterviewerOutput(
-                        utterance=INTERVIEWER_RECOVERY_UTTERANCE,
-                        action="scripted",
-                        reasoning="model returned JSON without a spoken utterance block",
-                        probe_id_used=None,
-                    )
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    try:
-        raw = json.loads(meta_json) if meta_json.strip() else {}
-        if not isinstance(raw, dict):
-            raise ValueError("metadata JSON must be an object")
-        meta = InterviewerLLMMeta.model_validate(raw)
-        if meta.action == "probe":
-            probe_source = "analyst" if meta.probe_id_used is not None else "interviewer"
-        else:
-            probe_source = None
-        spoken = utterance.strip()
-        if not spoken:
-            logfire.warning("interviewer_empty_utterance", wire_delimited=wire_delimited)
-            return InterviewerOutput(
-                utterance=INTERVIEWER_RECOVERY_UTTERANCE,
-                action="scripted",
-                reasoning="empty utterance from model",
-                probe_id_used=None,
-                probe_source=None,
-            )
+    # Guard: empty utterance — nothing safe to send to TTS.
+    spoken = utterance.strip()
+    if not spoken:
+        logfire.warning("interviewer_empty_utterance", wire_delimited=wire_delimited)
         return InterviewerOutput(
-            utterance=spoken,
-            action=meta.action,
-            reasoning=meta.reasoning,
-            probe_id_used=meta.probe_id_used,
-            probe_source=probe_source,
+            utterance=INTERVIEWER_RECOVERY_UTTERANCE,
+            action="scripted",
+            reasoning="empty utterance from model",
+            probe_id_used=None,
+            probe_source=None,
         )
+
+    # Parse metadata; fall back to default action on failure.
+    try:
+        meta = _parse_meta(meta_json)
     except (json.JSONDecodeError, ValueError, ValidationError) as exc:
         logfire.warning(
             "interviewer_metadata_parse_failed",
             text_snippet=text[:300],
             error_type=type(exc).__name__,
         )
-        spoken = (utterance or "").strip()
-        if spoken:
-            return InterviewerOutput(
-                utterance=spoken,
-                action="scripted",
-                reasoning="metadata parse failed",
-                probe_id_used=None,
-            )
         return InterviewerOutput(
-            utterance=INTERVIEWER_RECOVERY_UTTERANCE,
+            utterance=spoken,
             action="scripted",
             reasoning="metadata parse failed",
             probe_id_used=None,
         )
+
+    probe_source = None
+    if meta.action == "probe":
+        probe_source = "analyst" if meta.probe_id_used is not None else "interviewer"
+
+    return InterviewerOutput(
+        utterance=spoken,
+        action=meta.action,
+        reasoning=meta.reasoning,
+        probe_id_used=meta.probe_id_used,
+        probe_source=probe_source,
+    )
 
 
 class InterviewerStream:
@@ -827,6 +924,22 @@ class InterviewerStream:
         _stream_error: Exception | None = None
         full_text = ""
         any_yielded = False
+
+        # Empty/[silence] turns are resolved deterministically without a model call:
+        # instant first token (no filler needed), zero cost, 100% reliable escalation.
+        sc = _silence_short_circuit(prepared)
+        if sc is not None:
+            self._output = sc
+            self._usage = None
+            logfire.info(
+                "interviewer_silence_short_circuit",
+                call_id=deps.call_id,
+                turn_number=deps.turn_number,
+                action=sc.action,
+                consecutive_clarify_count=prepared.consecutive_clarify_count,
+            )
+            yield sc.utterance
+            return
 
         with anyio.move_on_after(self._budget_s) as cancel_scope:
             try:
@@ -899,9 +1012,10 @@ class InterviewerStream:
                                     any_yielded = True
                                     carry = carry[safe_end:]
 
-                    self._output = _apply_silence_override(
+                    self._output = _apply_overrides(
                         _parse_streamed_output(full_text, prepared.fallback_scripted_question),
                         prepared,
+                        prepared.respondent_text,
                     )
                     self._usage = streamed.usage()
                     # Safety: if the model skipped both tag and bare formats entirely, yield the

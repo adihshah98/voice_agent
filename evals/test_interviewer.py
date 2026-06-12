@@ -129,6 +129,7 @@ async def run_interviewer_on_case(
         utterance=result["message"],
         action=result["action"],
         reasoning=result["reasoning"],
+        probe_source=result["probe_source"],
     )
 
 

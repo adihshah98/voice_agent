@@ -172,4 +172,5 @@ def test_parse_streamed_output_metadata_fail_empty_body_uses_recovery() -> None:
     raw = "<utterance></utterance>\n{not valid json"
     out = interviewer_module._parse_streamed_output(raw, None)
     assert out.utterance == INTERVIEWER_RECOVERY_UTTERANCE
-    assert "metadata parse failed" in out.reasoning
+    # Empty utterance guard fires before metadata parse — both result in recovery utterance.
+    assert out.reasoning in ("empty utterance from model", "metadata parse failed")
