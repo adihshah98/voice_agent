@@ -206,9 +206,9 @@ async def run_replay(inputs: ReplayInputs) -> ReplayResult:
         # No wrap_up fired — not a violation of this specific check
         wrap_up_after_all_scripted = True
 
-    # Loop guard: detect more than 3 consecutive silence-handler turns.
-    # Up to 3 re-engagement attempts are allowed (4th silence triggers wrap_up).
-    # A run of 4+ consecutive clarify utterances means the loop guard failed.
+    # Loop guard: detect runaway re-engagement. The model may re-prompt a stalling
+    # respondent ("Take your time." → "Still there?"), but a run of 4+ consecutive
+    # clarify utterances means it's stuck re-engaging instead of advancing.
     actions = [t["action"] for t in turn_results]
     max_consec = 0
     cur = 0
@@ -273,7 +273,7 @@ class WrapUpOnlyAfterAllScripted(Evaluator[ReplayInputs, ReplayResult, None]):
     correct behaviour — DisengagementWrapsUp covers that case instead.
     """
 
-    _EXEMPT = {"disengaged_early_exit", "extended_silence_wrap_up"}
+    _EXEMPT = {"disengaged_early_exit"}
 
     def evaluate(
         self,
@@ -286,11 +286,11 @@ class WrapUpOnlyAfterAllScripted(Evaluator[ReplayInputs, ReplayResult, None]):
 
 @dataclass
 class NoStillThereLoop(Evaluator[ReplayInputs, ReplayResult, None]):
-    """Interviewer must not re-engage more than 3 times consecutively without wrapping up.
+    """Interviewer must not re-engage more than 3 times consecutively.
 
-    Up to 3 consecutive clarify turns are allowed (silence 1→clarify, silence 2→clarify,
-    silence 3→clarify, silence 4→wrap_up). A run of 4+ consecutive clarifies means the
-    Python override failed to fire.
+    Re-prompting a stalling respondent ("Take your time." → "Still there?") is fine,
+    but a run of 4+ consecutive clarify turns means the interviewer is stuck
+    re-engaging instead of advancing or wrapping up.
     """
 
     def evaluate(
@@ -326,24 +326,6 @@ class BridgingPhrasePresent(Evaluator[ReplayInputs, ReplayResult, None]):
             any(phrase in u.lower() for phrase in self._BRIDGE_PHRASES)
             for u in ctx.output.probe_utterances
         )
-
-
-@dataclass
-class WrapUpAfterFourthSilence(Evaluator[ReplayInputs, ReplayResult, None]):
-    """For the extended_silence_wrap_up transcript: wrap_up must fire by turn 5
-    (index 4 — the fourth consecutive silence turn).
-
-    Returns True (N/A pass) for all other transcripts.
-    """
-
-    def evaluate(
-        self,
-        ctx: EvaluatorContext[ReplayInputs, ReplayResult, None],
-    ) -> bool:
-        if ctx.inputs.transcript.name != "extended_silence_wrap_up":
-            return True
-        idx = ctx.output.wrap_up_turn_index
-        return idx is not None and idx <= 4
 
 
 @dataclass
@@ -393,7 +375,6 @@ def _build_dataset() -> Dataset[ReplayInputs, ReplayResult, None]:
             WrapUpOnlyAfterAllScripted(),
             NoStillThereLoop(),
             BridgingPhrasePresent(),
-            WrapUpAfterFourthSilence(),
             DisengagementWrapsUp(),
         ),
     )
@@ -452,9 +433,6 @@ async def test_replay_transcripts():
     assert scores.get("BridgingPhrasePresent", 1.0) >= 1.0, (
         "stale_probe_bridging: interviewer did not bridge back with 'Earlier you mentioned…'"
     )
-    assert scores.get("WrapUpAfterFourthSilence", 1.0) >= 1.0, (
-        "extended_silence_wrap_up: wrap_up did not fire after 4 consecutive silence turns"
-    )
     assert scores.get("DisengagementWrapsUp", 1.0) >= 1.0, (
         "disengaged_early_exit: interviewer kept asking scripted questions despite disengagement"
     )
@@ -466,7 +444,7 @@ async def test_replay_transcripts():
 
 
 def _print_results(report) -> None:
-    header = f"{'transcript':<30} {'AV':>4} {'SC':>4} {'WU':>4} {'SL':>4} {'BP':>4} {'4S':>4} {'DE':>4}  turn actions"
+    header = f"{'transcript':<30} {'AV':>4} {'SC':>4} {'WU':>4} {'SL':>4} {'BP':>4} {'DE':>4}  turn actions"
     print(f"\nReplay eval results:\n{header}\n{'-' * len(header)}")
 
     def _b(src, key) -> str:
@@ -481,10 +459,9 @@ def _print_results(report) -> None:
         wu = _b(case.assertions, "WrapUpOnlyAfterAllScripted")
         sl = _b(case.assertions, "NoStillThereLoop")
         bp = _b(case.assertions, "BridgingPhrasePresent")
-        ss = _b(case.assertions, "WrapUpAfterFourthSilence")
         de = _b(case.assertions, "DisengagementWrapsUp")
         actions = ", ".join(t["action"] for t in (case.output.turn_results if case.output else []))
-        print(f"{(case.name or ''):<30} {av} {sc} {wu} {sl} {bp} {ss} {de}  {actions[:60]}")
+        print(f"{(case.name or ''):<30} {av} {sc} {wu} {sl} {bp} {de}  {actions[:60]}")
 
         if case.output:
             fails = [t for t in case.output.turn_results if not t["pass"]]

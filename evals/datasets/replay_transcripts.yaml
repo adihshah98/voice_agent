@@ -257,42 +257,6 @@ transcripts:
         generated_after_turn: 1
 
   # -------------------------------------------------------------------------
-  # extended_silence_wrap_up: full 4x silence chain.
-  # silence → clarify → silence → clarify → silence → clarify → silence → wrap_up.
-  # Tests that the counting rule fires correctly after 4 consecutive silences.
-  # -------------------------------------------------------------------------
-  - name: extended_silence_wrap_up
-    scripted_questions:
-      - "How do you currently use this product?"
-      - "What do you value most about it?"
-      - "Has anything frustrated you recently?"
-    turns:
-      # Turn 1: substantive opener — interviewer asks scripted Q2
-      - speaker: respondent
-        text: "We use it for customer calls, about fifteen a week across the team."
-        expected_actions: [scripted, probe]
-
-      # Turn 2: first silence — must respond with re-engagement (clarify)
-      - speaker: respondent
-        text: "[silence]"
-        expected_actions: [clarify]
-
-      # Turn 3: second silence — SILENCE_HANDLER_COUNT is 1; re-engage again (clarify)
-      - speaker: respondent
-        text: "[silence]"
-        expected_actions: [clarify]
-
-      # Turn 4: third silence — SILENCE_HANDLER_COUNT is 2; re-engage again (clarify)
-      - speaker: respondent
-        text: "[silence]"
-        expected_actions: [clarify]
-
-      # Turn 5: fourth silence — SILENCE_HANDLER_COUNT is 3; must wrap_up now
-      - speaker: respondent
-        text: "[silence]"
-        expected_actions: [wrap_up]
-
-  # -------------------------------------------------------------------------
   # multi_skip_scripted: respondent's first answer covers Q1, Q2, and Q3
   # simultaneously. Interviewer must fire skip_scripted twice consecutively
   # before landing on the first genuinely uncovered scripted question.

@@ -20,7 +20,7 @@ Current state: 35 Tier 1 cases, 14 Tier 2 cases, 6 replay transcripts, 3 simulat
 | `WrapUpOnlyAfterAllScripted` — no premature exit | Replay — evaluator on all 6 transcripts |
 | Analyst catches contradiction + interviewer probes it | Simulation — `contradictory` persona |
 | Off-topic redirect | Simulation — `off_topic_rambler` persona |
-| Extended silence → wrap_up after 3× "Still there?" | Simulation — `silent_respondent` persona |
+| Extended dead-air → re-prompt then end call | **Vapi `customer.speech.timeout` hooks** (not eval-tested; server-side config) |
 | Probe specificity and stale-probe bridging | Simulation — `ProbesAreSpecific`, `StaleProbesBridged` |
 
 ---
@@ -43,29 +43,20 @@ Current state: 35 Tier 1 cases, 14 Tier 2 cases, 6 replay transcripts, 3 simulat
 
 ---
 
-### 2. Silence handling — full 3× sequence
+### 2. Silence handling — now owned by Vapi (SUPERSEDED)
 
-**What the prompt says:** silence → "Still there?" → silence → "Still there?" → silence → `wrap_up`.
+**Status:** True dead-air (the user says nothing) is no longer handled in Python or
+tested in evals. It is owned by Vapi `customer.speech.timeout` assistant hooks set in
+`server._dial_vapi` (`_build_speech_timeout_hooks`): re-prompt "Take your time." at
+`VAPI_SILENCE_TIMEOUT_SECONDS`, "Still there?" at 2x, and `endCall` at 3x. This is
+server-side config and runs on Vapi's side, so it can't be unit-tested from pytest. The
+old `silent_respondent` persona, `extended_silence_wrap_up` replay transcript,
+`HandledSilenceGracefully` and `WrapUpAfterFourthSilence` evaluators were removed.
 
-**What's tested:** `NoStillThereLoop` (in replay) catches *consecutive* "Still there?" turns. `HandledSilenceGracefully` (in simulation) checks that at least one "Still there?" and one "Take your time." appeared and that `wrap_up` eventually fired.
-
-**Gap:** No replay transcript walks through the full 3-silence chain to assert `wrap_up` fires at exactly the right point. The simulation test covers this but non-deterministically.
-
-**Fix — new replay transcript: `extended_silence_wrap_up`**
-```yaml
-turns:
-  - text: "We use it for customer calls."   # substantive turn
-    expected_actions: [scripted, probe]
-  - text: "[silence]"                        # → "Still there?"
-    expected_actions: [clarify]
-  - text: "[silence]"                        # → "Still there?" again (count=2)
-    expected_actions: [clarify]
-  - text: "[silence]"                        # → wrap_up (count=3)
-    expected_actions: [wrap_up]
-```
-Add evaluator `WrapUpAfterThirdSilence` — checks `wrap_up` fires by turn 4 of this transcript.
-
-Also add a case for the `um` → "Take your time." → silence → "Still there?" chain (not "Take your time." twice in a row).
+**What remains in evals:** thinking fillers ("um", "let me think") are real transcribed
+speech handled by the interviewer model (NODE 1 → "Take your time." / "Still there?"),
+still exercised by `non_happy_path_silence_vague` (single re-prompt → clarify) and guarded
+against runaway by `NoStillThereLoop` (no 4+ consecutive clarify turns).
 
 ---
 

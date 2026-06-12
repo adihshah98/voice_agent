@@ -143,21 +143,6 @@ def _end_of_call_report_body(call_id: str, vapi_call_id: str, ended_reason: str 
     }
 
 
-def _speech_update_body(call_id: str, vapi_call_id: str, role: str, status: str) -> dict:
-    return {
-        "message": {
-            "type": "speech-update",
-            "status": status,
-            "role": role,
-            "turn": 1,
-            "call": {
-                "id": vapi_call_id,
-                "assistant": {"metadata": {"call_id": call_id}},
-            },
-        }
-    }
-
-
 @pytest.mark.asyncio
 async def test_status_update_in_progress_is_idempotent(mocker: pytest_mock.MockerFixture) -> None:
     eng = state.make_engine("sqlite:///:memory:")
@@ -259,76 +244,6 @@ async def test_delete_call_twice_second_is_already_ended(mocker: pytest_mock.Moc
         r2 = await client.delete("/calls/c-del-dup", headers=headers)
         assert r2.status_code == 200
         assert r2.json()["status"] == "already_ended"
-
-
-@pytest.mark.asyncio
-async def test_extended_silence_marks_call_ended(mocker: pytest_mock.MockerFixture) -> None:
-    eng = state.make_engine("sqlite:///:memory:")
-    state.init_db(eng)
-    mocker.patch.object(server, "engine", eng)
-    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
-    mocker.patch.object(server.settings, "vapi_extended_silence_seconds", 0.05)
-    mocker.patch.object(server.settings, "vapi_api_key", "")
-
-    with state.session_scope(eng) as session:
-        session.add(
-            state.Call(
-                id="c-silence",
-                vapi_call_id="vapi-s1",
-                scripted_questions=[],
-                status="active",
-            )
-        )
-
-    transport = httpx.ASGITransport(app=server.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        r = await client.post(
-            "/vapi/webhook", json=_speech_update_body("c-silence", "vapi-s1", "assistant", "stopped")
-        )
-    assert r.status_code == 200
-    await asyncio.sleep(0.12)
-
-    with state.session_scope(eng) as session:
-        c = session.get(state.Call, "c-silence")
-        assert c is not None
-        assert c.status == "ended"
-        assert c.end_reason == "extended_silence"
-
-
-@pytest.mark.asyncio
-async def test_extended_silence_cancelled_when_user_speaks(mocker: pytest_mock.MockerFixture) -> None:
-    eng = state.make_engine("sqlite:///:memory:")
-    state.init_db(eng)
-    mocker.patch.object(server, "engine", eng)
-    mocker.patch.object(server.settings, "vapi_webhook_secret", "")
-    mocker.patch.object(server.settings, "vapi_extended_silence_seconds", 0.2)
-    mocker.patch.object(server.settings, "vapi_api_key", "")
-
-    with state.session_scope(eng) as session:
-        session.add(
-            state.Call(
-                id="c-quiet",
-                vapi_call_id="vapi-s2",
-                scripted_questions=[],
-                status="active",
-            )
-        )
-
-    transport = httpx.ASGITransport(app=server.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post(
-            "/vapi/webhook", json=_speech_update_body("c-quiet", "vapi-s2", "assistant", "stopped")
-        )
-        await asyncio.sleep(0.05)
-        await client.post(
-            "/vapi/webhook", json=_speech_update_body("c-quiet", "vapi-s2", "user", "started")
-        )
-        await asyncio.sleep(0.25)
-
-    with state.session_scope(eng) as session:
-        c = session.get(state.Call, "c-quiet")
-        assert c is not None
-        assert c.status == "active"
 
 
 @pytest.mark.asyncio

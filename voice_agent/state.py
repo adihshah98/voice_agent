@@ -395,25 +395,6 @@ def call_summary_stats(session: Session, call_id: str) -> dict:
     }
 
 
-def consecutive_clarify_count(session: Session, call_id: str) -> int:
-    """Count trailing consecutive interviewer turns with action='clarify'.
-
-    Used to populate SILENCE_HANDLER_COUNT in the interviewer prompt so the
-    model knows how many re-engagement attempts have already been made without
-    scanning utterance text (which is fragile when fillers are prepended).
-    """
-    recent = recent_turns(session, call_id, n=20)
-    count = 0
-    for turn in reversed(recent):
-        if turn.speaker != "interviewer":
-            continue
-        if turn.action == "clarify":
-            count += 1
-        else:
-            break
-    return count
-
-
 def recent_turns(session: Session, call_id: str, n: int = 6) -> list[Turn]:
     stmt = (
         select(Turn)

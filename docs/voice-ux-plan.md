@@ -191,11 +191,23 @@ Deepgram nova-3 is faster and more accurate on phone audio (compressed codec, ba
 
 ### 1d. Dead air handling
 
-If the respondent goes silent mid-call (> 10s), Vapi can send a nudge automatically. Add to assistant payload:
+If the respondent goes silent mid-call, Vapi re-engages automatically via
+`customer.speech.timeout` assistant hooks (implemented in `server._build_speech_timeout_hooks`,
+base interval = `VAPI_SILENCE_TIMEOUT_SECONDS`):
 
 ```json
-"silenceTimeoutSeconds": 10,
-"silenceTimeoutMessage": "Still there?"
+"hooks": [
+  {"on": "customer.speech.timeout",
+   "options": {"timeoutSeconds": 10, "triggerMaxCount": 3, "triggerResetMode": "onUserSpeech"},
+   "do": [{"type": "say", "exact": "Take your time."}]},
+  {"on": "customer.speech.timeout",
+   "options": {"timeoutSeconds": 20, "triggerMaxCount": 3, "triggerResetMode": "onUserSpeech"},
+   "do": [{"type": "say", "exact": "Still there?"}]},
+  {"on": "customer.speech.timeout",
+   "options": {"timeoutSeconds": 30, "triggerMaxCount": 1, "triggerResetMode": "onUserSpeech"},
+   "do": [{"type": "say", "exact": "…thanks so much for your time today. I'll let you go."},
+          {"type": "tool", "tool": {"type": "endCall"}}]}
+]
 ```
 
 ### 1e. Config consolidation in server.py

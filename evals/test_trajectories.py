@@ -1,13 +1,13 @@
-"""Tier 3 — focused simulation for 6 persona-specific behaviors.
+"""Tier 3 — focused simulation for 5 persona-specific behaviors.
 
 Only personas that require live simulation (emergent multi-agent behavior)
 are tested here. The other 4 personas (power_user, skeptical_buyer,
 ai_skeptic, churn_risk) run as deterministic replay evals in test_replay.py.
+True dead-air silence is handled by Vapi `customer.speech.timeout` hooks
+(see server._build_speech_timeout_hooks), so it is not simulated here.
 
     contradictory        — analyst must detect contradiction + probe it
     off_topic_rambler    — interviewer must fire off_topic redirect
-    silent_respondent    — interviewer must handle silence gracefully and
-                           end the call after 3 consecutive "Still there?"s
     context_compression  — analyst accumulates all covered subtopics
     context_drift        — interviewer doesn't re-ask facts stated in turn 1
     cooperative_respondent — call should reach wrap_up naturally
@@ -22,9 +22,6 @@ Evaluators:
                             contradiction AND a priority-1 probe was asked
     RedirectedOffTopic      deterministic — off_topic_rambler: off_topic action
                             fired at least once
-    HandledSilenceGracefully deterministic — silent_respondent: said "Still
-                            there?", said "Take your time.", ended call after
-                            repeated silence
     ProbesAreSpecific       LLM judge — probes reference specific details
     StaleProbesBridged      LLM judge — old probes bridged back to prior context
     CoveredSubtopicsAccumulate LLM judge — analyst tracked expected topics
@@ -107,10 +104,6 @@ class TrajectoryResult(BaseModel):
     turn_actions: list[str]
     # Probe turns for quality evaluation
     probe_turns: list[ProbeTurn] = []
-    # Silence handling tracking
-    still_there_utterances: list[int] = []    # turn indices where "Still there?" was said
-    take_your_time_utterances: list[int] = []  # turn indices where "Take your time." was said
-    wrapped_up_after_silence: bool = False     # True if wrap_up fired after repeated silence
     # context_compression: covered_subtopics accumulated by analyst across the call
     final_covered_subtopics: list[str] = []
     # context_drift: all interviewer utterances for drift checking
@@ -268,9 +261,6 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
     contradiction_probe_asked = False
     completed = False
     probe_turns: list[ProbeTurn] = []
-    still_there_utterances: list[int] = []
-    take_your_time_utterances: list[int] = []
-    wrapped_up_after_silence = False
     interviewer_utterances: list[str] = []
     wrap_up_turn_index: int | None = None
 
@@ -317,12 +307,6 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
         if out["action"] == "off_topic":
             off_topic_redirects_at.append(db_turn_number - 1)
 
-        msg_lower = out["message"].lower()
-        if "still there" in msg_lower:
-            still_there_utterances.append(turn_idx)
-        if "take your time" in msg_lower:
-            take_your_time_utterances.append(turn_idx)
-
         # Track contradiction probe: probe asked on a turn where analyst had already flagged one
         if out["action"] == "probe" and analyst_found_contradiction:
             contradiction_probe_asked = True
@@ -364,9 +348,6 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
         if out["action"] == "wrap_up":
             completed = True
             wrap_up_turn_index = turn_idx
-            # Detect wrap_up triggered by silence (preceded by a "Still there?" clarify)
-            if still_there_utterances and turn_idx > 0 and (turn_idx - 1) in still_there_utterances:
-                wrapped_up_after_silence = True
             break
 
     # Scripted coverage + final analyst snapshot
@@ -387,9 +368,6 @@ async def run_trajectory(inputs: TrajectoryInputs) -> TrajectoryResult:
         contradiction_probe_asked=contradiction_probe_asked,
         turn_actions=turn_actions,
         probe_turns=probe_turns,
-        still_there_utterances=still_there_utterances,
-        take_your_time_utterances=take_your_time_utterances,
-        wrapped_up_after_silence=wrapped_up_after_silence,
         final_covered_subtopics=final_covered_subtopics,
         interviewer_utterances=interviewer_utterances,
         wrap_up_turn_index=wrap_up_turn_index,
@@ -443,31 +421,6 @@ class RedirectedOffTopic(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
         if ctx.inputs.persona_name != "off_topic_rambler":
             return True
         return len(ctx.output.off_topic_redirects_at) > 0
-
-
-@dataclass
-class HandledSilenceGracefully(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
-    """For the silent_respondent persona: interviewer must:
-      1. Respond to silence with "Still there?" (at least once).
-      2. Respond to a thinking filler with "Take your time." (at least once).
-      3. End the call (wrap_up) after repeated silence, not just keep asking questions.
-
-    Returns True (N/A pass) for other personas.
-    """
-
-    def evaluate(
-        self,
-        ctx: EvaluatorContext[TrajectoryInputs, TrajectoryResult, None],
-    ) -> bool:
-        if ctx.inputs.persona_name != "silent_respondent":
-            return True
-        r = ctx.output
-        asked_still_there = len(r.still_there_utterances) >= 1
-        asked_take_your_time = len(r.take_your_time_utterances) >= 1
-        ended_call = r.wrapped_up_after_silence or (
-            r.completed and len(r.still_there_utterances) >= 3
-        )
-        return asked_still_there and asked_take_your_time and ended_call
 
 
 class _ProbeQualityJudgement(BaseModel):
@@ -726,7 +679,6 @@ class NoContextDrift(Evaluator[TrajectoryInputs, TrajectoryResult, None]):
 _SIMULATION_PERSONAS = {
     "contradictory",
     "off_topic_rambler",
-    "silent_respondent",
     "context_compression",
     "context_drift",
     "cooperative_respondent",
@@ -766,7 +718,6 @@ def _build_dataset(only: set[str] | None = None) -> Dataset[TrajectoryInputs, Tr
             CoveredAllScripted(),
             CaughtContradiction(),
             RedirectedOffTopic(),
-            HandledSilenceGracefully(),
             ProbesAreSpecific(),
             StaleProbesBridged(),
             CoveredSubtopicsAccumulate(),
@@ -783,13 +734,12 @@ def _build_dataset(only: set[str] | None = None) -> Dataset[TrajectoryInputs, Tr
 @pytest.mark.asyncio
 @pytest.mark.slow
 async def test_tier3_trajectories(cases_filter: set[str] | None):
-    """Focused simulation for 6 personas testing emergent multi-turn behavior.
+    """Focused simulation for 5 personas testing emergent multi-turn behavior.
 
     Personas testing multi-agent dynamics (analyst ↔ interviewer) and trajectory
     properties that deterministic replay evals can't cover:
       - contradictory: analyst catches contradiction + interviewer probes it
       - off_topic_rambler: interviewer fires off_topic redirect (start + mid)
-      - silent_respondent: silence handling + wrap_up after 3× "Still there?"
       - context_compression: analyst accumulates all covered subtopics (start + mid)
       - context_drift: interviewer doesn't re-ask facts from turn 1 (start/mid/end)
       - cooperative_respondent: call should reach wrap_up naturally (start/mid/end)

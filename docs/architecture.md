@@ -302,7 +302,7 @@ Lifecycle events only, no LLM calls.
 | `status-update` (in-progress) | `Call.status` → `"active"`                                                                       |
 | `conversation-update`         | Debug log only (`messages` available for future reconciliation; **no** transcript writes here)    |
 | `end-of-call-report`          | `Call.status` → `"ended"`; schedule synthesis if enabled                                         |
-| `speech-update`               | Latency / extended-silence instrumentation (`_speech_ts`), not turn persistence                  |
+| `speech-update`               | Latency instrumentation (`_speech_ts`: TTFT + TTS duration), not turn persistence                |
 
 **Turn persistence and analyst scheduling** happen in `POST /vapi/llm/chat/completions`: after `TurnPipeline.commit()` inserts rows, the handler may fire `run_analyst_safely` when `should_run_analyst()` returned true during that commit.
 
@@ -442,9 +442,9 @@ Thresholds: AllActionsValid 100% | ScriptedCursorAdvanced 100% | WrapUpOnlyAfter
 
 Thresholds: CaughtContradiction 100% | RedirectedOffTopic 100% | ProbesAreSpecific ≥80% | StaleProbesBridged ≥75%
 
-**Why the replay/simulation split:** 4 of the 7 personas (`power_user`, `skeptical_buyer`, `ai_skeptic`, `churn_risk`) don't require emergent behavior — their interesting behaviors can be fully specified as canned transcripts. Only `contradictory`, `off_topic_rambler`, and `silent_respondent` need live simulation because you can't pre-script whether the analyst will catch a contradiction and whether the interviewer will act on it. Replay is deterministic and CI-safe; simulation is reserved for behaviors that only emerge from live multi-agent interaction.
+**Why the replay/simulation split:** 4 of the personas (`power_user`, `skeptical_buyer`, `ai_skeptic`, `churn_risk`) don't require emergent behavior — their interesting behaviors can be fully specified as canned transcripts. Only `contradictory`, `off_topic_rambler`, and the live-dynamics personas need simulation because you can't pre-script whether the analyst will catch a contradiction and whether the interviewer will act on it. Replay is deterministic and CI-safe; simulation is reserved for behaviors that only emerge from live multi-agent interaction. (True dead-air silence is no longer simulated — it's handled by Vapi `customer.speech.timeout` hooks, server-side.)
 
-**When to add a replay case vs. a simulation case:** Use replay whenever you can write down the exact respondent text that triggers the behavior you want to test — e.g. "after two `clarify` turns, does the next action advance to `scripted`?" Script those two silence turns in the YAML and assert the action on turn 3. Use simulation only when the behavior depends on what a live respondent *chooses* to say in response to the interviewer — contradictions, off-topic tangents, and extended silence chains all require a live respondent because the interesting signal is emergent rather than scripted.
+**When to add a replay case vs. a simulation case:** Use replay whenever you can write down the exact respondent text that triggers the behavior you want to test — e.g. "after two `clarify` turns, does the next action advance to `scripted`?" Script those two clarify-triggering turns in the YAML and assert the action on turn 3. Use simulation only when the behavior depends on what a live respondent *chooses* to say in response to the interviewer — contradictions and off-topic tangents require a live respondent because the interesting signal is emergent rather than scripted.
 
 ### Synthesis (`test_synthesis.py`)
 

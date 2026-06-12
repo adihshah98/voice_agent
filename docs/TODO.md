@@ -1,15 +1,12 @@
 ## Todo
 
-- Decision Making: Some kind of deterministic order to decide what action to take?
-  - How did you debug the regex issue? I want to know how I can replciate it in the future
 - Silence in Vapi
   - See chat that says "silence detection and time limits"
-- Multi-tenant 
-  - Eventual goal is per customer, per call, per project level configurability across many customers, with a frotnend to be able to configure it. Design keeping that in mind
-    - Tell it it is diligencing which product & some knowledge abt it
+- Multi-tenant + Brain
+  - Eventual goal is per customer, per call, per project level configurability across many customers, with a frontend to be able to configure it. Design keeping that in mind
+    - Tell it it is diligencing which product & some knowledge abt it 
     - Tell it which direction to go, where not to spend too much time
     - If not customization, uses the default
-    - Synthesis
   - Multi-tenant auth
 
 ---

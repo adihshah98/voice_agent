@@ -67,12 +67,12 @@ Two endpoints, different roles:
 - `/vapi/webhook` — HMAC-verified (see Security below). Four event types:
   - `status-update` — flips `Call.status` pending→active.
   - `conversation-update` — debug log only (no DB writes; transcript reconciliation may use `messages` later); turn persistence and analyst scheduling happen in the custom-LLM endpoint after `commit()`.
-  - `end-of-call-report` — flips status to ended; schedules synthesis if enabled; cancels silence watch.
-  - `speech-update` — tracks timing (`_speech_ts`) for latency measurement; manages the extended-silence watch (starts timer on `assistant/stopped`, cancels on `user/started`).
+  - `end-of-call-report` — flips status to ended; schedules synthesis if enabled.
+  - `speech-update` — tracks timing (`_speech_ts`) for latency measurement (`assistant/started` stashes TTFT, `assistant/stopped` computes TTS duration).
 
 Outbound dialing: `POST /calls/start` with `phone_number` + `VAPI_API_KEY` and full dial config returns **202** and sets `Call.dial_status` to `queued`; `_dial_vapi` runs in a background task (`queued`→`dialing`→`dialed` + atomic `UPDATE` of `vapi_call_id`, or terminal `dial_failed` / `dial_skipped`). Poll **`GET /calls/{call_id}`** for `dial_status`, `vapi_call_id`, and `status`. Without a phone (or without a dial), response stays **200** and `dial_status` is null. See `docs/TODO.md` for remaining edge cases.
 
-**Extended silence:** After assistant TTS ends, if the user doesn't speak within `VAPI_EXTENDED_SILENCE_SECONDS`, `_end_call_vapi_delete` fires. Set to 0 (default) to disable. Avoids unbounded silent calls up to `maxDurationSeconds`.
+**Silence / dead-air:** Handled entirely by Vapi via `customer.speech.timeout` assistant hooks set in `_dial_vapi` (built by `_build_speech_timeout_hooks`). The ladder escalates on continuous user silence — re-prompt at `VAPI_SILENCE_TIMEOUT_SECONDS` ("Take your time.") and 2x ("Still there?"), then warmly end the call at 3x (`endCall` tool). `triggerResetMode: onUserSpeech` clears the ladder the moment the user speaks. Set `VAPI_SILENCE_TIMEOUT_SECONDS=0` to disable. Thinking fillers ("um", "let me think") are real transcribed speech and are handled by the interviewer model (NODE 1 → "Take your time."), not by these hooks.
 
 ### Security
 

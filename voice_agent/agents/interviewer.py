@@ -66,11 +66,6 @@ class PreparedInterviewerTurn:
     fallback_scripted_question: str | None
     respondent_text: str = ""
     has_pending_probes: bool = False
-    # Number of consecutive trailing clarify turns; used to enforce wrap_up in Python
-    # when the model misses the counting rule (deterministic override).
-    consecutive_clarify_count: int = 0
-    # Whether the current respondent utterance is silence/blank (for the override check).
-    is_silence: bool = False
 
 
 @dataclass
@@ -79,7 +74,6 @@ class InterviewerContextReads:
     scripted_remaining: int
     probes: list[state.Probe]
     snapshot: state.AnalystSnapshot | None
-    consecutive_clarify_count: int = 0
 
 
 def _recommend_next(reads: InterviewerContextReads) -> str:
@@ -190,7 +184,6 @@ def prepare_interviewer_turn(
         scripted_remaining=state.scripted_remaining(session, call_id),
         probes=state.top_probes(session, call_id, n=3, min_turn=current_turn - PROBE_STALENESS_TURNS),
         snapshot=state.latest_snapshot(session, call_id),
-        consecutive_clarify_count=state.consecutive_clarify_count(session, call_id),
     )
     prompt_parts = _build_prompt_parts_from_reads(
         reads,
@@ -198,14 +191,11 @@ def prepare_interviewer_turn(
         respondent_text=respondent_text,
         vapi_messages=messages,
     )
-    is_silence = not respondent_text.strip() or respondent_text.strip().lower() in ("[silence]", "silence")
     return PreparedInterviewerTurn(
         prompt_parts=prompt_parts,
         fallback_scripted_question=reads.next_scripted_question,
         respondent_text=respondent_text,
         has_pending_probes=bool(reads.probes),
-        consecutive_clarify_count=reads.consecutive_clarify_count,
-        is_silence=is_silence,
     )
 
 
@@ -236,12 +226,11 @@ async def prepare_interviewer_turn_concurrent(
         with state.session_scope(engine) as session:
             return await anyio.to_thread.run_sync(functools.partial(fn, session, *args))
 
-    next_q, remaining, probes, snapshot, clarify_count = await asyncio.gather(
+    next_q, remaining, probes, snapshot = await asyncio.gather(
         _read(state.next_scripted, call_id),
         _read(state.scripted_remaining, call_id),
         _read(state.top_probes, call_id, 3, current_turn - PROBE_STALENESS_TURNS),
         _read(state.latest_snapshot, call_id),
-        _read(state.consecutive_clarify_count, call_id),
     )
     messages = vapi_messages or await _read(_db_messages_fallback, call_id)
 
@@ -250,7 +239,6 @@ async def prepare_interviewer_turn_concurrent(
         scripted_remaining=remaining or 0,
         probes=probes or [],
         snapshot=snapshot,
-        consecutive_clarify_count=clarify_count or 0,
     )
     prompt_parts = _build_prompt_parts_from_reads(
         reads,
@@ -258,14 +246,11 @@ async def prepare_interviewer_turn_concurrent(
         respondent_text=respondent_text,
         vapi_messages=messages,
     )
-    is_silence = not respondent_text.strip() or respondent_text.strip().lower() in ("[silence]", "silence")
     return PreparedInterviewerTurn(
         prompt_parts=prompt_parts,
         fallback_scripted_question=reads.next_scripted_question,
         respondent_text=respondent_text,
         has_pending_probes=bool(reads.probes),
-        consecutive_clarify_count=reads.consecutive_clarify_count,
-        is_silence=is_silence,
     )
 
 
@@ -323,13 +308,10 @@ Quick map (condition → action):
 NODE 1 — IS THERE SUBSTANTIVE CONTENT TO ACT ON?
    Brief confirmations — "yes", "yeah", "sure", "okay", "mm-hmm", "I can hear you" — are
    NOT silence. They are go-aheads: treat as content and continue to node 2.
-   Pure thinking filler standing alone — "um", "uh", "hmm", "give me a second",
-   "let me think" → action=`clarify`, say only "Take your time." But if the previous
-   interviewer turn was already "Take your time." and they are still stalling, say only
-   "Still there?" instead. Nothing else, no question appended.
-   (Truly blank / "[silence]" input, the re-engagement escalation, and ending the call
-   after repeated silence are handled deterministically BEFORE you are called — never
-   your job to count silences or wrap up for silence.)
+   Pure thinking filler or a blank/"[silence]" turn standing alone — "um", "uh", "hmm",
+   "give me a second", "let me think" → action=`clarify`, say only "Take your time." But
+   if the previous interviewer turn was already "Take your time." and they are still
+   stalling, say only "Still there?" instead. Nothing else, no question appended.
    Otherwise → continue to node 2.
 
 NODE 2 — IS THE ANSWER TOO VAGUE TO ACT ON?
@@ -644,9 +626,6 @@ async def run_interviewer(
             respondent_text=respondent_text,
             vapi_messages=vapi_messages or _db_messages_fallback(session, deps.call_id),
         )
-    sc = _silence_short_circuit(prepared)
-    if sc is not None:
-        return sc
     result = await _get_interviewer().run(prepared.prompt_parts, deps=deps)
     output = _parse_streamed_output(result.output, prepared.fallback_scripted_question)
     return _apply_overrides(output, prepared, prepared.respondent_text)
@@ -669,42 +648,6 @@ _OPEN_TAG = "<utterance>"
 _CLOSE_TAG = "</utterance>"
 _META_RE = re.compile(r"</utterance>\s*(\{.*)", re.DOTALL)
 _META_BARE_RE = re.compile(r"\n(\{.*)", re.DOTALL)  # tag-free fallback: JSON after first \n{
-
-_WRAP_UP_UTTERANCE = "It sounds like now might not be a great time — thanks so much for your time today. I'll let you go."
-
-# Deterministic re-engagement ladder for empty/[silence] turns, indexed by how many
-# consecutive re-engagement attempts (clarify turns) have already been made.
-# Index 2 must contain "still there" so the turn immediately before a silence wrap_up
-# is a "Still there?" — the trajectory eval keys its wrap-after-silence detection off that.
-_SILENCE_LADDER = ("Take your time.", "Still there?", "Still there?")
-
-
-def _silence_short_circuit(prepared: PreparedInterviewerTurn) -> InterviewerOutput | None:
-    """Resolve empty/[silence] turns deterministically, without an LLM call.
-
-    Truly blank input carries nothing the model can act on, so the re-engagement
-    ladder and the wrap-up after repeated silence are owned by Python: instant,
-    free, and 100% reliable on the highest-frequency degenerate turn. Thinking
-    fillers ("um", "uh") are NOT is_silence and still go to the model.
-
-    Returns None for any non-silence turn (the normal LLM path).
-    """
-    if not prepared.is_silence:
-        return None
-    n = prepared.consecutive_clarify_count
-    if n >= len(_SILENCE_LADDER):
-        return InterviewerOutput(
-            utterance=_WRAP_UP_UTTERANCE,
-            action="wrap_up",
-            reasoning=f"Python silence handler: consecutive_clarify_count={n} — wrapping up after repeated silence",
-            probe_id_used=None,
-        )
-    return InterviewerOutput(
-        utterance=_SILENCE_LADDER[n],
-        action="clarify",
-        reasoning=f"Python silence handler: empty/[silence] input, re-engagement attempt {n + 1} of {len(_SILENCE_LADDER)}",
-        probe_id_used=None,
-    )
 
 
 # Verbal-exit phrases that override the model's action to wrap_up (step 5 of the decision framework).
@@ -742,9 +685,6 @@ def _apply_overrides(
     The prompt instructs the model on both rules below, but small fallback models
     (Groq, Cerebras) miss them under pressure. Python guards make the highest-stakes
     rules hard invariants regardless of model compliance.
-
-    Empty/[silence] turns never reach here — `_silence_short_circuit` resolves the
-    re-engagement ladder and silence wrap-up before the model is ever called.
 
     Guards run in priority order — first match wins:
       1. Verbal exit   — wrap_up on explicit "I'm done / I need to go" signals.
@@ -924,22 +864,6 @@ class InterviewerStream:
         _stream_error: Exception | None = None
         full_text = ""
         any_yielded = False
-
-        # Empty/[silence] turns are resolved deterministically without a model call:
-        # instant first token (no filler needed), zero cost, 100% reliable escalation.
-        sc = _silence_short_circuit(prepared)
-        if sc is not None:
-            self._output = sc
-            self._usage = None
-            logfire.info(
-                "interviewer_silence_short_circuit",
-                call_id=deps.call_id,
-                turn_number=deps.turn_number,
-                action=sc.action,
-                consecutive_clarify_count=prepared.consecutive_clarify_count,
-            )
-            yield sc.utterance
-            return
 
         with anyio.move_on_after(self._budget_s) as cancel_scope:
             try:

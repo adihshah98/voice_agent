@@ -54,9 +54,9 @@ class Settings(BaseSettings):
     vapi_stop_num_words: int = 3            # words user must say before assistant stops (blocks backchannel interrupts)
     vapi_stop_backoff_seconds: float = 0.5  # wait after real interruption before speaking again
 
-    # After assistant TTS ends, if the user does not speak within this window, end the call (Vapi DELETE).
-    # 0 = disabled. Avoids unbounded "Still there?" loops until maxDurationSeconds.
-    vapi_extended_silence_seconds: float = 0.0
+    # Base interval (seconds) for the Vapi customer.speech.timeout ladder set in _dial_vapi:
+    # re-prompt at 1x ("Take your time."), 2x ("Still there?"), and end the call at 3x. 0 = disabled.
+    vapi_silence_timeout_seconds: float = 10.0
 
     # Spoken line when the model response cannot be parsed into a usable utterance + metadata.
     interviewer_recovery_utterance: str = (

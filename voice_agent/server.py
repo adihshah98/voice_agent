@@ -55,9 +55,6 @@ _background_tasks: set[asyncio.Task] = set()
 # Keyed by call_id; cleaned up on end-of-call-report.
 _speech_ts: dict[str, dict[str, Any]] = {}
 
-# One asyncio.Task per call: fires Vapi DELETE if user stays silent after assistant stops speaking.
-_silence_watch_tasks: dict[str, asyncio.Task] = {}
-
 
 def _fire(coro, *, name: str | None = None) -> asyncio.Task:
     task = asyncio.create_task(coro, name=name)
@@ -83,15 +80,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 
-def _cancel_silence_watch(call_id: str) -> None:
-    """Stop the extended-silence task for this call if one is running."""
-    task = _silence_watch_tasks.pop(call_id, None)
-    if task and not task.done():
-        task.cancel()
-
-
 def _end_call_vapi_delete(call_id: str, end_reason: str) -> None:
-    """Mark a call ended in the DB, cancel silence watch, and fire Vapi DELETE — best-effort, never raises.
+    """Mark a call ended in the DB and fire Vapi DELETE — best-effort, never raises.
 
     Uses a single conditional UPDATE (Postgres-safe under concurrent callers): only the first
     transition from pending|active → ended returns vapi_call_id for DELETE; duplicates no-op the DB write.
@@ -116,7 +106,6 @@ def _end_call_vapi_delete(call_id: str, end_reason: str) -> None:
         logfire.exception("end_call_vapi_delete_db_failed", call_id=call_id, end_reason=end_reason)
         return
 
-    _cancel_silence_watch(call_id)
     _speech_ts.pop(call_id, None)
 
     if not vapi_call_id or not settings.vapi_api_key:
@@ -141,41 +130,6 @@ def _end_call_vapi_delete(call_id: str, end_reason: str) -> None:
 def _end_call_on_error(call_id: str) -> None:
     """Mark a call ended and fire Vapi DELETE — best-effort, never raises."""
     _end_call_vapi_delete(call_id, "server_error")
-
-
-def _schedule_silence_watch_if_enabled(call_id: str, vapi_call_id: str | None) -> None:
-    """Start (or replace) a timer: end the call if the user does not start/stop speaking before the deadline.
-
-    Fires after each assistant TTS `stopped` event. Cancelled when the user or assistant next speaks.
-    """
-    if settings.vapi_extended_silence_seconds <= 0 or not call_id:
-        return
-
-    _cancel_silence_watch(call_id)
-
-    async def _run() -> None:
-        try:
-            await asyncio.sleep(settings.vapi_extended_silence_seconds)
-        except asyncio.CancelledError:
-            return
-        try:
-            with state.session_scope(engine) as session:
-                call = session.get(state.Call, call_id)
-                if not call or call.status == "ended":
-                    return
-            logfire.info("extended_silence_timeout", call_id=call_id, vapi_call_id=vapi_call_id)
-            _end_call_vapi_delete(call_id, "extended_silence")
-        except Exception:
-            logfire.exception("silence_watch_failed", call_id=call_id)
-
-    task = _fire(_run(), name=f"silence-watch-{call_id}")
-    _silence_watch_tasks[call_id] = task
-
-    def _on_done(t: asyncio.Task) -> None:
-        if _silence_watch_tasks.get(call_id) is t:
-            _silence_watch_tasks.pop(call_id, None)
-
-    task.add_done_callback(_on_done)
 
 
 @app.exception_handler(HTTPException)
@@ -365,7 +319,6 @@ def _mark_dial_failed(call_id: str, *, end_reason: str, dial_error: str | None) 
             )
     except Exception:
         logfire.exception("mark_dial_failed_db_error", call_id=call_id)
-    _cancel_silence_watch(call_id)
     _speech_ts.pop(call_id, None)
 
 
@@ -419,12 +372,10 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                     if call is None:
                         logfire.warning("end_of_call_unknown_call_id", call_id=call_id)
                         return {}
-                    _cancel_silence_watch(call_id)
                     _speech_ts.pop(call_id, None)
                     return {}
                 event_span.set_attribute("ended_reason", ended_reason)
                 probes_asked, probes_total = state.probe_utilization(session, call_id)
-            _cancel_silence_watch(call_id)
             _speech_ts.pop(call_id, None)
 
             # Extract Vapi's per-turn TurnLatency breakdown (seconds → ms).
@@ -515,11 +466,7 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
 
             if call_id:
                 entry = _speech_ts.setdefault(call_id, {})
-                if role == "user" and status == "stopped":
-                    _cancel_silence_watch(call_id)
-                elif role == "user" and status == "started":
-                    _cancel_silence_watch(call_id)
-                elif role == "assistant" and status == "started":
+                if role == "assistant" and status == "started":
                     llm_ttft_ms = entry.pop("llm_ttft_ms", None)
                     filler_injected = entry.pop("filler_injected", False)
                     logfire.info(
@@ -529,13 +476,11 @@ async def vapi_webhook(request: Request, _: None = Depends(_require_vapi_signatu
                         filler_injected=filler_injected,
                     )
                     entry["assistant_started_at"] = now
-                    _cancel_silence_watch(call_id)
                 elif role == "assistant" and status == "stopped":
                     assistant_started = entry.get("assistant_started_at")
                     if assistant_started is not None:
                         tts_duration_ms = int((now - assistant_started) * 1000)
                     entry.pop("assistant_started_at", None)
-                    _schedule_silence_watch_if_enabled(call_id, vapi_call_id)
 
             logfire.info(
                 "vapi_speech_update",
@@ -920,7 +865,6 @@ async def delete_call(
             if session.get(state.Call, call_id) is None:
                 raise HTTPException(status_code=404, detail="Call not found")
             return {"call_id": call_id, "status": "already_ended"}
-    _cancel_silence_watch(call_id)
     _speech_ts.pop(call_id, None)
 
     if vapi_call_id and settings.vapi_api_key:
@@ -985,6 +929,44 @@ def _build_stop_speaking_plan() -> dict[str, Any]:
     }
 
 
+def _build_speech_timeout_hooks() -> list[dict[str, Any]]:
+    """Vapi-side dead-air ladder via `customer.speech.timeout` hooks.
+
+    Escalates on continuous user silence: re-prompt at 1x and 2x the base interval,
+    then warmly end the call at 3x. `triggerResetMode: onUserSpeech` clears the whole
+    ladder the moment the user speaks. Returns [] (no hooks) when disabled.
+
+    This owns true dead-air. Thinking fillers ("um", "let me think") are real
+    transcribed speech and are handled by the interviewer model, not here.
+    """
+    base = settings.vapi_silence_timeout_seconds
+    if base <= 0:
+        return []
+    return [
+        {
+            "on": "customer.speech.timeout",
+            "options": {"timeoutSeconds": base, "triggerMaxCount": 3, "triggerResetMode": "onUserSpeech"},
+            "do": [{"type": "say", "exact": "Take your time."}],
+        },
+        {
+            "on": "customer.speech.timeout",
+            "options": {"timeoutSeconds": base * 2, "triggerMaxCount": 3, "triggerResetMode": "onUserSpeech"},
+            "do": [{"type": "say", "exact": "Still there?"}],
+        },
+        {
+            "on": "customer.speech.timeout",
+            "options": {"timeoutSeconds": base * 3, "triggerMaxCount": 1, "triggerResetMode": "onUserSpeech"},
+            "do": [
+                {
+                    "type": "say",
+                    "exact": "It sounds like now might not be a great time — thanks so much for your time today. I'll let you go.",
+                },
+                {"type": "tool", "tool": {"type": "endCall"}},
+            ],
+        },
+    ]
+
+
 async def _dial_vapi(call_id: str, phone_number: str) -> None:
     """POST to Vapi's outbound call API (background task). Never raises to the HTTP client.
 
@@ -1041,6 +1023,7 @@ async def _dial_vapi(call_id: str, phone_number: str) -> None:
                 },
                 "startSpeakingPlan": _build_start_speaking_plan(),
                 "stopSpeakingPlan": _build_stop_speaking_plan(),
+                **({"hooks": _hooks} if (_hooks := _build_speech_timeout_hooks()) else {}),
                 "firstMessage": (
                     "Hey, thank you for getting on the call! Want to check if you can hear me before we get started."
                 ),
