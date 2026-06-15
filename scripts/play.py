@@ -35,6 +35,7 @@ sys.path.insert(0, str(REPO_ROOT))
 load_dotenv()
 
 from voice_agent.config import ENABLE_SYNTHESIS_REPORT, settings
+from voice_agent.models import CallBrain
 
 _level_name = settings.log_level.upper()
 _root_level = getattr(logging, _level_name, logging.INFO)
@@ -86,13 +87,14 @@ def load_questions(product: str | None) -> list[str]:
 # --- In-process call ops ----------------------------------------------------
 
 
-def seed_call(engine, questions: list[str]) -> str:
+def seed_call(engine, questions: list[str], brain: dict | None = None) -> str:
     call_id = str(uuid.uuid4())
     with state.session_scope(engine) as session:
         session.add(
             state.Call(
                 id=call_id,
                 scripted_questions=questions,
+                brain=brain,
                 status="active",
             )
         )
@@ -182,12 +184,12 @@ def print_report(report: dict) -> None:
 
 
 
-async def run_local_repl(questions: list[str]) -> None:
+async def run_local_repl(questions: list[str], brain: dict | None = None) -> None:
     engine = state.make_engine(settings.database_url)
     state.init_db(engine)
     init_tracing(engine=engine)
 
-    call_id = seed_call(engine, questions)
+    call_id = seed_call(engine, questions, brain=brain)
     print(f"Call created: {call_id}")
 
     print('\nType respondent answers below. Enter "quit" or Ctrl-D to stop.')
@@ -245,7 +247,7 @@ async def run_local_repl(questions: list[str]) -> None:
 # --- --phone mode: dial via server ------------------------------------------
 
 
-def dial_via_server(questions: list[str], phone_number: str) -> None:
+def dial_via_server(questions: list[str], phone_number: str, brain: dict | None = None) -> None:
     import httpx
 
     call_id = str(uuid.uuid4())
@@ -261,13 +263,22 @@ def dial_via_server(questions: list[str], phone_number: str) -> None:
         if settings.api_auth_token:
             headers["Authorization"] = f"Bearer {settings.api_auth_token}"
 
+        body: dict = {
+            "scripted_questions": questions,
+            "call_id": call_id,
+            "phone_number": phone_number,
+        }
+        if brain:
+            body.update({
+                "product": brain.get("product_name", "the product"),
+                "product_description": brain.get("product_description"),
+                "focus_areas": brain.get("focus_areas", []),
+                "deprioritize": brain.get("deprioritize", []),
+                "investor_thesis": brain.get("investor_thesis"),
+            })
         resp = client.post(
             f"{BASE_URL}/calls/start",
-            json={
-                "scripted_questions": questions,
-                "call_id": call_id,
-                "phone_number": phone_number,
-            },
+            json=body,
             headers=headers,
             timeout=15,
         )
@@ -310,6 +321,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal E2E voice interview simulation")
     parser.add_argument("product", nargs="?", help="Product name to substitute in questions (optional)")
     parser.add_argument("--phone", metavar="NUMBER", help="Dial this number via Vapi (e.g. +14155551234)")
+    parser.add_argument("--description", metavar="TEXT", help="One-sentence product description for agent context")
+    parser.add_argument("--focus", metavar="AREA", action="append", default=[], help="Focus area to dig into (repeatable)")
+    parser.add_argument("--skip", metavar="AREA", action="append", default=[], help="Area to deprioritize (repeatable)")
+    parser.add_argument("--thesis", metavar="TEXT", help="Investor thesis for this call")
     args = parser.parse_args()
 
     product: str | None = args.product or None
@@ -317,11 +332,22 @@ def main() -> None:
     label = f"'{product}'" if product else "generic (no product)"
     print(f"\nLoaded {len(questions)} scripted questions — {label}")
 
+    brain = CallBrain(
+        product_name=product or "the product",
+        product_description=args.description,
+        focus_areas=args.focus,
+        deprioritize=args.skip,
+        investor_thesis=args.thesis,
+    ).model_dump()
+
+    if args.focus or args.skip or args.description or args.thesis:
+        print(f"Brain: {brain}")
+
     if args.phone:
-        dial_via_server(questions, args.phone)
+        dial_via_server(questions, args.phone, brain=brain)
         return
 
-    asyncio.run(run_local_repl(questions))
+    asyncio.run(run_local_repl(questions, brain=brain))
 
 
 if __name__ == "__main__":

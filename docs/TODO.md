@@ -1,19 +1,24 @@
 ## Todo
 
-- Silence in Vapi
-  - See chat that says "silence detection and time limits"
-- Multi-tenant + Brain
-  - Eventual goal is per customer, per call, per project level configurability across many customers, with a frontend to be able to configure it. Design keeping that in mind
-    - Tell it it is diligencing which product & some knowledge abt it 
-    - Tell it which direction to go, where not to spend too much time
-    - If not customization, uses the default
-  - Multi-tenant auth
+- Interviewer Brain
+  - Tell it it is diligencing which product & some knowledge abt it 
+  - Tell it which direction to go, where not to spend too much time
+  - If not customization, uses the default
+- Multi-tenant 
+  - Eventual goal is per customer, per call, per project level configurability across many customers, with a frontend to be able to configure it + Multi-tenant auth
 
 ---
 
 ---
 
 ## Future improvements
+
+- Improve Brain
+  - Real feedback loop where previous conversations feed in
+    - Across calls, you add a **"project learner"** that compacts call syntheses → a bounded **project brief** (~1–2KB). Same compaction pattern, lifted from call-scope to project-scope. That compacted brief rides in the cached prompt prefix. No turn-time retrieval, ever.
+  - When RAG makes sense
+    - Customer **uploads** a big knowledge base (product docs, past decks, Gong transcripts), or
+    - you want to **query across hundreds of past interviews** ("what did others say about pricing?").
 
 - Flow
   - What if user has to tend to doorbell and asks agent to pause for 3-5 minutes
@@ -38,8 +43,7 @@
   - Advanced Voice UX features & Voice UX Evals
     - Make the fillers sound more natural
     - Livekit/Pipecat & Deepgram: In production systems, it's not acceptable to wait for 1+ seconds (to decide if user is done talking w/o punctuation), but also not acceptable to interrupt users mid thought - how would it be done irl.
-      - Speculative LLM Firing: Calling LLM before VAD done: That's a managed-service tax. If sub-500ms E2E latency is a hard requirement, the honest answer is **Vapi is the constraint** — frameworks like LiveKit Agents or Pipecat running on your own infra are the production best practice for latency-critical voice AI. Fire the LLM on the *interim transcript* — before endpointing confirms. If the user continues speaking, cancel the inflight request and refire with the updated transcript. The wasted token cost is negligible vs. the latency win.
-      This requires streaming STT with interim results (Deepgram supports it), and a cancellation mechanism on the LLM side. **This is the technique that cuts perceived latency in half.** It works because most of the time, the user's last ~200ms of audio doesn't change the semantic meaning.
+      - Speculative LLM Firing: Calling LLM before VAD done: That's a managed-service tax. If sub-500ms E2E latency is a hard requirement, the honest answer is **Vapi is the constraint** — frameworks like LiveKit Agents or Pipecat running on your own infra are the production best practice for latency-critical voice AI. Fire the LLM on the *interim transcript* — before endpointing confirms. If the user continues speaking, cancel the inflight request and refire with the updated transcript. The wasted token cost is negligible vs. the latency win. This requires streaming STT with interim results (Deepgram supports it), and a cancellation mechanism on the LLM side. **This is the technique that cuts perceived latency in half.** It works because most of the time, the user's last ~200ms of audio doesn't change the semantic meaning.
       - **No backchannels** — The bot can't say "mm-hmm" mid-answer. This is the single biggest voice UX gap vs. a human interviewer. It's a Vapi architectural constraint — true backchannels require LiveKit/Pipecat on your own infra (the TODO already flags this). Not worth solving now unless latency and reliability are solid.
       - **LiveKit full barge-in control** — only if Vapi's built-in config is insufficient
     - Model routing by intent/tier

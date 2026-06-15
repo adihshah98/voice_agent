@@ -17,6 +17,23 @@ Action = Literal[
 ]
 
 
+class CallBrain(BaseModel):
+    """Per-call strategic brief injected into interviewer and analyst contexts.
+
+    Tells both agents what product is being researched, what the investor wants
+    to understand, and where to spend (or not spend) time. All fields beyond
+    product_name are optional — a brain with just a product name is still useful
+    (the agents can refer to it by name and the interviewer deflects identity
+    questions accurately).
+    """
+
+    product_name: str
+    product_description: str | None = None
+    focus_areas: list[str] = []
+    deprioritize: list[str] = []
+    investor_thesis: str | None = None
+
+
 # --- Interviewer -----------------------------------------------------------
 
 

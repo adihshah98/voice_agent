@@ -38,6 +38,7 @@ from sqlmodel import Session, select
 from voice_agent import state
 from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely as _synthesis_safely
 from voice_agent.config import ENABLE_SYNTHESIS_REPORT, VAPI_TIMESTAMP_TOLERANCE_S, settings
+from voice_agent.models import CallBrain
 from voice_agent.tracing import agent_span, init_tracing
 from voice_agent.turn import TurnPipeline
 
@@ -528,6 +529,10 @@ def _load_default_questions(product: str) -> list[str]:
 class StartCallRequest(BaseModel):
     product: str
     phone_number: str | None = None
+    product_description: str | None = None
+    focus_areas: list[str] = []
+    deprioritize: list[str] = []
+    investor_thesis: str | None = None
 
 
 @app.post("/calls/start")
@@ -536,6 +541,13 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
     """Dial out via Vapi, loading scripted questions from investor_questions.yaml for the given product."""
     call_id = str(uuid.uuid4())
     scripted_questions = _load_default_questions(req.product)
+    brain = CallBrain(
+        product_name=req.product,
+        product_description=req.product_description,
+        focus_areas=req.focus_areas,
+        deprioritize=req.deprioritize,
+        investor_thesis=req.investor_thesis,
+    )
 
     wants_dial = bool(req.phone_number and settings.vapi_api_key)
     can_dial = bool(
@@ -570,6 +582,7 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
                 id=call_id,
                 phone_number=req.phone_number,
                 scripted_questions=scripted_questions,
+                brain=brain.model_dump(),
                 status=status,
                 dial_status=dial_status,
                 dial_error=dial_error,
@@ -584,6 +597,7 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
         phone_number=req.phone_number,
         question_count=len(scripted_questions),
         product=req.product,
+        focus_areas=req.focus_areas,
         dial_status=dial_status,
     )
 

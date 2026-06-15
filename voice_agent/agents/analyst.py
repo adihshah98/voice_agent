@@ -24,7 +24,7 @@ load_dotenv()
 
 from voice_agent import state
 from voice_agent.config import ANALYST_MODEL, settings
-from voice_agent.models import AnalysisUpdate, AnalystDeps
+from voice_agent.models import AnalysisUpdate, AnalystDeps, CallBrain
 
 
 ANALYST_PROMPT = """\
@@ -112,6 +112,21 @@ def _format_turn(t) -> str:
     return f"{t.speaker.upper()} [{t.turn_number}]: {t.text}"
 
 
+def _render_diligence_brief(brain: CallBrain) -> str:
+    lines = ["DILIGENCE_BRIEF:"]
+    label = brain.product_name
+    if brain.product_description:
+        label += f" — {brain.product_description}"
+    lines.append(f"  Product: {label}")
+    if brain.investor_thesis:
+        lines.append(f"  Investor thesis: {brain.investor_thesis}")
+    if brain.focus_areas:
+        lines.append(f"  Focus areas: {'; '.join(brain.focus_areas)}")
+    if brain.deprioritize:
+        lines.append(f"  Deprioritize: {'; '.join(brain.deprioritize)}")
+    return "\n".join(lines)
+
+
 def _build_prompt(session, call_id: str) -> tuple[str, int]:
     """Return (prompt_text, last_turn_number).
 
@@ -122,6 +137,10 @@ def _build_prompt(session, call_id: str) -> tuple[str, int]:
     EXISTING_PROBES are capped to the most recent _MAX_EXISTING_PROBES entries to
     keep the prompt from growing unboundedly on long calls.
     """
+    call_obj = session.get(state.Call, call_id)
+    brain_dict = call_obj.brain if call_obj else None
+    brain = CallBrain.model_validate(brain_dict) if brain_dict else None
+
     snapshot = state.latest_snapshot(session, call_id)
 
     if snapshot:
@@ -166,6 +185,9 @@ def _build_prompt(session, call_id: str) -> tuple[str, int]:
         prompt += "\n\nEXISTING_PROBES (do not repeat):\n" + "\n".join(
             f"- {q}" for q in existing
         )
+
+    if brain:
+        prompt = _render_diligence_brief(brain) + "\n\n" + prompt
 
     return prompt, last_turn
 

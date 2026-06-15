@@ -42,6 +42,7 @@ class Call(SQLModel, table=True):
     dial_status: Optional[str] = None  # queued|dialing|dialed|dial_failed; None = no dial
     dial_error: Optional[str] = None
     end_reason: Optional[str] = None
+    brain: Optional[dict] = Field(default=None, sa_column=Column(JSON, nullable=True))
     started_at: datetime = Field(default_factory=_utcnow)
     ended_at: Optional[datetime] = None
 
@@ -220,6 +221,11 @@ def session_scope(engine) -> Iterator[Session]:
 
 
 # --- Read helpers used by interviewer tools --------------------------------
+
+
+def call_brain(session: Session, call_id: str) -> Optional[dict]:
+    call = session.get(Call, call_id)
+    return call.brain if call else None
 
 
 def next_turn_number(session: Session, call_id: str) -> int:

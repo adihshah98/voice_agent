@@ -53,7 +53,7 @@ from voice_agent.interviewer_llm_caching import (
     openai_interviewer_settings,
     user_message_cache_breakpoint,
 )
-from voice_agent.models import InterviewerDeps, InterviewerLLMMeta, InterviewerOutput
+from voice_agent.models import CallBrain, InterviewerDeps, InterviewerLLMMeta, InterviewerOutput
 
 
 CONTEXT_WINDOW_TURNS = 15  # recent turns injected into the LLM context block; keep under Cerebras 8k limit
@@ -74,6 +74,7 @@ class InterviewerContextReads:
     scripted_remaining: int
     probes: list[state.Probe]
     snapshot: state.AnalystSnapshot | None
+    brain: "CallBrain | None" = None
 
 
 def _recommend_next(reads: InterviewerContextReads) -> str:
@@ -99,16 +100,38 @@ def _recommend_next(reads: InterviewerContextReads) -> str:
     return "wrap_up — no scripted questions remain and no analyst probe pending"
 
 
+def _render_study_brief(brain: CallBrain) -> str:
+    lines = ["STUDY_BRIEF:"]
+    label = brain.product_name
+    if brain.product_description:
+        label += f" — {brain.product_description}"
+    lines.append(f"  Product: {label}")
+    if brain.investor_thesis:
+        lines.append(f"  Investor thesis: {brain.investor_thesis}")
+    if brain.focus_areas:
+        lines.append("  Focus areas (go deep, probe multiple angles):")
+        for fa in brain.focus_areas:
+            lines.append(f"    - {fa}")
+    if brain.deprioritize:
+        lines.append("  Deprioritize (acknowledge briefly; don't dwell):")
+        for d in brain.deprioritize:
+            lines.append(f"    - {d}")
+    return "\n".join(lines)
+
+
 def _build_prompt_parts_from_reads(
     reads: InterviewerContextReads,
     current_turn: int,
     respondent_text: str,
     vapi_messages: list[dict],
 ) -> list[str | CachePoint]:
-    # Order: COVERED_SUBTOPICS + CALL_CONTEXT, cache breakpoint (Anthropic), then per-turn CONTEXT.
-    # COVERED_SUBTOPICS and CALL_CONTEXT sit before the cache breakpoint so they are cached across
-    # turns (they change only when the analyst runs, not every turn). See interviewer_llm_caching.
+    # Order: STUDY_BRIEF + COVERED_SUBTOPICS + CALL_CONTEXT, cache breakpoint (Anthropic), then per-turn CONTEXT.
+    # Everything before the cache breakpoint is cached across turns (changes only when analyst runs).
+    # STUDY_BRIEF is call-level config that never changes, so it sits at the top of this cached block.
     covered_lines = []
+    if reads.brain:
+        covered_lines.append(_render_study_brief(reads.brain))
+        covered_lines.append("")
     if reads.snapshot and reads.snapshot.covered_subtopics:
         covered_lines.append("COVERED_SUBTOPICS (do NOT revisit these areas):")
         for topic in reads.snapshot.covered_subtopics:
@@ -179,11 +202,14 @@ def prepare_interviewer_turn(
 ) -> PreparedInterviewerTurn:
     """Load DB-backed context in one short-lived read session."""
     messages = vapi_messages or _db_messages_fallback(session, call_id)
+    brain_dict = state.call_brain(session, call_id)  # identity-map hit; Call already loaded above
+    brain = CallBrain.model_validate(brain_dict) if brain_dict else None
     reads = InterviewerContextReads(
         next_scripted_question=state.next_scripted(session, call_id),
         scripted_remaining=state.scripted_remaining(session, call_id),
         probes=state.top_probes(session, call_id, n=3, min_turn=current_turn - PROBE_STALENESS_TURNS),
         snapshot=state.latest_snapshot(session, call_id),
+        brain=brain,
     )
     prompt_parts = _build_prompt_parts_from_reads(
         reads,
@@ -226,19 +252,22 @@ async def prepare_interviewer_turn_concurrent(
         with state.session_scope(engine) as session:
             return await anyio.to_thread.run_sync(functools.partial(fn, session, *args))
 
-    next_q, remaining, probes, snapshot = await asyncio.gather(
+    next_q, remaining, probes, snapshot, brain_dict = await asyncio.gather(
         _read(state.next_scripted, call_id),
         _read(state.scripted_remaining, call_id),
         _read(state.top_probes, call_id, 3, current_turn - PROBE_STALENESS_TURNS),
         _read(state.latest_snapshot, call_id),
+        _read(state.call_brain, call_id),
     )
     messages = vapi_messages or await _read(_db_messages_fallback, call_id)
+    brain = CallBrain.model_validate(brain_dict) if brain_dict else None
 
     reads = InterviewerContextReads(
         next_scripted_question=next_q,
         scripted_remaining=remaining or 0,
         probes=probes or [],
         snapshot=snapshot,
+        brain=brain,
     )
     prompt_parts = _build_prompt_parts_from_reads(
         reads,
@@ -255,7 +284,7 @@ async def prepare_interviewer_turn_concurrent(
 
 
 # Bump when INTERVIEWER_PROMPT content changes so Logfire traces can be filtered by version.
-INTERVIEWER_PROMPT_VERSION = "2026-06-11.1"
+INTERVIEWER_PROMPT_VERSION = "2026-06-13.1"
 
 INTERVIEWER_PROMPT = """\
 You are conducting a customer interview on behalf of an investor or research firm
@@ -270,6 +299,10 @@ You control the conversation — scripted questions are the study backbone,
 analyst suggestions are inputs. You decide what happens next.
 
 CONTEXT fields:
+- STUDY_BRIEF (when present): the product being researched, the investor thesis, areas to go deep on,
+  and areas to keep brief. Use this to calibrate depth: treat focus areas like high-value investor
+  signal triggers — always probe one level deeper. For deprioritize areas, acknowledge the answer
+  and move on without layering.
 - SCRIPTED_REMAINING / NEXT_SCRIPTED: structured study questions
 - PENDING_PROBES: up to 3 analyst suggestions, each tagged with [id, priority, turns_ago].
   Priority 1=urgent, 2=worthwhile, 3=nice-to-have. All are fresh (turns_ago ≤ 8).
