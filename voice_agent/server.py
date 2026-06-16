@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -78,6 +79,19 @@ app = FastAPI(
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+_frontend_origins = [o for o in [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    settings.frontend_url,
+] if o]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_frontend_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 
 
@@ -526,27 +540,228 @@ def _load_default_questions(product: str) -> list[str]:
     ]
 
 
-class StartCallRequest(BaseModel):
+# --- Project endpoints -------------------------------------------------------
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
     product: str
+    product_description: str | None = None
+    focus_areas: list[str] = []
+    deprioritize: list[str] = []
+    investor_thesis: str | None = None
+    scripted_questions: list[str] | None = None
+
+
+class PatchProjectRequest(BaseModel):
+    name: str | None = None
+    product: str | None = None
+    product_description: str | None = None
+    focus_areas: list[str] | None = None
+    deprioritize: list[str] | None = None
+    investor_thesis: str | None = None
+    scripted_questions: list[str] | None = None
+
+
+def _project_to_dict(project: state.Project, call_count: int = 0) -> dict[str, Any]:
+    return {
+        "id": project.id,
+        "name": project.name,
+        "product": project.product,
+        "product_description": project.product_description,
+        "focus_areas": project.focus_areas,
+        "deprioritize": project.deprioritize,
+        "investor_thesis": project.investor_thesis,
+        "scripted_questions": project.scripted_questions,
+        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "call_count": call_count,
+    }
+
+
+@app.post("/projects", status_code=201)
+async def create_project(req: CreateProjectRequest, _: None = Depends(_require_api_auth)) -> dict[str, Any]:
+    """Create a research project with default or custom scripted questions."""
+    questions = req.scripted_questions if req.scripted_questions is not None else _load_default_questions(req.product)
+    project = state.Project(
+        name=req.name,
+        product=req.product,
+        product_description=req.product_description,
+        focus_areas=req.focus_areas,
+        deprioritize=req.deprioritize,
+        investor_thesis=req.investor_thesis,
+        scripted_questions=questions,
+    )
+    with state.session_scope(engine) as session:
+        session.add(project)
+    return _project_to_dict(project, call_count=0)
+
+
+@app.get("/projects")
+async def list_projects(_: None = Depends(_require_api_auth)) -> list[dict[str, Any]]:
+    """List all projects with call counts."""
+    from sqlalchemy import func as sa_func
+    with state.session_scope(engine) as session:
+        rows = session.exec(
+            select(state.Project, sa_func.count(state.Call.id).label("call_count"))
+            .outerjoin(state.Call, state.Call.project_id == state.Project.id)
+            .group_by(state.Project.id)
+            .order_by(state.Project.created_at.desc())
+        ).all()
+        return [_project_to_dict(proj, cnt) for proj, cnt in rows]
+
+
+@app.get("/projects/{project_id}")
+async def get_project(project_id: str, _: None = Depends(_require_api_auth)) -> dict[str, Any]:
+    """Get project detail with call count."""
+    from sqlalchemy import func as sa_func
+    with state.session_scope(engine) as session:
+        row = session.exec(
+            select(state.Project, sa_func.count(state.Call.id).label("call_count"))
+            .outerjoin(state.Call, state.Call.project_id == state.Project.id)
+            .where(state.Project.id == project_id)
+            .group_by(state.Project.id)
+        ).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        proj, cnt = row
+        return _project_to_dict(proj, cnt)
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: str, _: None = Depends(_require_api_auth)) -> dict[str, str]:
+    """Delete a project and its calls (cascades via ORM relationship)."""
+    with state.session_scope(engine) as session:
+        project = session.get(state.Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        session.delete(project)
+    return {"id": project_id, "status": "deleted"}
+
+
+@app.patch("/projects/{project_id}")
+async def patch_project(project_id: str, req: PatchProjectRequest, _: None = Depends(_require_api_auth)) -> dict[str, Any]:
+    """Update project fields. Only provided (non-null) fields are changed."""
+    from sqlalchemy import func as sa_func
+    with state.session_scope(engine) as session:
+        project = session.get(state.Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if req.name is not None:
+            project.name = req.name
+        if req.product is not None:
+            project.product = req.product
+        if req.product_description is not None:
+            project.product_description = req.product_description
+        if req.focus_areas is not None:
+            project.focus_areas = req.focus_areas
+        if req.deprioritize is not None:
+            project.deprioritize = req.deprioritize
+        if req.investor_thesis is not None:
+            project.investor_thesis = req.investor_thesis
+        if req.scripted_questions is not None:
+            project.scripted_questions = req.scripted_questions
+        session.add(project)
+        call_count = session.exec(
+            select(sa_func.count(state.Call.id)).where(state.Call.project_id == project_id)
+        ).one()
+        return _project_to_dict(project, int(call_count))
+
+
+def _call_to_summary(call: state.Call, has_report: bool = False) -> dict[str, Any]:
+    return {
+        "call_id": call.id,
+        "project_id": call.project_id,
+        "status": call.status,
+        "dial_status": call.dial_status,
+        "phone_number": call.phone_number,
+        "started_at": call.started_at.isoformat() if call.started_at else None,
+        "ended_at": call.ended_at.isoformat() if call.ended_at else None,
+        "end_reason": call.end_reason,
+        "has_report": has_report,
+    }
+
+
+@app.get("/projects/{project_id}/calls")
+async def list_project_calls(project_id: str, _: None = Depends(_require_api_auth)) -> list[dict[str, Any]]:
+    """List calls for a project."""
+    with state.session_scope(engine) as session:
+        if session.get(state.Project, project_id) is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        calls = list(session.exec(
+            select(state.Call)
+            .where(state.Call.project_id == project_id)
+            .order_by(state.Call.started_at.desc())
+        ))
+        report_call_ids = set(session.exec(
+            select(state.SynthesisReport.call_id)
+            .where(state.SynthesisReport.call_id.in_([c.id for c in calls]))
+        ))
+        return [_call_to_summary(c, c.id in report_call_ids) for c in calls]
+
+
+@app.get("/calls")
+async def list_calls(limit: int = 50, _: None = Depends(_require_api_auth)) -> list[dict[str, Any]]:
+    """List recent calls across all projects."""
+    with state.session_scope(engine) as session:
+        calls = list(session.exec(
+            select(state.Call).order_by(state.Call.started_at.desc()).limit(limit)
+        ))
+        report_call_ids = set(session.exec(
+            select(state.SynthesisReport.call_id)
+            .where(state.SynthesisReport.call_id.in_([c.id for c in calls]))
+        ))
+        return [_call_to_summary(c, c.id in report_call_ids) for c in calls]
+
+
+# --- Call lifecycle ---------------------------------------------------------
+
+
+class StartCallRequest(BaseModel):
+    product: str | None = None
     phone_number: str | None = None
     product_description: str | None = None
     focus_areas: list[str] = []
     deprioritize: list[str] = []
     investor_thesis: str | None = None
+    scripted_questions: list[str] | None = None
+    project_id: str | None = None
 
 
 @app.post("/calls/start")
 @limiter.limit(settings.calls_start_rate_limit or "9999/hour")
 async def start_call(request: Request, req: StartCallRequest, _: None = Depends(_require_api_auth)) -> JSONResponse:
     """Dial out via Vapi, loading scripted questions from investor_questions.yaml for the given product."""
+    # Resolve project defaults, then apply per-call overrides
+    project: state.Project | None = None
+    if req.project_id:
+        with state.session_scope(engine) as session:
+            project = session.get(state.Project, req.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    product = req.product or (project.product if project else None)
+    if not product:
+        raise HTTPException(status_code=422, detail="product is required when project_id is not provided")
+
+    product_description = req.product_description or (project.product_description if project else None)
+    focus_areas = req.focus_areas or (project.focus_areas if project else [])
+    deprioritize = req.deprioritize or (project.deprioritize if project else [])
+    investor_thesis = req.investor_thesis or (project.investor_thesis if project else None)
+
+    if req.scripted_questions is not None:
+        scripted_questions = req.scripted_questions
+    elif project is not None:
+        scripted_questions = project.scripted_questions
+    else:
+        scripted_questions = _load_default_questions(product)
+
     call_id = str(uuid.uuid4())
-    scripted_questions = _load_default_questions(req.product)
     brain = CallBrain(
-        product_name=req.product,
-        product_description=req.product_description,
-        focus_areas=req.focus_areas,
-        deprioritize=req.deprioritize,
-        investor_thesis=req.investor_thesis,
+        product_name=product,
+        product_description=product_description,
+        focus_areas=focus_areas,
+        deprioritize=deprioritize,
+        investor_thesis=investor_thesis,
     )
 
     wants_dial = bool(req.phone_number and settings.vapi_api_key)
@@ -580,6 +795,7 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
         session.add(
             state.Call(
                 id=call_id,
+                project_id=req.project_id,
                 phone_number=req.phone_number,
                 scripted_questions=scripted_questions,
                 brain=brain.model_dump(),
@@ -594,10 +810,11 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
     logfire.info(
         "call_created",
         call_id=call_id,
+        project_id=req.project_id,
         phone_number=req.phone_number,
         question_count=len(scripted_questions),
-        product=req.product,
-        focus_areas=req.focus_areas,
+        product=product,
+        focus_areas=focus_areas,
         dial_status=dial_status,
     )
 

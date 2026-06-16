@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     webhook_url: str = ""
     llm_secret_token: str = ""   # static secret sent by Vapi in X-Vapi-Secret header; empty = skip check (dev)
     api_auth_token: str = ""  # Bearer for POST /calls/start and DELETE /calls/{id}; empty = skip check (dev)
+    frontend_url: str = ""  # Render frontend URL for CORS; empty = localhost only
 
     # Voice
     vapi_voice_provider: str = "11labs"

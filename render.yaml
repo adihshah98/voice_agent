@@ -3,11 +3,10 @@ services:
     name: voice-agent
     runtime: docker
     dockerfilePath: ./Dockerfile
-    # Render injects DATABASE_URL automatically from the linked database below.
     envVars:
-      # --- Required secrets — set these in the Render dashboard or via render.yaml secrets ---
+      # --- Required secrets — set these in the Render dashboard ---
       - key: ANTHROPIC_API_KEY
-        sync: false          # set manually in dashboard
+        sync: false
       - key: GOOGLE_API_KEY
         sync: false
       - key: GROQ_API_KEY
@@ -30,17 +29,25 @@ services:
         sync: false
       - key: VAPI_VOICE_ID
         sync: false
-      # --- Auto-wired by Render from the database below ---
+      # --- Supabase Postgres — set DATABASE_URL in the Render dashboard ---
       - key: DATABASE_URL
-        fromDatabase:
-          name: voice-agent-db
-          property: connectionString
-      # --- Service URL (set after first deploy, needed for outbound Vapi dials) ---
+        sync: false
+      # --- Service URL (needed for outbound Vapi dials) ---
       - key: WEBHOOK_URL
-        sync: false          # set to https://<your-render-service>.onrender.com after first deploy
+        value: https://voice-agent-ede2.onrender.com
+      # --- Frontend URL for CORS (set after frontend first deploys) ---
+      - key: FRONTEND_URL
+        sync: false
 
-databases:
-  - name: voice-agent-db
-    databaseName: voice_agent
-    user: voice_agent
-    plan: free              # upgrade to starter/standard for production
+  - type: web
+    name: voice-agent-frontend
+    runtime: node
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        value: https://voice-agent-ede2.onrender.com
+      # --- Set this if your backend requires API_AUTH_TOKEN ---
+      - key: NEXT_PUBLIC_API_AUTH_TOKEN
+        sync: false

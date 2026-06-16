@@ -1,11 +1,10 @@
 ## Todo
 
-- Interviewer Brain
-  - Tell it it is diligencing which product & some knowledge abt it 
-  - Tell it which direction to go, where not to spend too much time
-  - If not customization, uses the default
-- Multi-tenant 
-  - Eventual goal is per customer, per call, per project level configurability across many customers, with a frontend to be able to configure it + Multi-tenant auth
+- Voice UX & Flow
+  - Keeps asking take your time
+  - Run E2E Call from frontend
+- Multi-tenant for the frontend - Eventual goal is per customer, per call, per project level configurability across many customers, with a frontend to be able to configure it + Multi-tenant auth
+- Add README.md, Architecture.MD
 
 ---
 
@@ -17,9 +16,8 @@
   - Real feedback loop where previous conversations feed in
     - Across calls, you add a **"project learner"** that compacts call syntheses → a bounded **project brief** (~1–2KB). Same compaction pattern, lifted from call-scope to project-scope. That compacted brief rides in the cached prompt prefix. No turn-time retrieval, ever.
   - When RAG makes sense
-    - Customer **uploads** a big knowledge base (product docs, past decks, Gong transcripts), or
+    - Customer **uploads** a big knowledge base (product docs, past decks, Gong transcripts, website), or
     - you want to **query across hundreds of past interviews** ("what did others say about pricing?").
-
 - Flow
   - What if user has to tend to doorbell and asks agent to pause for 3-5 minutes
 - Evals

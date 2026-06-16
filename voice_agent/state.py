@@ -6,6 +6,7 @@ coordination flows through these tables — agents never call each other.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -30,10 +31,33 @@ DIAL_DIALED = "dialed"
 DIAL_FAILED = "dial_failed"
 
 
+class Project(SQLModel, table=True):
+    __tablename__ = "projects"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    name: str
+    product: str
+    product_description: Optional[str] = None
+    focus_areas: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    deprioritize: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    investor_thesis: Optional[str] = None
+    scripted_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    calls: list["Call"] = Relationship(
+        sa_relationship=relationship(
+            "Call",
+            back_populates="project",
+            cascade="all, delete-orphan",
+        ),
+    )
+
+
 class Call(SQLModel, table=True):
     __tablename__ = "calls"
 
     id: str = Field(primary_key=True)
+    project_id: Optional[str] = Field(default=None, foreign_key="projects.id", index=True)
     vapi_call_id: Optional[str] = Field(default=None, unique=True, index=True)
     phone_number: Optional[str] = None
     scripted_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -46,6 +70,9 @@ class Call(SQLModel, table=True):
     started_at: datetime = Field(default_factory=_utcnow)
     ended_at: Optional[datetime] = None
 
+    project: Optional["Project"] = Relationship(
+        sa_relationship=relationship("Project", back_populates="calls"),
+    )
     turns: list["Turn"] = Relationship(
         sa_relationship=relationship(
             "Turn",
