@@ -9,6 +9,7 @@ Requires ANTHROPIC_API_KEY in .env. Run with:
 
 Pass criteria:
     - ActionMatches >= 90%  (action + probe_source when specified)
+    - ClarifyKindMatches 100% (deterministic) — silence-style vs vague-style clarify wording
     - UtteranceWarmth average >= 4 / 5
     - SingleQuestion 100% (deterministic)
     - NoLeadingQuestions >= 90%
@@ -30,6 +31,7 @@ from voice_agent import state
 from evals.cases import InterviewerCaseInputs, load_cases
 from evals.evaluators import (
     ActionMatches,
+    ClarifyKindMatches,
     SingleQuestion,
     no_leading_questions_judge,
     response_relevance_judge,
@@ -48,6 +50,7 @@ WARMTH_THRESHOLD = 4.0
 NON_LEADING_THRESHOLD = 0.90
 RESPONSE_RELEVANT_THRESHOLD = 0.90
 SINGLE_QUESTION_THRESHOLD = 1.0
+CLARIFY_KIND_THRESHOLD = 1.0
 
 
 def _seed_engine(inputs: InterviewerCaseInputs):
@@ -143,6 +146,7 @@ async def test_tier1_interviewer_decisions():
         cases=load_cases(DATASET_PATH),
         evaluators=(
             ActionMatches(),
+            ClarifyKindMatches(),
             SingleQuestion(),
             utterance_warmth_judge(),
             no_leading_questions_judge(),
@@ -176,6 +180,10 @@ async def test_tier1_interviewer_decisions():
     assert scores.get("SingleQuestion", 0) >= SINGLE_QUESTION_THRESHOLD, (
         "Interviewer stacked multiple questions in a single utterance"
     )
+    assert scores.get("ClarifyKindMatches", 0) >= CLARIFY_KIND_THRESHOLD, (
+        "Interviewer said the wrong kind of clarify line (e.g. \"Take your time.\" for a "
+        "vague-but-present answer, or vice versa) — see ClarifyKindMatches"
+    )
     warmth = scores.get("utterance_warmth")
     if warmth is not None:
         assert warmth >= WARMTH_THRESHOLD, (
@@ -197,7 +205,7 @@ async def test_tier1_interviewer_decisions():
 
 def _print_per_case(report) -> None:
     """Print a table: case | expected | actual | scores | utterance, then failures."""
-    header = f"{'case':<40} {'exp':>12} {'got':>12} {'AM':>5} {'SQ':>4} {'NL':>4} {'RR':>4} {'W':>5}  utterance"
+    header = f"{'case':<40} {'exp':>12} {'got':>12} {'AM':>5} {'CK':>4} {'SQ':>4} {'NL':>4} {'RR':>4} {'W':>5}  utterance"
     print(f"\nTier 1 per-case results:\n{header}\n{'-' * len(header)}")
 
     def _bool(src, key) -> str:
@@ -226,11 +234,12 @@ def _print_per_case(report) -> None:
         if len(utterance) > 50:
             utterance = utterance[:50] + "…"
         am = _num(case.scores, "ActionMatches")
+        ck = _num(case.scores, "ClarifyKindMatches")
         sq = _bool(case.assertions, "SingleQuestion")
         nl = _bool(case.assertions, "non_leading")
         rr = _bool(case.assertions, "response_relevant")
         w  = _num(case.scores, "utterance_warmth")
-        print(f"{(case.name or ''):<40} {exp:>12} {got:>12} {am} {sq} {nl} {rr} {w}  {utterance}")
+        print(f"{(case.name or ''):<40} {exp:>12} {got:>12} {am} {ck} {sq} {nl} {rr} {w}  {utterance}")
 
     for fail in report.failures:
         exp = _action_label(fail.expected_output)

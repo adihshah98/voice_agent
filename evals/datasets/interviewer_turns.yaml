@@ -276,6 +276,7 @@ cases:
       last_respondent: "It's... fine I guess? kind of."
     expected_output:
       action: clarify
+      utterance: vague  # sentinel for ClarifyKindMatches — has real words (not silence) → "What do you mean by that?", never "Take your time."
 
   - name: one_word_vague
     inputs:
@@ -292,6 +293,7 @@ cases:
       last_respondent: "Mixed."
     expected_output:
       action: clarify
+      utterance: vague  # sentinel for ClarifyKindMatches — a real (if terse) word, not silence → "What do you mean by that?"
 
   - name: noncommittal_maybe
     inputs:
@@ -307,6 +309,7 @@ cases:
       last_respondent: "Maybe."
     expected_output:
       action: clarify
+      utterance: vague  # sentinel for ClarifyKindMatches — a real word, not silence → "What do you mean by that?"
 
   # --- wrap_up (respondent signals end, or nothing left to ask) -----------
 
@@ -400,6 +403,7 @@ cases:
       last_respondent: "[silence]"
     expected_output:
       action: clarify
+      utterance: silence  # sentinel for ClarifyKindMatches — expects "Take your time."/"Still there?", not "What do you mean by that?"
 
   - name: thinking_filler_clarify
     inputs:
@@ -415,6 +419,7 @@ cases:
       last_respondent: "Um... uh... hmm."
     expected_output:
       action: clarify
+      utterance: silence  # sentinel for ClarifyKindMatches — pure filler, no real words → "Take your time."
 
   # --- probe (investor-relevant triggers, with analyst lag) -----------------
 

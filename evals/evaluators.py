@@ -67,6 +67,48 @@ class ActionMatches(
         return 1.0
 
 
+_SILENCE_STYLE_RE = re.compile(r"^(take your time\.?|still there\??)$", re.IGNORECASE)
+
+
+@dataclass
+class ClarifyKindMatches(
+    Evaluator[InterviewerCaseInputs, InterviewerOutput, None]
+):
+    """For clarify cases, the wording must match the *kind* of clarify expected.
+
+    `action == "clarify"` covers two distinct situations that must never be
+    confused (see NODE 1 vs NODE 2 in INTERVIEWER_PROMPT):
+      - silence-style: "Take your time." / "Still there?" — for true silence
+        or pure thinking-filler turns with no actual words.
+      - vague-style: "What do you mean by that?" — for turns that have real
+        words but no substance (a hedge, a non-answer).
+
+    ActionMatches alone can't catch a regression where the model says "Take
+    your time." to a respondent who actually answered (just vaguely) — both
+    outputs have action=clarify, so it would pass ActionMatches but be the
+    wrong thing to say out loud. This evaluator only judges cases where
+    `expected_output.utterance` encodes which kind via the sentinel below.
+
+    Skipped (returns 1.0) for any case that isn't a clarify case, or doesn't
+    specify an expected utterance kind — most clarify cases were written
+    before this distinction was tracked and remain action-only.
+    """
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[InterviewerCaseInputs, InterviewerOutput, None],
+    ) -> float:
+        if ctx.expected_output is None or ctx.expected_output.action != "clarify":
+            return 1.0
+        expected_kind = ctx.expected_output.utterance  # "silence" | "vague" | ""
+        if expected_kind not in ("silence", "vague"):
+            return 1.0
+        if ctx.output.action != "clarify":
+            return 0.0
+        is_silence_style = bool(_SILENCE_STYLE_RE.match(_clean_utterance(ctx.output.utterance)))
+        return 1.0 if is_silence_style == (expected_kind == "silence") else 0.0
+
+
 @dataclass
 class SingleQuestion(
     Evaluator[InterviewerCaseInputs, InterviewerOutput, None]
