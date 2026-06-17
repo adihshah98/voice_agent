@@ -127,6 +127,14 @@ async def auth_google_callback(request: Request, code: str | None = None, error:
     """Exchange Google auth code for a JWT, then redirect to the frontend."""
     frontend = (settings.frontend_url or "http://localhost:3000").rstrip("/")
 
+    logfire.info(
+        "auth_callback_entry",
+        has_code=bool(code),
+        error=error,
+        redirect_uri=_callback_url(request),
+        query_params=str(request.query_params),
+    )
+
     if error or not code:
         return RedirectResponse(f"{frontend}/login?error={error or 'no_code'}")
 
@@ -144,13 +152,14 @@ async def auth_google_callback(request: Request, code: str | None = None, error:
         )
         userinfo = userinfo_resp.json()
     except Exception as exc:
-        logfire.exception("google_oauth_error")
+        logfire.exception("google_oauth_error", error=str(exc), redirect_uri=redirect_uri)
         return RedirectResponse(f"{frontend}/login?error=oauth_failed")
 
     with state.session_scope(engine) as session:
         try:
             principal = _upsert_user_and_get_principal(session, userinfo)
         except HTTPException as exc:
+            logfire.warning("auth_no_access", email=userinfo.get("email"), detail=exc.detail)
             return RedirectResponse(f"{frontend}/login?error=no_access")
 
     jwt_token = _issue_jwt(principal)
