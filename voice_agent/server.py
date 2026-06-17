@@ -163,25 +163,20 @@ async def auth_google_callback(request: Request, code: str | None = None, error:
     jwt_token = _issue_jwt(principal)
     logfire.info("user_logged_in", user_id=principal.user_id, org_id=principal.org_id)
 
-    response = RedirectResponse(f"{frontend}/")
-    response.set_cookie(
-        "access_token",
-        jwt_token,
-        httponly=True,
-        secure=frontend.startswith("https"),
-        samesite="lax",
-        max_age=settings.jwt_expire_days * 86400,
-        path="/",
-    )
+    # Pass token in redirect URL so the frontend can store it.
+    # Cross-origin deployments (different Render subdomains) can't share cookies,
+    # so we hand the JWT off via URL param. The frontend strips it from the URL
+    # immediately after storing it in localStorage.
+    # Long-term fix: move to a shared custom domain (e.g. api.corvera.ai +
+    # app.corvera.ai) and set an HttpOnly cookie on .corvera.ai with SameSite=lax.
+    response = RedirectResponse(f"{frontend}/?token={jwt_token}")
     return response
 
 
 @app.post("/auth/logout")
 async def auth_logout(request: Request):
-    frontend = (settings.frontend_url or "http://localhost:3000").rstrip("/")
-    response = RedirectResponse(f"{frontend}/login")
-    response.delete_cookie("access_token", path="/")
-    return response
+    # Token is stored in frontend localStorage; clearing it is handled client-side.
+    return JSONResponse({"status": "logged_out"})
 
 
 @app.get("/auth/me")
