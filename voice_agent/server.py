@@ -146,10 +146,8 @@ async def auth_google_callback(request: Request, code: str | None = None, error:
             code=code,
             redirect_uri=redirect_uri,
         )
-        userinfo_resp = await client.get(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
-            token=token,
-        )
+        client.token = token
+        userinfo_resp = await client.get("https://www.googleapis.com/oauth2/v3/userinfo")
         userinfo = userinfo_resp.json()
     except Exception as exc:
         logfire.exception("google_oauth_error", error=str(exc), redirect_uri=redirect_uri)
