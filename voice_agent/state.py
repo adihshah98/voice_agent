@@ -30,11 +30,58 @@ DIAL_DIALING = "dialing"
 DIAL_DIALED = "dialed"
 DIAL_FAILED = "dial_failed"
 
+DEFAULT_ORG_ID = "00000000-0000-0000-0000-000000000001"
+
+
+class Organization(SQLModel, table=True):
+    __tablename__ = "organizations"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    name: str
+    slug: str = Field(unique=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    members: list["OrgMember"] = Relationship(
+        sa_relationship=relationship("OrgMember", back_populates="org", cascade="all, delete-orphan"),
+    )
+    projects: list["Project"] = Relationship(
+        sa_relationship=relationship("Project", back_populates="org"),
+    )
+
+
+class User(SQLModel, table=True):
+    __tablename__ = "users"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    email: str = Field(unique=True, index=True)
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    google_sub: Optional[str] = Field(default=None, unique=True, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    memberships: list["OrgMember"] = Relationship(
+        sa_relationship=relationship("OrgMember", back_populates="user", cascade="all, delete-orphan"),
+    )
+
+
+class OrgMember(SQLModel, table=True):
+    __tablename__ = "org_members"
+
+    org_id: str = Field(foreign_key="organizations.id", primary_key=True, index=True)
+    user_id: str = Field(foreign_key="users.id", primary_key=True, index=True)
+    role: str = Field(default="member")  # "admin" | "member"
+    invited_at: datetime = Field(default_factory=_utcnow)
+    joined_at: Optional[datetime] = None
+
+    org: Organization = Relationship(sa_relationship=relationship("Organization", back_populates="members"))
+    user: User = Relationship(sa_relationship=relationship("User", back_populates="memberships"))
+
 
 class Project(SQLModel, table=True):
     __tablename__ = "projects"
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    org_id: str = Field(default=DEFAULT_ORG_ID, foreign_key="organizations.id", index=True)
     name: str
     product: str
     product_description: Optional[str] = None
@@ -44,6 +91,9 @@ class Project(SQLModel, table=True):
     scripted_questions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=_utcnow)
 
+    org: Optional["Organization"] = Relationship(
+        sa_relationship=relationship("Organization", back_populates="projects"),
+    )
     calls: list["Call"] = Relationship(
         sa_relationship=relationship(
             "Call",
@@ -57,6 +107,7 @@ class Call(SQLModel, table=True):
     __tablename__ = "calls"
 
     id: str = Field(primary_key=True)
+    org_id: str = Field(default=DEFAULT_ORG_ID, foreign_key="organizations.id", index=True)
     project_id: Optional[str] = Field(default=None, foreign_key="projects.id", index=True)
     vapi_call_id: Optional[str] = Field(default=None, unique=True, index=True)
     phone_number: Optional[str] = None

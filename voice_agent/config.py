@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     api_auth_token: str = ""  # Bearer for POST /calls/start and DELETE /calls/{id}; empty = skip check (dev)
     frontend_url: str = ""  # Render frontend URL for CORS; empty = localhost only
 
+    # Multi-tenant auth (Google OAuth + JWT)
+    google_client_id: str = ""       # GOOGLE_CLIENT_ID from Google Cloud Console
+    google_client_secret: str = ""   # GOOGLE_CLIENT_SECRET
+    jwt_secret: str = ""             # HS256 signing secret; empty = skip JWT check (dev)
+    jwt_algorithm: str = "HS256"
+    jwt_expire_days: int = 7
+    admin_bootstrap_email: str = ""  # ADMIN_BOOTSTRAP_EMAIL: grants admin on first login if set
+
     # Voice
     vapi_voice_provider: str = "11labs"
     vapi_voice_id: str | None = None  # default depends on provider

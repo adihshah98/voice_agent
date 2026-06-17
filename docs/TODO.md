@@ -1,11 +1,5 @@
 ## Todo
 
-- Run E2E Call from frontend
-  - Very high latency
-  - No probing 
-- Multi-tenant for the frontend - Eventual goal is per customer, per call, per project level configurability across many customers, with a frontend to be able to configure it + Multi-tenant auth
-- Add README.md, Architecture.MD
-
 ---
 
 ---

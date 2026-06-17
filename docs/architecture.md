@@ -28,7 +28,7 @@ An AI-powered outbound interviewer that conducts structured investor/user resear
                             │    {call_id: "..."}}}                   ├─ fetch context: next_q,
                             │                                         │   probes, snapshot (DB)
                             │                                         └─ interviewer LLM call
-                            │                                              (Haiku 4.5, 5s budget)
+                            │                                              (Haiku 4.5 + fallback chain, 5s budget)
                             │◄── SSE chunks (OpenAI format) ──────────
                             │    delta: "Tell me more about..."
   ◄── TTS audio ────────────│    ...
@@ -148,13 +148,15 @@ All three are PydanticAI agents with Anthropic backends. Models and flags live i
 The only real-time agent. Runs synchronously from the caller's perspective (Vapi waits for a response).
 
 
-| Property    | Value                                                             |
-| ----------- | ----------------------------------------------------------------- |
-| Model       | `claude-haiku-4-5-20251001`                                       |
-| Deadline    | 5 s (`anyio.move_on_after`)                                       |
-| Output type | `InterviewerOutput` (utterance, action, reasoning, probe_id_used) |
-| Fallback    | Next scripted question (or `wrap_up` if none remain)              |
+| Property      | Value                                                             |
+| ------------- | ----------------------------------------------------------------- |
+| Primary model | `claude-haiku-4-5-20251001`                                       |
+| Model chain   | OpenAI gpt-4.1-mini (opt) → Haiku 4.5 → Gemini 2.0 Flash → Groq llama-3.3-70b → Cerebras llama3.1-8b (opt) |
+| Deadline      | 5 s (`anyio.move_on_after`)                                       |
+| Output type   | `InterviewerOutput` (utterance, action, reasoning, probe_id_used) |
+| Timeout fallback | Next scripted question (or `wrap_up` if none remain)           |
 
+**Model chain (`_build_interviewer_model`)** is a PydanticAI `FallbackModel`. The OpenAI tier is prepended only when `OPENAI_API_KEY` + `OPENAI_MODEL` are set; Cerebras is appended only when `CEREBRAS_API_KEY` + `CEREBRAS_MODEL` are set. Each model is constructed explicitly with its provider so keys come from pydantic-settings, not import-time env. Gemini runs with `thinking_budget=0` to cap reasoning latency. The chain advances on transient/parse failures (`fallback_on=_log_and_fallback`); the 5 s deadline is a separate, outer guard that triggers the scripted fallback regardless of which model is in flight.
 
 **Not a tool loop.** All DB state is pre-fetched into a text `[CONTEXT]` block before the LLM call. The model returns a single structured output; Python applies side effects after. This was a deliberate deviation from the original PLAN.md design (which described a ReAct tool loop) — it eliminates the latency risk of multi-round tool calls within a 5 s budget.
 
@@ -317,25 +319,38 @@ Lifecycle events only, no LLM calls.
 | `DELETE /calls/{id}`     | Ends call locally + cancels in-flight Vapi call               |
 
 
-**Outbound dialing (`_dial_vapi`):** POSTs to `https://api.vapi.ai/call/phone`. Key fields:
+**Outbound dialing (`_dial_vapi`):** POSTs to `https://api.vapi.ai/call`. Key fields:
 
-- `assistant.model`: `{provider: "custom-llm", url: "{WEBHOOK_URL}/vapi/llm"}`
-- `assistant.serverUrl`: `{WEBHOOK_URL}/vapi/webhook`  
+- `assistant.model`: `{provider: "custom-llm", url: "{WEBHOOK_URL}/vapi/llm/chat/completions"}` (+ `X-Vapi-Secret` header when `LLM_SECRET_TOKEN` is set)
+- `assistant.server.url`: `{WEBHOOK_URL}/vapi/webhook` (+ `credentialId` when `VAPI_SERVER_CREDENTIAL_ID` is set, for HMAC signing)
 - `assistant.metadata`: `{"call_id": call_id}` — the recovery key used by both endpoints
-- `assistant.transcriber`: Deepgram nova-2
-- `assistant.voice`: ElevenLabs by default (voice ID `21m00Tcm4TlvDq8ikWAM`), or Vapi's built-in Elliot if `VAPI_VOICE_PROVIDER=vapi`
+- `assistant.transcriber`: Deepgram `flux-general-en` (`eotThreshold` 0.7, `eotTimeoutMs` 4500)
+- `assistant.voice`: ElevenLabs by default (`VAPI_VOICE_ID`), or Vapi's built-in Elliot if `VAPI_VOICE_PROVIDER=vapi`
+- `assistant.hooks`: the `customer.speech.timeout` dead-air ladder (when `VAPI_SILENCE_TIMEOUT_SECONDS > 0`)
 
-**Known race condition:** `vapi_call_id` is written to DB after `POST /call/phone` returns, but Vapi can fire `status-update: ringing` before that write commits. Works in practice (ringing fires hundreds of ms later) but is not atomic. Tracked in `docs/TODO.md`.
+**Known race condition:** `vapi_call_id` is written to DB after `POST /call` returns, but Vapi can fire `status-update: ringing` before that write commits. Works in practice (ringing fires hundreds of ms later) but is not atomic. Tracked in `docs/TODO.md`.
 
 ---
 
 ## Data Model — `voice_agent/state.py`
 
-All SQLModel tables. Schema is SQLite in dev but Postgres-compatible.
+All SQLModel tables. SQLite in dev, **Postgres in production** (`DATABASE_URL`). Schema is managed by **Alembic** migrations in `alembic/versions/` — `init_db()` calls `create_all()` only for in-memory SQLite (tests/evals); every other DB is migrated with `alembic upgrade head` (run automatically on container boot).
+
+**Multi-tenant model:** every `Project` and `Call` is scoped to an `Organization`. Users authenticate via Google OAuth; an `OrgMember` row (composite PK `org_id` + `user_id`) ties a `User` to an org with a `role` (`admin` | `member`). All REST reads/writes filter by the caller's `org_id` (from the JWT principal). See `voice_agent/auth.py`.
 
 ```
+organizations ──< org_members >── users
+     │
+     └──< projects ──< calls ──< turns
+                          ├──< probes
+                          ├──< analyst_snapshots
+                          └──< synthesis_report (1:1)
+
 calls
 ├── id (PK, our UUID)
+├── org_id (FK → organizations)
+├── project_id (FK → projects, nullable)
+├── brain (JSON — serialized CallBrain strategic brief)
 ├── vapi_call_id (Vapi's ID after dial; unique when set — multiple NULLs allowed pre-dial)
 ├── phone_number
 ├── scripted_questions (JSON list)
@@ -381,6 +396,55 @@ synthesis_reports
 - `turns_since(after_turn)` — incremental analyst context reads.
 - `session_scope(engine)` — context manager: commit on success, rollback on exception.
 - `make_engine(url)` — `:memory:` → `StaticPool` (tests); file SQLite → `NullPool`; Postgres → default pool.
+
+---
+
+## Auth & Multi-tenancy — `voice_agent/auth.py`
+
+Google OAuth (authorization-code) + JWT sessions. Org-scoped data isolation.
+
+**Login flow:**
+
+```
+GET /auth/google           → redirect to Google consent screen
+GET /auth/google/callback  → exchange code → userinfo → upsert User → find OrgMember
+                             → issue JWT → set httpOnly access_token cookie → redirect to frontend
+GET /auth/me               → decode JWT → { user_id, org_id, role, email, name }
+POST /auth/logout          → clear cookie
+```
+
+JWT payload: `{ sub: user_id, org_id, role, email, exp }`. `require_auth` (FastAPI dependency)
+decodes it into an `AuthPrincipal`; `require_admin` additionally enforces `role == "admin"`.
+The token is accepted from either the `access_token` cookie (set by the callback) or an
+`Authorization: Bearer` header.
+
+**Dev mode:** when `JWT_SECRET=""`, `require_auth` returns a fake admin principal in
+`DEFAULT_ORG_ID` — the whole app works with no OAuth configured. A user with no org
+membership is rejected with 403 (`ADMIN_BOOTSTRAP_EMAIL` can grant admin on first login).
+
+**Org-scoping invariant:** every REST handler filters `Project`/`Call` queries by
+`principal.org_id`. There is no cross-org read path; admin routes (`/orgs/me/members`)
+only mutate the caller's own org.
+
+## Frontend — `frontend/`
+
+Next.js 16 + React 19 + Tailwind operator UI. Pages: project list/detail, new project,
+start call, call detail + report, settings (org members), login. The API client is
+`frontend/src/lib/api.ts` — all requests send `credentials: "include"` (cookie auth) and
+redirect to `/login` on 401.
+
+> ⚠️ This Next.js version has breaking changes vs. common training data. **Read
+> `frontend/AGENTS.md` and `node_modules/next/dist/docs/` before editing frontend code.**
+
+## Deployment
+
+- **Backend:** Dockerized (`Dockerfile`, `python:3.12-slim`, `uv sync --frozen --no-dev`).
+  Container CMD runs `alembic upgrade head` then `uvicorn`. Deployed on Render via
+  `render.yaml` as a `web` service; secrets set in the Render dashboard (`sync: false`).
+- **Frontend:** Render Node `web` service (`npm install && npm run build` / `npm start`),
+  `NEXT_PUBLIC_API_URL` points at the backend service.
+- **Database:** Supabase/Render Postgres in prod (`DATABASE_URL`). `make_engine` normalizes
+  bare `postgres://` URLs to `postgresql+psycopg2://`.
 
 ---
 
@@ -475,15 +539,22 @@ LLM judge model: `claude-sonnet-4-6` (defined in `evals/evaluators.py`).
 **Environment variables** (see `.env.example`):
 
 
-| Var                   | Required        | Purpose                                           |
-| --------------------- | --------------- | ------------------------------------------------- |
-| `ANTHROPIC_API_KEY`   | Yes             | All LLM calls                                     |
-| `VAPI_API_KEY`        | For phone calls | Vapi outbound dialing                             |
-| `WEBHOOK_URL`         | For phone calls | Public URL Vapi POSTs to (ngrok in dev)           |
-| `DATABASE_URL`        | No              | Defaults to `sqlite:///voice_agent.db`            |
-| `LOGFIRE_TOKEN`       | No              | Enables Logfire cloud export                      |
-| `LOGFIRE_PROJECT`     | No              | Defaults to `"voice-agent"`                       |
-| `VAPI_VOICE_PROVIDER` | No              | `"vapi"` for Elliot voice; defaults to ElevenLabs |
+| Var                                          | Required        | Purpose                                                          |
+| -------------------------------------------- | --------------- | --------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`                          | Yes             | All Anthropic LLM calls                                          |
+| `GOOGLE_API_KEY` / `GROQ_API_KEY` / `CEREBRAS_API_KEY` | No    | Interviewer fallback chain tiers (degrade gracefully if unset)  |
+| `OPENAI_API_KEY`                             | No              | Adds gpt-4.1-mini as the first interviewer tier                 |
+| `VAPI_API_KEY`, `VAPI_PHONE_NUMBER_ID`       | For phone calls | Vapi outbound dialing                                           |
+| `WEBHOOK_URL`                                | For phone calls | Public URL Vapi POSTs to (ngrok in dev)                         |
+| `VAPI_WEBHOOK_SECRET`, `LLM_SECRET_TOKEN`    | Prod            | Webhook HMAC / custom-LLM endpoint secret (empty = dev skip)    |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`  | Multi-tenant    | Google OAuth login                                              |
+| `JWT_SECRET`                                 | Multi-tenant    | JWT signing; empty = dev superuser mode                         |
+| `API_AUTH_TOKEN`                             | No              | Static bearer for protected endpoints (empty = dev skip)        |
+| `FRONTEND_URL`                               | Prod            | Frontend origin for CORS + OAuth redirect                       |
+| `DATABASE_URL`                               | Prod            | Postgres URL; defaults to `sqlite:///voice_agent.db`            |
+| `LOGFIRE_TOKEN`                              | No              | Enables Logfire cloud export (console-only when unset)          |
+| `LOGFIRE_PROJECT`                            | No              | Defaults to `"research-agent"`                                  |
+| `VAPI_VOICE_PROVIDER`                        | No              | `"vapi"` for Elliot voice; defaults to `"11labs"` (ElevenLabs)  |
 
 
 ---

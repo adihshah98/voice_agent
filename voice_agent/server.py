@@ -28,7 +28,7 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -38,6 +38,15 @@ from sqlalchemy import update
 from sqlmodel import Session, select
 from voice_agent import state
 from voice_agent.agents.synthesis import SynthesisDeps, run_synthesis_safely as _synthesis_safely
+from voice_agent.auth import (
+    AuthPrincipal,
+    _callback_url,
+    _google_client,
+    _issue_jwt,
+    _upsert_user_and_get_principal,
+    require_admin,
+    require_auth,
+)
 from voice_agent.config import ENABLE_SYNTHESIS_REPORT, VAPI_TIMESTAMP_TOLERANCE_S, settings
 from voice_agent.models import CallBrain
 from voice_agent.tracing import agent_span, init_tracing
@@ -88,11 +97,177 @@ _frontend_origins = [o for o in [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_frontend_origins,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
+
+
+# --- Auth routes (Google OAuth + JWT) ---------------------------------------
+
+
+@app.get("/auth/google")
+async def auth_google(request: Request):
+    """Redirect the browser to Google's OAuth consent screen."""
+    if not settings.google_client_id:
+        raise HTTPException(status_code=501, detail="Google OAuth not configured (GOOGLE_CLIENT_ID missing)")
+    client = _google_client()
+    redirect_uri = _callback_url(request)
+    uri, _ = client.create_authorization_url(
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        redirect_uri=redirect_uri,
+        access_type="online",
+    )
+    return RedirectResponse(uri)
+
+
+@app.get("/auth/google/callback")
+async def auth_google_callback(request: Request, code: str | None = None, error: str | None = None):
+    """Exchange Google auth code for a JWT, then redirect to the frontend."""
+    frontend = (settings.frontend_url or "http://localhost:3000").rstrip("/")
+
+    if error or not code:
+        return RedirectResponse(f"{frontend}/login?error={error or 'no_code'}")
+
+    client = _google_client()
+    redirect_uri = _callback_url(request)
+    try:
+        token = await client.fetch_token(
+            "https://oauth2.googleapis.com/token",
+            code=code,
+            redirect_uri=redirect_uri,
+        )
+        userinfo_resp = await client.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            token=token,
+        )
+        userinfo = userinfo_resp.json()
+    except Exception as exc:
+        logfire.exception("google_oauth_error")
+        return RedirectResponse(f"{frontend}/login?error=oauth_failed")
+
+    with state.session_scope(engine) as session:
+        try:
+            principal = _upsert_user_and_get_principal(session, userinfo)
+        except HTTPException as exc:
+            return RedirectResponse(f"{frontend}/login?error=no_access")
+
+    jwt_token = _issue_jwt(principal)
+    logfire.info("user_logged_in", user_id=principal.user_id, org_id=principal.org_id)
+
+    response = RedirectResponse(f"{frontend}/")
+    response.set_cookie(
+        "access_token",
+        jwt_token,
+        httponly=True,
+        secure=frontend.startswith("https"),
+        samesite="lax",
+        max_age=settings.jwt_expire_days * 86400,
+        path="/",
+    )
+    return response
+
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request):
+    frontend = (settings.frontend_url or "http://localhost:3000").rstrip("/")
+    response = RedirectResponse(f"{frontend}/login")
+    response.delete_cookie("access_token", path="/")
+    return response
+
+
+@app.get("/auth/me")
+async def auth_me(principal: AuthPrincipal = Depends(require_auth)) -> dict[str, Any]:
+    """Return current user identity and org."""
+    return {
+        "user_id": principal.user_id,
+        "org_id": principal.org_id,
+        "role": principal.role,
+        "email": principal.email,
+        "name": principal.name,
+    }
+
+
+# --- Org management routes (admin only) -------------------------------------
+
+
+class InviteUserRequest(BaseModel):
+    email: str
+    role: str = "member"  # "admin" | "member"
+
+
+@app.get("/orgs/me")
+async def get_org(principal: AuthPrincipal = Depends(require_auth)) -> dict[str, Any]:
+    """Return the current org and its members."""
+    with state.session_scope(engine) as session:
+        org = session.get(state.Organization, principal.org_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        members = list(session.exec(
+            select(state.OrgMember, state.User)
+            .join(state.User, state.OrgMember.user_id == state.User.id)
+            .where(state.OrgMember.org_id == principal.org_id)
+        ))
+        return {
+            "id": org.id,
+            "name": org.name,
+            "slug": org.slug,
+            "created_at": org.created_at.isoformat(),
+            "members": [
+                {
+                    "user_id": m.user_id,
+                    "email": u.email,
+                    "name": u.name,
+                    "avatar_url": u.avatar_url,
+                    "role": m.role,
+                    "joined_at": m.joined_at.isoformat() if m.joined_at else None,
+                }
+                for m, u in members
+            ],
+        }
+
+
+@app.post("/orgs/me/members", status_code=201)
+async def invite_member(
+    req: InviteUserRequest,
+    principal: AuthPrincipal = Depends(require_admin),
+) -> dict[str, Any]:
+    """Invite a user by email. Creates the user account if it doesn't exist yet."""
+    if req.role not in ("admin", "member"):
+        raise HTTPException(status_code=422, detail="role must be 'admin' or 'member'")
+    with state.session_scope(engine) as session:
+        user = session.exec(select(state.User).where(state.User.email == req.email)).first()
+        if user is None:
+            user = state.User(email=req.email)
+            session.add(user)
+            session.flush()
+
+        existing = session.get(state.OrgMember, (principal.org_id, user.id))
+        if existing:
+            raise HTTPException(status_code=409, detail="User is already a member")
+
+        membership = state.OrgMember(org_id=principal.org_id, user_id=user.id, role=req.role)
+        session.add(membership)
+        logfire.info("member_invited", org_id=principal.org_id, email=req.email, role=req.role, invited_by=principal.user_id)
+        return {"user_id": user.id, "email": user.email, "role": req.role, "status": "invited"}
+
+
+@app.delete("/orgs/me/members/{user_id}")
+async def remove_member(
+    user_id: str,
+    principal: AuthPrincipal = Depends(require_admin),
+) -> dict[str, str]:
+    """Remove a member from the org. Admins cannot remove themselves."""
+    if user_id == principal.user_id:
+        raise HTTPException(status_code=400, detail="Cannot remove yourself")
+    with state.session_scope(engine) as session:
+        membership = session.get(state.OrgMember, (principal.org_id, user_id))
+        if membership is None:
+            raise HTTPException(status_code=404, detail="Member not found")
+        session.delete(membership)
+    logfire.info("member_removed", org_id=principal.org_id, removed_user_id=user_id, by=principal.user_id)
+    return {"user_id": user_id, "status": "removed"}
 
 
 def _end_call_vapi_delete(call_id: str, end_reason: str) -> None:
@@ -579,10 +754,14 @@ def _project_to_dict(project: state.Project, call_count: int = 0) -> dict[str, A
 
 
 @app.post("/projects", status_code=201)
-async def create_project(req: CreateProjectRequest, _: None = Depends(_require_api_auth)) -> dict[str, Any]:
+async def create_project(
+    req: CreateProjectRequest,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> dict[str, Any]:
     """Create a research project with default or custom scripted questions."""
     questions = req.scripted_questions if req.scripted_questions is not None else _load_default_questions(req.product)
     project = state.Project(
+        org_id=principal.org_id,
         name=req.name,
         product=req.product,
         product_description=req.product_description,
@@ -597,13 +776,14 @@ async def create_project(req: CreateProjectRequest, _: None = Depends(_require_a
 
 
 @app.get("/projects")
-async def list_projects(_: None = Depends(_require_api_auth)) -> list[dict[str, Any]]:
-    """List all projects with call counts."""
+async def list_projects(principal: AuthPrincipal = Depends(require_auth)) -> list[dict[str, Any]]:
+    """List all projects for the caller's org with call counts."""
     from sqlalchemy import func as sa_func
     with state.session_scope(engine) as session:
         rows = session.exec(
             select(state.Project, sa_func.count(state.Call.id).label("call_count"))
             .outerjoin(state.Call, state.Call.project_id == state.Project.id)
+            .where(state.Project.org_id == principal.org_id)
             .group_by(state.Project.id)
             .order_by(state.Project.created_at.desc())
         ).all()
@@ -611,14 +791,17 @@ async def list_projects(_: None = Depends(_require_api_auth)) -> list[dict[str, 
 
 
 @app.get("/projects/{project_id}")
-async def get_project(project_id: str, _: None = Depends(_require_api_auth)) -> dict[str, Any]:
+async def get_project(
+    project_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> dict[str, Any]:
     """Get project detail with call count."""
     from sqlalchemy import func as sa_func
     with state.session_scope(engine) as session:
         row = session.exec(
             select(state.Project, sa_func.count(state.Call.id).label("call_count"))
             .outerjoin(state.Call, state.Call.project_id == state.Project.id)
-            .where(state.Project.id == project_id)
+            .where(state.Project.id == project_id, state.Project.org_id == principal.org_id)
             .group_by(state.Project.id)
         ).first()
         if row is None:
@@ -628,10 +811,15 @@ async def get_project(project_id: str, _: None = Depends(_require_api_auth)) -> 
 
 
 @app.delete("/projects/{project_id}")
-async def delete_project(project_id: str, _: None = Depends(_require_api_auth)) -> dict[str, str]:
+async def delete_project(
+    project_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> dict[str, str]:
     """Delete a project and its calls (cascades via ORM relationship)."""
     with state.session_scope(engine) as session:
-        project = session.get(state.Project, project_id)
+        project = session.exec(
+            select(state.Project).where(state.Project.id == project_id, state.Project.org_id == principal.org_id)
+        ).first()
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
         session.delete(project)
@@ -639,11 +827,17 @@ async def delete_project(project_id: str, _: None = Depends(_require_api_auth)) 
 
 
 @app.patch("/projects/{project_id}")
-async def patch_project(project_id: str, req: PatchProjectRequest, _: None = Depends(_require_api_auth)) -> dict[str, Any]:
+async def patch_project(
+    project_id: str,
+    req: PatchProjectRequest,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> dict[str, Any]:
     """Update project fields. Only provided (non-null) fields are changed."""
     from sqlalchemy import func as sa_func
     with state.session_scope(engine) as session:
-        project = session.get(state.Project, project_id)
+        project = session.exec(
+            select(state.Project).where(state.Project.id == project_id, state.Project.org_id == principal.org_id)
+        ).first()
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
         if req.name is not None:
@@ -682,10 +876,15 @@ def _call_to_summary(call: state.Call, has_report: bool = False) -> dict[str, An
 
 
 @app.get("/projects/{project_id}/calls")
-async def list_project_calls(project_id: str, _: None = Depends(_require_api_auth)) -> list[dict[str, Any]]:
+async def list_project_calls(
+    project_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> list[dict[str, Any]]:
     """List calls for a project."""
     with state.session_scope(engine) as session:
-        if session.get(state.Project, project_id) is None:
+        if session.exec(
+            select(state.Project).where(state.Project.id == project_id, state.Project.org_id == principal.org_id)
+        ).first() is None:
             raise HTTPException(status_code=404, detail="Project not found")
         calls = list(session.exec(
             select(state.Call)
@@ -700,11 +899,17 @@ async def list_project_calls(project_id: str, _: None = Depends(_require_api_aut
 
 
 @app.get("/calls")
-async def list_calls(limit: int = 50, _: None = Depends(_require_api_auth)) -> list[dict[str, Any]]:
-    """List recent calls across all projects."""
+async def list_calls(
+    limit: int = 50,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> list[dict[str, Any]]:
+    """List recent calls for the caller's org."""
     with state.session_scope(engine) as session:
         calls = list(session.exec(
-            select(state.Call).order_by(state.Call.started_at.desc()).limit(limit)
+            select(state.Call)
+            .where(state.Call.org_id == principal.org_id)
+            .order_by(state.Call.started_at.desc())
+            .limit(limit)
         ))
         report_call_ids = set(session.exec(
             select(state.SynthesisReport.call_id)
@@ -729,13 +934,22 @@ class StartCallRequest(BaseModel):
 
 @app.post("/calls/start")
 @limiter.limit(settings.calls_start_rate_limit or "9999/hour")
-async def start_call(request: Request, req: StartCallRequest, _: None = Depends(_require_api_auth)) -> JSONResponse:
+async def start_call(
+    request: Request,
+    req: StartCallRequest,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> JSONResponse:
     """Dial out via Vapi, loading scripted questions from investor_questions.yaml for the given product."""
     # Resolve project defaults, then apply per-call overrides
     project: state.Project | None = None
     if req.project_id:
         with state.session_scope(engine) as session:
-            project = session.get(state.Project, req.project_id)
+            project = session.exec(
+                select(state.Project).where(
+                    state.Project.id == req.project_id,
+                    state.Project.org_id == principal.org_id,
+                )
+            ).first()
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -795,6 +1009,7 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
         session.add(
             state.Call(
                 id=call_id,
+                org_id=principal.org_id,
                 project_id=req.project_id,
                 phone_number=req.phone_number,
                 scripted_questions=scripted_questions,
@@ -833,11 +1048,17 @@ async def start_call(request: Request, req: StartCallRequest, _: None = Depends(
 
 
 @app.get("/calls/{call_id}")
-async def get_call(request: Request, call_id: str) -> dict[str, Any]:
+async def get_call(
+    request: Request,
+    call_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> dict[str, Any]:
     """Poll call lifecycle: status, dial outcome, Vapi id (Phase 4)."""
     request.state.call_id = call_id
     with state.session_scope(engine) as session:
-        call = session.get(state.Call, call_id)
+        call = session.exec(
+            select(state.Call).where(state.Call.id == call_id, state.Call.org_id == principal.org_id)
+        ).first()
         if call is None:
             raise HTTPException(status_code=404, detail="Call not found")
         return {
@@ -854,7 +1075,11 @@ async def get_call(request: Request, call_id: str) -> dict[str, Any]:
 
 
 @app.get("/calls/{call_id}/report")
-async def get_report(request: Request, call_id: str) -> JSONResponse:
+async def get_report(
+    request: Request,
+    call_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> JSONResponse:
     """Return synthesis report, 202 if still generating, or 200 stub when synthesis is disabled."""
     request.state.call_id = call_id
     with state.session_scope(engine) as session:
@@ -863,7 +1088,9 @@ async def get_report(request: Request, call_id: str) -> JSONResponse:
         ).first()
 
         if report is None:
-            call = session.get(state.Call, call_id)
+            call = session.exec(
+                select(state.Call).where(state.Call.id == call_id, state.Call.org_id == principal.org_id)
+            ).first()
             if call is None:
                 raise HTTPException(status_code=404, detail="Call not found")
             if call.dial_status == state.DIAL_FAILED:
@@ -913,11 +1140,17 @@ async def get_report(request: Request, call_id: str) -> JSONResponse:
 
 
 @app.get("/calls/{call_id}/trace")
-async def get_trace(request: Request, call_id: str) -> dict[str, str]:
+async def get_trace(
+    request: Request,
+    call_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+) -> dict[str, str]:
     """Return a Logfire query URL for this call's spans."""
     request.state.call_id = call_id
     with state.session_scope(engine) as session:
-        call = session.get(state.Call, call_id)
+        call = session.exec(
+            select(state.Call).where(state.Call.id == call_id, state.Call.org_id == principal.org_id)
+        ).first()
         if call is None:
             raise HTTPException(status_code=404, detail="Call not found")
 
@@ -1072,7 +1305,9 @@ async def vapi_llm(request: Request, body: VapiLLMBody, _: None = Depends(_requi
 
 @app.delete("/calls/{call_id}")
 async def delete_call(
-    request: Request, call_id: str, _: None = Depends(_require_api_auth)
+    request: Request,
+    call_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
 ) -> dict[str, str]:
     """Cancel an in-flight call. Fires DELETE to Vapi if the call is still active."""
     request.state.call_id = call_id
@@ -1084,6 +1319,7 @@ async def delete_call(
             update(state.Call)
             .where(
                 state.Call.id == call_id,
+                state.Call.org_id == principal.org_id,
                 state.Call.status.in_(["pending", "active"]),
             )
             .values(status="ended", end_reason="deleted", ended_at=ended_at)
@@ -1093,7 +1329,10 @@ async def delete_call(
         if row is not None:
             vapi_call_id = row[0]
         else:
-            if session.get(state.Call, call_id) is None:
+            exists = session.exec(
+                select(state.Call).where(state.Call.id == call_id, state.Call.org_id == principal.org_id)
+            ).first()
+            if exists is None:
                 raise HTTPException(status_code=404, detail="Call not found")
             return {"call_id": call_id, "status": "already_ended"}
     _speech_ts.pop(call_id, None)

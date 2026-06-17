@@ -1,14 +1,15 @@
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const TOKEN = process.env.NEXT_PUBLIC_API_AUTH_TOKEN ?? "";
-
-function headers(): HeadersInit {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (TOKEN) h["Authorization"] = `Bearer ${TOKEN}`;
-  return h;
-}
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API}${path}`, { ...init, headers: headers() });
+  const res = await fetch(`${API}${path}`, {
+    ...init,
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...(init?.headers as Record<string, string>) },
+  });
+  if (res.status === 401) {
+    window.location.href = "/login";
+    throw new Error("Unauthorized");
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`${res.status} ${path}: ${text}`);
@@ -136,7 +137,7 @@ export function getCall(id: string): Promise<CallDetail> {
 }
 
 export async function getReport(id: string): Promise<{ pending: boolean; report: Report | null }> {
-  const res = await fetch(`${API}/calls/${id}/report`, { headers: headers() });
+  const res = await fetch(`${API}/calls/${id}/report`, { credentials: "include" });
   if (res.status === 202) return { pending: true, report: null };
   if (!res.ok) throw new Error(`${res.status} /calls/${id}/report`);
   const data: Report = await res.json();
