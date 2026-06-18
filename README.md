@@ -11,7 +11,7 @@ for agent orchestration, with a **FastAPI** backend, **Vite + React Router** fro
 
 ### 🚀 Live demo
 
-**Operator UI → [voice-agent-frontend-gelo.onrender.com](https://voice-agent-frontend-gelo.onrender.com/)**
+**Operator UI → [voice-agent-1-mz3u.onrender.com](https://voice-agent-1-mz3u.onrender.com/)**
 
 Deployed on **Render** (Dockerized FastAPI API + Vite static frontend, see [`render.yaml`](render.yaml))
 with a **Supabase** Postgres database, Google OAuth login, and **Logfire** tracing. Create a
@@ -49,6 +49,71 @@ Three LLM agents coordinate **only through the database** (they never call each 
 
 The core design constraint is the **interviewer latency budget** — see
 [Architecture → latency contract](docs/architecture.md#the-three-agents).
+
+---
+
+## Services & integrations
+
+The system stitches together several external services. Here is what each one does and why it is here:
+
+### Vapi — telephony orchestration
+
+[Vapi](https://vapi.ai) is the voice infrastructure layer. It handles:
+
+- **Outbound dialing** — `POST /calls/start` calls `https://api.vapi.ai/call`, which rings the respondent's phone.
+- **STT (speech-to-text)** — transcription is done by **Deepgram `flux-general-en`** (configured inside the Vapi dial payload; the backend never touches raw audio).
+- **Turn management** — Vapi calls our `/vapi/llm/chat/completions` endpoint after each respondent utterance, expecting an OpenAI-compatible streaming response. We own the LLM; Vapi owns the call state.
+- **Webhooks** — Vapi POSTs lifecycle events to `/vapi/webhook`: `status-update` (call connected), `conversation-update` (transcript snapshot), `end-of-call-report` (call ended), and `speech-update` (TTS start/stop timing for latency measurement).
+- **Silence handling** — Vapi's `customer.speech.timeout` hook ladder is configured per-call: re-prompt at `VAPI_SILENCE_TIMEOUT_SECONDS`, escalate at 2×, hang up at 3×. `triggerResetMode: onUserSpeech` resets the ladder the moment the user speaks.
+
+Required env vars: `VAPI_API_KEY`, `VAPI_PHONE_NUMBER_ID`, `WEBHOOK_URL` (public base URL, e.g. ngrok in dev), `VAPI_WEBHOOK_SECRET` (HMAC key), `VAPI_SERVER_CREDENTIAL_ID`.
+
+> The outbound phone number is provisioned through **Twilio** and imported into Vapi. Vapi owns the call orchestration; Twilio supplies the number. The backend only interacts with Vapi — `VAPI_PHONE_NUMBER_ID` is the Vapi ID of the imported Twilio number.
+
+### ElevenLabs — text-to-speech
+
+ElevenLabs provides the voice for the AI interviewer. It is invoked **through Vapi** (not directly by the backend): Vapi receives our streaming text tokens and forwards them to ElevenLabs for TTS, then plays the resulting audio to the respondent.
+
+Key knobs (all optional; see `.env.example`):
+
+| Var | Effect |
+| --- | ------ |
+| `VAPI_VOICE_ID` | Which ElevenLabs voice to use |
+| `VAPI_VOICE_MODEL` | `eleven_flash_v2_5` ≈ 75 ms latency; `eleven_multilingual_v2` = max quality |
+| `VAPI_VOICE_CHUNK_MIN_CHARACTERS` | Streaming flush threshold — `1` means audio starts on short fillers immediately |
+| `VAPI_VOICE_STABILITY` / `_SIMILARITY_BOOST` / `_STYLE` / `_SPEED` | Fine-tune expressiveness vs. steadiness |
+
+Set `VAPI_VOICE_PROVIDER=vapi` to switch to Vapi's built-in "Elliot" voice with no ElevenLabs dependency.
+
+### Deepgram — speech-to-text
+
+Deepgram is configured as the transcription provider inside the Vapi dial payload (`transcriber: { provider: "deepgram", model: "flux-general-en" }`). The backend never calls Deepgram directly — transcripts arrive pre-processed via Vapi's `conversation-update` and custom-LLM messages.
+
+### Anthropic — LLM backbone
+
+All three agents run on Anthropic models via PydanticAI:
+
+- **Interviewer** — primary model is **Haiku 4.5** with a 5 s hard deadline. Falls back through: OpenAI gpt-4.1-mini (optional) → Haiku 4.5 → Gemini 2.0 Flash → Groq llama-3.3-70b → Cerebras llama3.1-8b (optional). Every tier is env-overridable or droppable.
+- **Analyst** — **Sonnet 4.6**, fire-and-forget background task.
+- **Synthesis** — **Sonnet 4.6**, post-call (currently disabled via `ENABLE_SYNTHESIS_REPORT=False`).
+
+Required: `ANTHROPIC_API_KEY`. Optional resilience keys: `GOOGLE_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `CEREBRAS_API_KEY`.
+
+### Google OAuth — authentication
+
+The operator UI uses Google OAuth for login (`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`). After the OAuth callback, the backend issues a JWT (`JWT_SECRET`) stored in `localStorage` and sent as `Authorization: Bearer` on every API request. Omit these vars for dev — the backend returns a fake admin principal automatically.
+
+### Logfire — observability
+
+[Pydantic Logfire](https://logfire.pydantic.dev) is the tracing and observability layer. Every meaningful span carries `call_id` + `turn_number` so you can slice by call or turn. When `LOGFIRE_TOKEN` is unset the backend falls back to console-only structured output — no external dependency in dev. Evals always disable Logfire.
+
+### Supabase / Postgres — production database
+
+Dev uses a local SQLite file (`voice_agent.db`). Production uses a Postgres database — hosted on Supabase in the live deployment, but any Postgres URL works. Set `DATABASE_URL=postgresql+psycopg2://...` and run `uv run alembic upgrade head`. The Docker image does this automatically on boot.
+
+### Render — hosting
+
+The live demo runs on [Render](https://render.com): a Dockerized FastAPI web service for the backend and a static site for the Vite frontend. Configuration is in [`render.yaml`](render.yaml). The API service runs `alembic upgrade head` as a pre-deploy command; the frontend service serves `frontend/dist/` with a catch-all rewrite to `index.html`.
 
 ---
 
