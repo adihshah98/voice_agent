@@ -6,14 +6,14 @@ adaptively probing on interesting signals, analyzes the conversation in the back
 and (optionally) produces a post-call research report.
 
 Built on **[Vapi](https://vapi.ai)** for telephony and **[PydanticAI](https://ai.pydantic.dev)**
-for agent orchestration, with a **FastAPI** backend, **Next.js** frontend, and
+for agent orchestration, with a **FastAPI** backend, **Vite + React Router** frontend, and
 **Pydantic Logfire** for observability.
 
 ### 🚀 Live demo
 
 **Operator UI → [voice-agent-frontend-gelo.onrender.com](https://voice-agent-frontend-gelo.onrender.com/)**
 
-Deployed on **Render** (Dockerized FastAPI API + Node/Next.js frontend, see [`render.yaml`](render.yaml))
+Deployed on **Render** (Dockerized FastAPI API + Vite static frontend, see [`render.yaml`](render.yaml))
 with a **Supabase** Postgres database, Google OAuth login, and **Logfire** tracing. Create a
 project, configure the research brief, and dial out — the agent runs the interview live.
 
@@ -76,7 +76,7 @@ Frontend (operator UI):
 ```bash
 cd frontend
 npm install
-npm run dev            # http://localhost:3000  (expects backend on :8000)
+npm run dev            # http://localhost:5173  (expects backend on :8000)
 ```
 
 ### Environment
@@ -97,6 +97,7 @@ erroring. Model IDs, latency budgets, and feature flags all live in
 | `GOOGLE_CLIENT_ID/SECRET`, `JWT_SECRET` | multi-tenant auth | Google OAuth login + JWT sessions (dev mode when unset) |
 | `DATABASE_URL` | prod | Defaults to local SQLite; set Postgres URL in prod |
 | `LOGFIRE_TOKEN` | observability | Enables Logfire cloud export (console-only when unset) |
+| `VITE_API_URL` | frontend (prod) | Backend URL for the Vite SPA (defaults to `http://localhost:8000`) |
 
 ---
 
@@ -122,6 +123,10 @@ uv run python -m voice_agent.agents.interviewer    # interviewer REPL with a see
 # Database migrations (Alembic)
 uv run alembic upgrade head                        # apply migrations
 uv run alembic revision --autogenerate -m "..."    # create a migration from model changes
+
+# Frontend
+cd frontend && npm install && npm run dev          # dev server on :5173
+cd frontend && npm run build                       # production build → frontend/dist/
 ```
 
 ---
@@ -142,13 +147,62 @@ voice_agent/            Backend package
 ├── auth.py             Google OAuth + JWT, multi-tenant org/user model
 └── tracing.py          Logfire / OpenTelemetry setup
 
-frontend/               Next.js operator UI (projects, calls, reports, settings)
-evals/                  pydantic_evals suite — Tier 1/2/3 + replay + synthesis
+frontend/               Vite + React Router SPA (projects, calls, reports, settings, login)
+├── src/
+│   ├── App.tsx         createBrowserRouter — all routes defined here
+│   ├── main.tsx        entry point
+│   ├── pages/          one file per route
+│   ├── components/     NavUser, CallRow, ProjectCard, QuestionEditor, StatusBadge
+│   └── lib/
+│       ├── api.ts      typed fetch wrapper; reads VITE_API_URL
+│       └── auth-context.tsx  AuthProvider; reads ?token= from URL on landing
+├── index.html
+└── vite.config.ts
+
+evals/                  pydantic_evals suite — Tier 1/2/3 + replay + simulation + synthesis
 tests/                  Unit tests (DB, server, tracing, streaming, caching)
 alembic/                Database migrations
 data/                   investor_questions.yaml — canonical scripted arc
 docs/                   architecture.md (authoritative) + design/latency/eval notes
 ```
+
+---
+
+## Evals
+
+The eval suite lives in `evals/` and uses [`pydantic_evals`](https://ai.pydantic.dev/evals/).
+All evals run via `uv run pytest`; thresholds are documented in [docs/architecture.md](docs/architecture.md#eval-suite).
+
+| Tier | File | Marker | What it tests |
+| ---- | ---- | ------ | ------------- |
+| **1 — interviewer decisions** | `evals/test_interviewer.py` | (none) | Single-turn action choice seeded from `interviewer_turns.yaml`. ActionMatches ≥ 90%, SingleQuestion 100%, warmth ≥ 4/5 |
+| **2 — analyst probes** | `evals/test_analyst.py` | (none) | Probe quality against canned transcripts in `analyst_probes.yaml` |
+| **3a — replay** | `evals/test_replay.py` | `replay` | Full transcripts: respondent lines fixed, interviewer live. Deterministic + CI-safe. Tests cursor advancement, probe staleness, loop guards |
+| **3b — simulation** | `evals/test_trajectories.py` | `slow` | Full conversations with LLM respondent personas (`personas.yaml`). Slow — hits the API |
+| **Synthesis** | `evals/test_synthesis.py` | (none) | Post-call report quality against replay transcripts |
+
+```bash
+uv run pytest -m replay          # fast, deterministic, safe for CI
+uv run pytest -m slow            # full simulation — use sparingly
+uv run pytest evals/ -v          # all eval tiers
+```
+
+`evals/cases.py` loads YAML fixtures into typed `Case` objects; `evals/evaluators.py` has custom scorers and `LLMJudge` wrappers. In-memory SQLite in evals requires `poolclass=StaticPool`.
+
+---
+
+## Observability (Logfire)
+
+The backend instruments every meaningful span via [Pydantic Logfire](https://logfire.pydantic.dev).
+`init_tracing()` in [`voice_agent/tracing.py`](voice_agent/tracing.py) is idempotent and called
+from every entrypoint (server lifespan, `play.py`, evals).
+
+- **When `LOGFIRE_TOKEN` is unset** — falls back to console-only structured output. Evals always pass `send_to_logfire=False`.
+- **Every span** carries `call_id` + `turn_number` via `agent_span`, so you can slice by call or turn in the Logfire UI.
+- **What's traced:** interviewer LLM call (with TTFT, cache tokens, filler flag), analyst task scheduling, synthesis, DB reads, webhook events.
+- **Latency metrics:** `llm_ttft_ms` (first token from LLM), TTS start/stop timing from `speech-update` webhooks. See [docs/Latency Measurement.md](docs/Latency%20Measurement.md) for the full breakdown.
+
+Set `LOGFIRE_TOKEN` in `.env` or the Render dashboard to enable cloud export.
 
 ---
 
@@ -169,6 +223,6 @@ docs/                   architecture.md (authoritative) + design/latency/eval no
 
 The backend ships as a Docker image (see [`Dockerfile`](Dockerfile)) and deploys to Render
 via [`render.yaml`](render.yaml) — a `web` service for the API (runs `alembic upgrade head`
-on boot) and a Node `web` service for the Next.js frontend. Production uses Postgres
+on boot) and a **static site** service for the Vite frontend (`npm run build` → `dist/`,
+with a catch-all rewrite to `index.html` for client-side routing). Production uses Postgres
 (`DATABASE_URL`); dev uses a local SQLite file.
-</content>

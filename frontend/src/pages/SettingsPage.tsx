@@ -1,9 +1,7 @@
-"use client";
-
 import { useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 interface Member {
   user_id: string;
@@ -33,7 +31,9 @@ export default function SettingsPage() {
   const isAdmin = user?.role === "admin";
 
   useEffect(() => {
-    fetch(`${API}/orgs/me`, { credentials: "include" })
+    const token = localStorage.getItem("access_token");
+    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+    fetch(`${API}/orgs/me`, { credentials: "include", headers })
       .then((r) => r.json())
       .then(setOrg)
       .catch(() => {});
@@ -44,21 +44,22 @@ export default function SettingsPage() {
     setInviting(true);
     setInviteError(null);
     setInviteSuccess(null);
+    const token = localStorage.getItem("access_token");
+    const authHeader: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
     try {
       const res = await fetch(`${API}/orgs/me/members`, {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeader },
         body: JSON.stringify({ email: inviteEmail, role: inviteRole }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail ?? `Error ${res.status}`);
+        throw new Error((body as { detail?: string }).detail ?? `Error ${res.status}`);
       }
       setInviteSuccess(`${inviteEmail} has been invited.`);
       setInviteEmail("");
-      // Refresh member list
-      const orgRes = await fetch(`${API}/orgs/me`, { credentials: "include" });
+      const orgRes = await fetch(`${API}/orgs/me`, { credentials: "include", headers: authHeader });
       if (orgRes.ok) setOrg(await orgRes.json());
     } catch (err) {
       setInviteError(err instanceof Error ? err.message : "Failed to invite");
@@ -69,9 +70,11 @@ export default function SettingsPage() {
 
   async function handleRemove(userId: string) {
     if (!confirm("Remove this member from the organization?")) return;
+    const token = localStorage.getItem("access_token");
     await fetch(`${API}/orgs/me/members/${userId}`, {
       method: "DELETE",
       credentials: "include",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     setOrg((prev) =>
       prev ? { ...prev, members: prev.members.filter((m) => m.user_id !== userId) } : prev

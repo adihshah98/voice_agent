@@ -1,5 +1,3 @@
-"use client";
-
 import { createContext, useContext, useEffect, useState } from "react";
 import { clearToken, getToken, setToken } from "./api";
 
@@ -44,7 +42,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+    const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
     fetch(`${API}/auth/me`, {
       credentials: "include",
       headers: { Authorization: `Bearer ${token}` },
@@ -56,7 +54,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = async () => {
-    const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+    const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
     await fetch(`${API}/auth/logout`, { method: "POST", credentials: "include" });
     clearToken();
     setUser(null);

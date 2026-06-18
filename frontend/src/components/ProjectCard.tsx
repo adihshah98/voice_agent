@@ -1,10 +1,10 @@
-import Link from "next/link";
+import { Link } from "react-router-dom";
 import type { Project } from "@/lib/api";
 
 export default function ProjectCard({ project }: { project: Project }) {
   return (
     <Link
-      href={`/projects/${project.id}`}
+      to={`/projects/${project.id}`}
       className="block rounded-xl p-5 bg-[var(--surface)] border border-[var(--border)] hover:border-[var(--accent-soft-border)] hover:bg-[var(--surface-raised)] transition-all"
     >
       <div className="flex items-start justify-between gap-3">

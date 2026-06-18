@@ -1,7 +1,5 @@
-"use client";
-
 import { useEffect, useState } from "react";
-import { useRouter, useParams } from "next/navigation";
+import { useNavigate, useParams } from "react-router-dom";
 import { getProject, startCall } from "@/lib/api";
 import QuestionEditor from "@/components/QuestionEditor";
 
@@ -11,9 +9,8 @@ const labelCls = "block text-sm font-medium text-[var(--muted-strong)] mb-1.5";
 const cardCls = "bg-[var(--surface)] border border-[var(--border)] rounded-xl p-6 space-y-4";
 
 export default function NewCallPage() {
-  const router = useRouter();
-  const params = useParams<{ id: string }>();
-  const projectId = params.id;
+  const navigate = useNavigate();
+  const { id: projectId } = useParams<{ id: string }>();
 
   const [phoneNumber, setPhoneNumber] = useState("");
   const [productOverride, setProductOverride] = useState("");
@@ -25,7 +22,7 @@ export default function NewCallPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getProject(projectId)
+    getProject(projectId!)
       .then((p) => {
         setProjectProduct(p.product);
         setQuestions(p.scripted_questions);
@@ -46,7 +43,7 @@ export default function NewCallPage() {
         focus_areas: focusOverride.split(",").map((s) => s.trim()).filter(Boolean),
         scripted_questions: questions.filter(Boolean),
       });
-      router.push(`/calls/${result.call_id}`);
+      navigate(`/calls/${result.call_id}`);
     } catch (err) {
       setError(String(err));
       setSubmitting(false);

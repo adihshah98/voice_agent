@@ -125,7 +125,7 @@ async def auth_google(request: Request):
 @app.get("/auth/google/callback")
 async def auth_google_callback(request: Request, code: str | None = None, error: str | None = None):
     """Exchange Google auth code for a JWT, then redirect to the frontend."""
-    frontend = (settings.frontend_url or "http://localhost:3000").rstrip("/")
+    frontend = (settings.frontend_url or "http://localhost:5173").rstrip("/")
 
     logfire.info(
         "auth_callback_entry",

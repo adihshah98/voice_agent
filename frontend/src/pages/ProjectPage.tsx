@@ -1,8 +1,5 @@
-"use client";
-
-import Link from "next/link";
+import { Link, useParams, useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
-import { useParams, useRouter } from "next/navigation";
 import { getProject, listProjectCalls, patchProject, deleteProject } from "@/lib/api";
 import type { Project, CallSummary } from "@/lib/api";
 import CallRow from "@/components/CallRow";
@@ -30,9 +27,8 @@ function toForm(p: Project): ConfigForm {
 }
 
 export default function ProjectPage() {
-  const params = useParams<{ id: string }>();
-  const router = useRouter();
-  const id = params.id;
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
 
   const [project, setProject] = useState<Project | null>(null);
   const [calls, setCalls] = useState<CallSummary[]>([]);
@@ -53,7 +49,7 @@ export default function ProjectPage() {
 
   const load = useCallback(async () => {
     try {
-      const [proj, callList] = await Promise.all([getProject(id), listProjectCalls(id)]);
+      const [proj, callList] = await Promise.all([getProject(id!), listProjectCalls(id!)]);
       setProject(proj);
       setQuestions(proj.scripted_questions);
       setConfig(toForm(proj));
@@ -113,8 +109,8 @@ export default function ProjectPage() {
     setDeleting(true);
     setDeleteError(null);
     try {
-      await deleteProject(id);
-      router.push("/");
+      await deleteProject(id!);
+      navigate("/");
     } catch (err) {
       setDeleteError(String(err));
       setDeleting(false);
@@ -129,7 +125,7 @@ export default function ProjectPage() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <p className="text-sm text-[var(--placeholder)] mb-1">
-            <Link href="/" className="hover:underline hover:text-[var(--muted-strong)]">Dashboard</Link> / Project
+            <Link to="/" className="hover:underline hover:text-[var(--muted-strong)]">Dashboard</Link> / Project
           </p>
           <h1 className="text-2xl font-semibold text-[var(--foreground)]">{project.name}</h1>
           <p className="text-[var(--muted)] mt-1">{project.product}</p>
@@ -167,7 +163,7 @@ export default function ProjectPage() {
             </button>
           )}
           <Link
-            href={`/projects/${id}/calls/new`}
+            to={`/projects/${id}/calls/new`}
             className="bg-[var(--accent)] text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-[var(--accent-hover)] transition-colors shadow-sm shadow-[var(--accent)]/20"
           >
             Launch Call

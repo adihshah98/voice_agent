@@ -1,4 +1,4 @@
-import Link from "next/link";
+import { Link } from "react-router-dom";
 import StatusBadge from "./StatusBadge";
 import type { CallSummary } from "@/lib/api";
 
@@ -14,7 +14,7 @@ export default function CallRow({ call }: { call: CallSummary }) {
   return (
     <tr className="border-b border-[var(--border)] last:border-b-0 hover:bg-[var(--surface-raised)] transition-colors">
       <td className="py-3 px-4">
-        <Link href={`/calls/${call.call_id}`} className="font-mono text-xs text-[var(--accent-hover)] hover:underline">
+        <Link to={`/calls/${call.call_id}`} className="font-mono text-xs text-[var(--accent-hover)] hover:underline">
           {call.call_id.slice(0, 8)}…
         </Link>
       </td>

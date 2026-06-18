@@ -1,7 +1,5 @@
-"use client";
-
 import { useEffect, useState, useCallback } from "react";
-import { useParams } from "next/navigation";
+import { useParams, Link } from "react-router-dom";
 import { getCall, getReport } from "@/lib/api";
 import type { CallDetail, Report } from "@/lib/api";
 import StatusBadge from "@/components/StatusBadge";
@@ -26,8 +24,7 @@ function Section({ title, items }: { title: string; items: string[] }) {
 }
 
 export default function CallDetailPage() {
-  const params = useParams<{ id: string }>();
-  const callId = params.id;
+  const { id: callId } = useParams<{ id: string }>();
 
   const [call, setCall] = useState<CallDetail | null>(null);
   const [report, setReport] = useState<Report | null>(null);
@@ -36,7 +33,7 @@ export default function CallDetailPage() {
 
   const fetchCall = useCallback(async () => {
     try {
-      const data = await getCall(callId);
+      const data = await getCall(callId!);
       setCall(data);
       return data;
     } catch (e) {
@@ -47,7 +44,7 @@ export default function CallDetailPage() {
 
   const fetchReport = useCallback(async () => {
     try {
-      const { pending, report: r } = await getReport(callId);
+      const { pending, report: r } = await getReport(callId!);
       setReportPending(pending);
       if (r) setReport(r);
       return { pending, report: r };
@@ -83,10 +80,10 @@ export default function CallDetailPage() {
     <div className="space-y-8">
       <div>
         <p className="text-sm text-[var(--placeholder)] mb-1">
-          <a href="/" className="hover:underline hover:text-[var(--muted-strong)]">Dashboard</a> / Call
+          <Link to="/" className="hover:underline hover:text-[var(--muted-strong)]">Dashboard</Link> / Call
         </p>
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold font-mono text-[var(--foreground)]">{callId.slice(0, 8)}…</h1>
+          <h1 className="text-2xl font-semibold font-mono text-[var(--foreground)]">{callId!.slice(0, 8)}…</h1>
           <StatusBadge label={call.status} />
           {call.dial_status && <StatusBadge label={call.dial_status} />}
         </div>

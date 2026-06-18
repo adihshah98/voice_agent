@@ -41,13 +41,14 @@ services:
 
   - type: web
     name: voice-agent-frontend
-    runtime: node
+    runtime: static
+    staticPublishPath: ./dist
     rootDir: frontend
     buildCommand: npm install && npm run build
-    startCommand: npm start
     envVars:
-      - key: NEXT_PUBLIC_API_URL
+      - key: VITE_API_URL
         value: https://voice-agent-ede2.onrender.com
-      # --- Set this if your backend requires API_AUTH_TOKEN ---
-      - key: NEXT_PUBLIC_API_AUTH_TOKEN
-        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

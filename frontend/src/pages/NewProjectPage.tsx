@@ -1,7 +1,5 @@
-"use client";
-
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router-dom";
 import { createProject, DEFAULT_QUESTIONS, substituteProduct } from "@/lib/api";
 import QuestionEditor from "@/components/QuestionEditor";
 
@@ -11,7 +9,7 @@ const labelCls = "block text-sm font-medium text-[var(--muted-strong)] mb-1.5";
 const cardCls = "bg-[var(--surface)] border border-[var(--border)] rounded-xl p-6 space-y-4";
 
 export default function NewProjectPage() {
-  const router = useRouter();
+  const navigate = useNavigate();
   const [name, setName] = useState("");
   const [product, setProduct] = useState("");
   const [productDescription, setProductDescription] = useState("");
@@ -48,7 +46,7 @@ export default function NewProjectPage() {
         investor_thesis: investorThesis.trim() || null,
         scripted_questions: questions.filter(Boolean),
       });
-      router.push(`/projects/${proj.id}`);
+      navigate(`/projects/${proj.id}`);
     } catch (err) {
       setError(String(err));
       setSaving(false);

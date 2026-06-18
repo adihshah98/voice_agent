@@ -31,7 +31,7 @@ uv run python -m voice_agent.agents.interviewer      # interviewer REPL with a s
 uv run alembic upgrade head                          # apply DB migrations (Postgres / file SQLite)
 uv run alembic revision --autogenerate -m "..."      # generate a migration from model changes
 
-cd frontend && npm install && npm run dev            # Next.js operator UI on :3000 (expects backend on :8000)
+cd frontend && npm install && npm run dev            # Vite + React Router operator UI on :5173 (expects backend on :8000)
 ```
 
 Pytest config in `pyproject.toml` sets `asyncio_mode = "auto"` and `testpaths = ["tests", "evals"]` — async tests need no marker. Markers: `replay` (deterministic, CI-safe), `slow` (live simulation).
@@ -98,7 +98,7 @@ A `Project` ([state.py](voice_agent/state.py)) is an org-scoped research config:
 
 ### Frontend ([frontend/](frontend/))
 
-Next.js 16 + React 19 operator UI (projects, calls, reports, settings, login). **Read `frontend/AGENTS.md` before editing** — it pins a Next.js version with breaking changes vs. training data; consult `node_modules/next/dist/docs/` first. The API client is [frontend/src/lib/api.ts](frontend/src/lib/api.ts); auth uses the cookie set by the OAuth callback (`credentials: "include"`, redirect to `/login` on 401).
+Vite + React Router v7 + Tailwind v4 operator UI (projects, calls, reports, settings, login). Pure client-side SPA — no SSR, no server components. Router defined in [frontend/src/App.tsx](frontend/src/App.tsx) via `createBrowserRouter`. Pages live in `src/pages/`, shared components in `src/components/`. The API client is [frontend/src/lib/api.ts](frontend/src/lib/api.ts); auth stores the JWT in `localStorage` as `access_token` and sends it as `Authorization: Bearer` on every request. Backend redirects to `{frontend}/?token=<jwt>` after OAuth; `auth-context.tsx` picks it up, stores it, and cleans the URL. API base URL is `VITE_API_URL` (defaults to `http://localhost:8000`).
 
 ### Security
 

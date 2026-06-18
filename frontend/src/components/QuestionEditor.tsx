@@ -1,5 +1,3 @@
-"use client";
-
 interface Props {
   value: string[];
   onChange: (questions: string[]) => void;

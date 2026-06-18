@@ -1,5 +1,3 @@
-"use client";
-
 const STATUS_STYLES: Record<string, string> = {
   pending: "bg-[var(--warning-soft)] text-[var(--warning)] ring-1 ring-inset ring-[var(--warning)]/30",
   active: "bg-[var(--success-soft)] text-[var(--success)] ring-1 ring-inset ring-[var(--success)]/30",
