@@ -1,6 +1,6 @@
 import { Link, useParams, useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
-import { getProject, listProjectCalls, patchProject, deleteProject } from "@/lib/api";
+import { getProject, listProjectCalls, patchProject, deleteProject, substituteProduct, startCall } from "@/lib/api";
 import type { Project, CallSummary } from "@/lib/api";
 import CallRow from "@/components/CallRow";
 import QuestionEditor from "@/components/QuestionEditor";
@@ -43,6 +43,10 @@ export default function ProjectPage() {
   const [configSaveError, setConfigSaveError] = useState<string | null>(null);
   const [configSaved, setConfigSaved] = useState(false);
 
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [launching, setLaunching] = useState(false);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -51,7 +55,7 @@ export default function ProjectPage() {
     try {
       const [proj, callList] = await Promise.all([getProject(id!), listProjectCalls(id!)]);
       setProject(proj);
-      setQuestions(proj.scripted_questions);
+      setQuestions(substituteProduct(proj.scripted_questions, proj.product));
       setConfig(toForm(proj));
       setCalls(callList);
     } catch {
@@ -63,7 +67,7 @@ export default function ProjectPage() {
     load();
   }, [load]);
 
-  const dirty = project ? JSON.stringify(questions) !== JSON.stringify(project.scripted_questions) : false;
+  const dirty = project ? JSON.stringify(questions) !== JSON.stringify(substituteProduct(project.scripted_questions, project.product)) : false;
   const configDirty = project ? JSON.stringify(config) !== JSON.stringify(toForm(project)) : false;
 
   const handleSaveQuestions = async () => {
@@ -73,7 +77,7 @@ export default function ProjectPage() {
     try {
       const updated = await patchProject(project.id, { scripted_questions: questions.filter(Boolean) });
       setProject(updated);
-      setQuestions(updated.scripted_questions);
+      setQuestions(substituteProduct(updated.scripted_questions, updated.product));
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -102,6 +106,23 @@ export default function ProjectPage() {
       setConfigSaveError(String(err));
     } finally {
       setConfigSaving(false);
+    }
+  };
+
+  const handleLaunchCall = async () => {
+    if (!project) return;
+    setLaunching(true);
+    setLaunchError(null);
+    try {
+      const result = await startCall({
+        project_id: project.id,
+        phone_number: phoneNumber.trim() || null,
+        scripted_questions: questions.filter(Boolean),
+      });
+      navigate(`/calls/${result.call_id}`);
+    } catch (err) {
+      setLaunchError(String(err));
+      setLaunching(false);
     }
   };
 
@@ -162,17 +183,21 @@ export default function ProjectPage() {
               Delete
             </button>
           )}
-          <Link
-            to={`/projects/${id}/calls/new`}
-            className="bg-[var(--accent)] text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-[var(--accent-hover)] transition-colors shadow-sm shadow-[var(--accent)]/20"
+          <button
+            type="button"
+            onClick={handleLaunchCall}
+            disabled={launching}
+            className="bg-[var(--accent)] text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-[var(--accent-hover)] disabled:opacity-60 transition-colors shadow-sm shadow-[var(--accent)]/20 inline-flex items-center gap-2"
           >
-            Launch Call
-          </Link>
+            {launching && <span className="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin" />}
+            {launching ? "Starting…" : "Launch Call"}
+          </button>
         </div>
       </div>
       {deleteError && <p className="text-sm text-[var(--danger)] text-right">{deleteError}</p>}
+      {launchError && <p className="text-sm text-[var(--danger)] text-right">{launchError}</p>}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="space-y-4">
         <div className={cardCls}>
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-medium text-[var(--muted-strong)]">Configuration</h3>
@@ -192,6 +217,16 @@ export default function ProjectPage() {
             )}
           </div>
           <div className="space-y-3">
+            <div>
+              <label className={labelCls}>Phone number <span className="font-normal">(leave blank for local simulation)</span></label>
+              <input
+                type="tel"
+                value={phoneNumber}
+                onChange={(e) => setPhoneNumber(e.target.value)}
+                placeholder="+14155551234"
+                className={inputCls}
+              />
+            </div>
             <div>
               <label className={labelCls}>Description</label>
               <textarea
@@ -237,9 +272,7 @@ export default function ProjectPage() {
 
         <div className={cardCls}>
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-medium text-[var(--muted-strong)]">
-              Questions ({questions.filter(Boolean).length})
-            </h3>
+            <h3 className="text-sm font-medium text-[var(--muted-strong)]">Questions ({questions.filter(Boolean).length})</h3>
             {dirty && (
               <div className="flex items-center gap-2">
                 {saved && <span className="text-xs text-[var(--success)]">Saved</span>}
@@ -255,13 +288,12 @@ export default function ProjectPage() {
               </div>
             )}
           </div>
-          <div className="max-h-96 overflow-y-auto pr-1">
-            <QuestionEditor value={questions} onChange={setQuestions} />
-          </div>
+          <QuestionEditor value={questions} onChange={setQuestions} />
         </div>
       </div>
 
       <section>
+
         <h2 className="text-lg font-medium text-[var(--foreground)] mb-4">Calls ({project.call_count})</h2>
         {calls.length === 0 ? (
           <div className="rounded-xl border border-dashed border-[var(--border-strong)] p-8 text-center">

@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     vapi_signature_header: str = "x-signature"   # must match "Signature Header" in Vapi HMAC credential
     vapi_timestamp_header: str = "x-timestamp"   # must match "Timestamp Header"; empty = omit timestamp from payload
     webhook_url: str = ""
+    base_url: str = ""  # Public base URL for auth callbacks. Defaults to webhook_url if unset.
     llm_secret_token: str = ""   # static secret sent by Vapi in X-Vapi-Secret header; empty = skip check (dev)
     api_auth_token: str = ""  # Bearer for POST /calls/start and DELETE /calls/{id}; empty = skip check (dev)
     frontend_url: str = ""  # Render frontend URL for CORS; empty = localhost only

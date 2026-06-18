@@ -6,7 +6,6 @@ import LoginPage from "@/pages/LoginPage";
 import CallDetailPage from "@/pages/CallDetailPage";
 import ProjectPage from "@/pages/ProjectPage";
 import NewProjectPage from "@/pages/NewProjectPage";
-import NewCallPage from "@/pages/NewCallPage";
 import SettingsPage from "@/pages/SettingsPage";
 
 function Layout() {
@@ -52,7 +51,6 @@ const router = createBrowserRouter([
       { path: "/calls/:id", element: <CallDetailPage /> },
       { path: "/projects/new", element: <NewProjectPage /> },
       { path: "/projects/:id", element: <ProjectPage /> },
-      { path: "/projects/:id/calls/new", element: <NewCallPage /> },
       { path: "/settings", element: <SettingsPage /> },
     ],
   },

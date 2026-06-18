@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useAuth } from "@/lib/auth-context";
 
 export default function NavUser() {
@@ -30,13 +31,13 @@ export default function NavUser() {
               <p className="text-xs font-medium text-[var(--foreground)] truncate">{user.email}</p>
               <p className="text-xs text-[var(--muted)] capitalize">{user.role}</p>
             </div>
-            <a
-              href="/settings"
+            <Link
+              to="/settings"
               className="block px-3 py-2 text-sm text-[var(--foreground)] hover:bg-[var(--surface-raised)] transition-colors"
               onClick={() => setOpen(false)}
             >
               Settings
-            </a>
+            </Link>
             <button
               onClick={logout}
               className="w-full text-left px-3 py-2 text-sm text-red-400 hover:bg-[var(--surface-raised)] transition-colors"

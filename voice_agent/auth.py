@@ -128,8 +128,7 @@ def _google_client() -> AsyncOAuth2Client:
 
 
 def _callback_url(request: Request) -> str:
-    # Use the configured frontend_url base or fall back to the request's base URL.
-    base = settings.webhook_url or str(request.base_url).rstrip("/")
+    base = settings.base_url or settings.webhook_url or str(request.base_url).rstrip("/")
     return f"{base}/auth/google/callback"
 
 

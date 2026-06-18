@@ -17,15 +17,9 @@ export default function NewProjectPage() {
   const [deprioritize, setDeprioritize] = useState("");
   const [investorThesis, setInvestorThesis] = useState("");
   const [questions, setQuestions] = useState<string[]>(DEFAULT_QUESTIONS);
-  const [productForQuestions, setProductForQuestions] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [validationMsg, setValidationMsg] = useState<string | null>(null);
-
-  const applyProduct = () => {
-    setQuestions(substituteProduct(DEFAULT_QUESTIONS, product));
-    setProductForQuestions(product);
-  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -78,7 +72,10 @@ export default function NewProjectPage() {
               type="text"
               required
               value={product}
-              onChange={(e) => setProduct(e.target.value)}
+              onChange={(e) => {
+                setProduct(e.target.value);
+                setQuestions(substituteProduct(DEFAULT_QUESTIONS, e.target.value));
+              }}
               placeholder="Notion AI"
               className={inputCls}
             />
@@ -134,22 +131,7 @@ export default function NewProjectPage() {
         </div>
 
         <div className={cardCls}>
-          <div className="flex items-center justify-between">
-            <h2 className="font-medium text-[var(--foreground)]">Interview Questions</h2>
-            <button
-              type="button"
-              onClick={applyProduct}
-              disabled={!product.trim()}
-              className="text-xs text-[var(--accent-hover)] hover:text-[var(--accent)] hover:underline disabled:opacity-40 disabled:hover:no-underline"
-            >
-              Apply &ldquo;{product || "product"}&rdquo; to defaults
-            </button>
-          </div>
-          {productForQuestions && (
-            <p className="text-xs text-[var(--muted)]">
-              Showing questions with &ldquo;{productForQuestions}&rdquo; substituted in.
-            </p>
-          )}
+          <h2 className="font-medium text-[var(--foreground)]">Interview Questions</h2>
           <QuestionEditor value={questions} onChange={setQuestions} />
         </div>
 
